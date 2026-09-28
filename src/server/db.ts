@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { defaults, completion, desiredFingerprint, manifestFingerprint, statusFor, type Game, type Job, type RemoteFile, type Settings, type JobState } from '../shared/domain';
+import { defaults, completion, desiredFingerprint, manifestFingerprint, statusFor, type Game, type Job, type RemoteFile, type MediaAsset, type Settings, type JobState } from '../shared/domain';
 import { migrate } from './migrations';
 
 export const configDir = process.env.GOG_VAULT_DATA_DIR || './config';
@@ -17,7 +17,11 @@ export function activity(message: string) {
 }
 export function settings(): Settings {
   const rows = db.query('SELECT key,value FROM settings').all() as { key: string; value: string }[];
-  return { ...defaults, ...Object.fromEntries(rows.map(row => [row.key, JSON.parse(row.value)])) };
+  const stored = Object.fromEntries(rows.map(row => [row.key, JSON.parse(row.value)]));
+  const config = { ...defaults, ...stored };
+  if (!('platforms' in stored)) config.platforms = [config.platform];
+  if (!('languages' in stored)) config.languages = [config.language];
+  return config;
 }
 export function saveSettings(input: Partial<Settings>): Settings {
   const write = db.query('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
@@ -28,7 +32,7 @@ export function filesFor(gameId: string): RemoteFile[] {
   return (db.query('SELECT * FROM remote_files WHERE game_id=? ORDER BY category,name').all(gameId) as Row[]).map(row => ({
     key: row.key, gameId: row.game_id, name: row.name, category: row.category, platform: row.platform,
     language: row.language, version: row.version, size: row.size, downlink: row.downlink,
-    checksumUrl: row.checksum_url, dlc: row.dlc, selected: !!row.selected, verified: !!row.verified
+    checksumUrl: row.checksum_url, dlc: row.dlc, selected: !!row.selected, verified: !!row.verified, matched: !!row.matched
   }));
 }
 for (const row of db.query("SELECT id FROM games WHERE archived_hash!='' AND archived_selected_hash='' ").all() as { id: string }[]) {
@@ -50,7 +54,7 @@ export function gameById(id: string): Game | null {
     localSize: row.local_size, remoteSize: files.filter(file => file.selected).reduce((n, f) => n + f.size, 0),
     manifestHash: row.manifest_hash, archivedHash: row.archived_hash,
     status: statusFor(files, jobsFor(id), !!row.archived_selected_hash && row.archived_selected_hash !== desiredFingerprint(files), !!row.folder),
-    completion: { main: completion(files, 'main'), dlc: completion(files, 'dlc'), extras: completion(files, 'extras'), other: completion(files, 'other') }
+    completion: { main: completion(files, 'main'), dlc: completion(files, 'dlc'), extras: completion(files, 'extras'), patches: completion(files, 'patches'), languagePacks: completion(files, 'languagePacks'), other: completion(files, 'other') }
   };
 }
 export function games(): Game[] {
@@ -73,9 +77,35 @@ export function replaceFiles(gameId: string, files: RemoteFile[]) {
       $language: file.language, $version: file.version, $size: file.size, $downlink: file.downlink, $checksum: file.checksumUrl || '',
       $dlc: file.dlc || '', $selected: Number(old.get(file.key)?.selected ?? file.selected),
       $verified: Number(old.get(file.key)?.size === file.size && old.get(file.key)?.version === file.version && old.get(file.key)?.verified) });
+    for (const file of files) {
+      const previous = old.get(file.key);
+      if (previous?.size === file.size && previous.version === file.version) {
+        db.query('UPDATE remote_files SET matched=?,name=?,checksum_url=? WHERE game_id=? AND key=?').run(Number(!!previous.matched),
+          previous.verified || previous.matched ? previous.name : file.name, previous.checksumUrl || file.checksumUrl || '', gameId, file.key);
+      }
+    }
     db.query('UPDATE games SET manifest_hash=? WHERE id=?').run(manifestFingerprint(files), gameId);
   })();
 }
 export function changeJob(id: number, state: JobState, error = '') {
   db.query('UPDATE download_jobs SET state=?,error=?,updated_at=? WHERE id=?').run(state, error, now(), id);
+}
+export function mediaFor(gameId: string): MediaAsset[] {
+  return (db.query('SELECT * FROM media_assets WHERE game_id=? ORDER BY role,key').all(gameId) as Row[]).map(row => ({
+    key: row.key, gameId: row.game_id, role: row.role, url: row.url, poster: row.poster, localPath: row.local_path,
+    size: row.size, selected: !!row.selected, external: !!row.external
+  }));
+}
+export function replaceMedia(gameId: string, media: MediaAsset[]) {
+  const previous = new Map(mediaFor(gameId).map(asset => [asset.key, asset]));
+  const config = settings();
+  const insert = db.query(`INSERT INTO media_assets(game_id,key,role,url,poster,local_path,size,selected,external) VALUES (?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(game_id,key) DO UPDATE SET poster=excluded.poster,size=excluded.size`);
+  db.transaction(() => {
+    for (const asset of media) {
+      const old = previous.get(asset.key);
+      insert.run(gameId, asset.key, asset.role, asset.url, asset.poster, old?.localPath || '', asset.size,
+        Number(old?.selected ?? (asset.role === 'screenshot' || asset.role === 'additionalArtwork' ? config.storeImages : asset.role === 'video' && !asset.external ? config.storeVideos : false)), Number(asset.external));
+    }
+  })();
 }

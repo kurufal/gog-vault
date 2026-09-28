@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth;
+
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -11,9 +13,9 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::{process::{CommandChild, CommandEvent}, ShellExt};
 
 #[derive(Clone, Serialize)]
-struct Session {
-    port: u16,
-    token: String,
+pub(crate) struct Session {
+    pub(crate) port: u16,
+    pub(crate) token: String,
 }
 
 struct Backend {
@@ -22,8 +24,44 @@ struct Backend {
 }
 
 #[tauri::command]
-fn backend_session(backend: tauri::State<'_, Backend>) -> Option<Session> {
+fn backend_session(window: tauri::WebviewWindow, backend: tauri::State<'_, Backend>) -> Option<Session> {
+    if window.label() != "main" { return None; }
     backend.session.lock().ok()?.clone()
+}
+
+#[tauri::command]
+async fn start_gog_login(window: tauri::WebviewWindow, app: tauri::AppHandle, backend: tauri::State<'_, Backend>, login_url: String) -> Result<(), String> {
+    if window.label() != "main" { return Err("Unauthorized window".into()); }
+    let session = backend.session.lock().unwrap().clone().ok_or("Backend unavailable")?;
+    auth::start(app, session, login_url)
+}
+
+#[tauri::command]
+async fn cancel_gog_login(window: tauri::WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    if window.label() != "main" { return Err("Unauthorized window".into()); }
+    auth::cancel(&app)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskCapacity {
+    total_bytes: u64,
+    free_bytes: u64,
+    available_bytes: u64,
+}
+
+#[tauri::command]
+async fn disk_capacity(window: tauri::WebviewWindow, path: String) -> Result<DiskCapacity, String> {
+    if window.label() != "main" { return Err("Unauthorized window".into()); }
+    let folder = std::path::Path::new(&path);
+    if !folder.is_dir() { return Err("Vault location is unavailable".into()); }
+    let total_bytes = fs2::total_space(folder).map_err(|_| "Drive or share capacity unavailable")?;
+    let free_bytes = fs2::free_space(folder).map_err(|_| "Drive or share capacity unavailable")?;
+    let available_bytes = fs2::available_space(folder).map_err(|_| "Drive or share capacity unavailable")?;
+    if total_bytes == 0 || free_bytes > total_bytes || available_bytes > free_bytes {
+        return Err("Drive or share capacity unavailable".into());
+    }
+    Ok(DiskCapacity { total_bytes, free_bytes, available_bytes })
 }
 
 fn stop_backend(session: &Session) -> bool {
@@ -53,7 +91,8 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Backend { session: Mutex::new(None), child: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![backend_session])
+        .manage(auth::AuthState::new())
+        .invoke_handler(tauri::generate_handler![backend_session, start_gog_login, cancel_gog_login, disk_capacity])
         .setup(move |app| {
             let show = MenuItem::with_id(app, "show", "Show GOG Vault", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -116,9 +155,14 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if window.label() == "gog-auth" && matches!(event, WindowEvent::Destroyed) {
+                auth::window_closed(&window.app_handle());
+            }
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .build(tauri::generate_context!())
@@ -126,9 +170,11 @@ fn main() {
 
     app.run(|app, event| {
         if let RunEvent::Exit = event {
+            let _ = auth::cancel(app);
             let backend = app.state::<Backend>();
             let graceful = backend.session.lock().unwrap().as_ref().is_some_and(stop_backend);
-            if let Some(child) = backend.child.lock().unwrap().take() {
+            let child = backend.child.lock().unwrap().take();
+            if let Some(child) = child {
                 if !graceful { let _ = child.kill(); }
             }
         }

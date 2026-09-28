@@ -26,6 +26,11 @@ describe('archive state', () => {
     expect(completion(files, 'main')).toBe(25);
     expect(completion(files, 'extras')).toBeNull();
   });
+  test('counts identified installers without claiming checksum verification', () => {
+    const identified = file({ matched: true });
+    expect(completion([identified], 'main')).toBe(100);
+    expect(statusFor([identified], [], false, true)).toBe('Needs Verification');
+  });
   test('detects manifest changes using file IDs, sizes and versions', () => {
     expect(manifestFingerprint([file()])).not.toBe(manifestFingerprint([file({ size: 101 })]));
     expect(manifestFingerprint([file()])).not.toBe(manifestFingerprint([file({ key: 'next' })]));

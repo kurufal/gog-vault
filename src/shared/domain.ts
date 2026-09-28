@@ -1,13 +1,13 @@
 import { isAbsolute, resolve, sep } from 'node:path';
 
-export type Category = 'main' | 'dlc' | 'extras' | 'other';
+export type Category = 'main' | 'dlc' | 'extras' | 'patches' | 'languagePacks' | 'other';
 export type Platform = 'windows' | 'linux' | 'mac';
 export type JobState = 'queued' | 'downloading' | 'paused' | 'verifying' | 'complete' | 'error' | 'cancelled';
-export type VaultStatus = 'Not Downloaded' | 'Queued' | 'Downloading' | 'Paused' | 'Verifying' | 'Vaulted' | 'Update Available' | 'Incomplete' | 'Error';
+export type VaultStatus = 'Not Downloaded' | 'Queued' | 'Downloading' | 'Paused' | 'Verifying' | 'Vaulted' | 'Update Available' | 'Needs Verification' | 'Incomplete' | 'Error';
 export interface RemoteFile {
   key: string; gameId: string; name: string; category: Category; platform: Platform;
   language: string; version: string; size: number; downlink: string; checksumUrl?: string;
-  dlc?: string; selected: boolean; verified: boolean;
+  dlc?: string; selected: boolean; verified: boolean; matched?: boolean;
 }
 export interface Game {
   id: string; title: string; slug: string; cover: string; background: string;
@@ -22,7 +22,8 @@ export interface Job {
 }
 export const defaults = {
   vaultPath: '', concurrency: 2, platform: 'windows' as Platform, language: 'English',
-  dlc: true, extras: false, retries: 3, timeout: 60, view: 'tiles', reducedMotion: false
+  platforms: ['windows'] as Platform[], languages: ['English'], dlc: true, extras: false, patches: false, languagePacks: false,
+  storeImages: false, storeVideos: false, autoRefresh: false, autoScan: false, retries: 3, timeout: 60, view: 'tiles', reducedMotion: false
 };
 export type Settings = typeof defaults;
 
@@ -46,7 +47,7 @@ export function completion(files: RemoteFile[], category: Category): number | nu
   const selected = files.filter(file => file.category === category && file.selected);
   if (!selected.length) return null;
   const total = selected.reduce((sum, file) => sum + Math.max(1, file.size), 0);
-  return Math.round(100 * selected.reduce((sum, file) => sum + (file.verified ? Math.max(1, file.size) : 0), 0) / total);
+  return Math.round(100 * selected.reduce((sum, file) => sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) / total);
 }
 export function manifestFingerprint(files: RemoteFile[]): string {
   const entries = files.map(({ key, size, version, category, platform, language }) =>
@@ -64,6 +65,7 @@ export function statusFor(files: RemoteFile[], jobs: Job[], changed: boolean, ha
   const selected = files.filter(file => file.selected);
   if (changed && hasFolder) return 'Update Available';
   if (main === 100 && selected.every(file => file.verified)) return 'Vaulted';
+  if (main === 100 && selected.every(file => file.verified || file.matched)) return 'Needs Verification';
   if (hasFolder || files.some(file => file.verified)) return 'Incomplete';
   return 'Not Downloaded';
 }
@@ -76,4 +78,9 @@ export function transition(from: JobState, to: JobState): boolean {
     complete: [], cancelled: []
   };
   return allowed[from].includes(to);
+}
+export type MediaRole = 'hero' | 'card' | 'logo' | 'icon' | 'videoPoster' | 'screenshot' | 'additionalArtwork' | 'video';
+export interface MediaAsset {
+  key: string; gameId: string; role: MediaRole; url: string; poster: string;
+  localPath: string; size: number; selected: boolean; external: boolean;
 }

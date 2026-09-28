@@ -34,7 +34,7 @@ export function enqueue(gameId: string) {
   if (!settings().vaultPath) throw new Error('Select a vault directory first');
   const game = gameById(gameId);
   if (!game) throw new Error('Game not found');
-  const files = filesFor(gameId).filter(file => file.selected && !file.verified);
+  const files = filesFor(gameId).filter(file => file.selected && !file.verified && !file.matched);
   if (!files.length) throw new Error('No missing selected files to download');
   if (jobsFor(gameId).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) throw new Error('Game already in queue');
   const destination = folderName(game);

@@ -11,7 +11,11 @@ const migrations = [
   `ALTER TABLE games ADD COLUMN archived_selected_hash TEXT NOT NULL DEFAULT '';`,
   `ALTER TABLE download_files ADD COLUMN snapshot TEXT NOT NULL DEFAULT '';
    ALTER TABLE download_files ADD COLUMN destination TEXT NOT NULL DEFAULT '';
-   ALTER TABLE download_jobs ADD COLUMN desired_hash TEXT NOT NULL DEFAULT '';`
+    ALTER TABLE download_jobs ADD COLUMN desired_hash TEXT NOT NULL DEFAULT '';`,
+    `ALTER TABLE remote_files ADD COLUMN matched INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE local_files (game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE, relative_path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms INTEGER NOT NULL, sha256 TEXT NOT NULL DEFAULT '', verified_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(game_id, relative_path));`,
+    `CREATE TABLE media_assets (game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE, key TEXT NOT NULL, role TEXT NOT NULL, url TEXT NOT NULL, poster TEXT NOT NULL DEFAULT '', local_path TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, selected INTEGER NOT NULL DEFAULT 0, external INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(game_id,key));`,
+    `CREATE TABLE unlinked_folders (vault_path TEXT NOT NULL, folder TEXT NOT NULL, discovered_at TEXT NOT NULL, PRIMARY KEY(vault_path,folder));`
 ];
 
 export function migrate(db: Database) {
