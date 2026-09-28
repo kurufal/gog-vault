@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -21,6 +22,7 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
     expect(ready).toBe(true);
     expect(port).toBeGreaterThan(0);
     const base = `http://127.0.0.1:${port}`;
+    expect(existsSync(join(dataDir, 'vault'))).toBe(false);
     expect((await fetch(`${base}/api/health`)).status).toBe(401);
     expect((await fetch(`${base}/ws/queue`)).status).toBe(401);
     const unauthorized = new WebSocket(`ws://127.0.0.1:${port}/ws/queue`);
@@ -34,15 +36,25 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
     const response = await fetch(`${base}/api/health`, { headers: { Authorization: `Bearer ${token}`, Origin: 'http://tauri.localhost' } });
     expect(response.status).toBe(200);
     expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://tauri.localhost');
+    const unconfigured = await (await fetch(`${base}/api/health`, { headers: { Authorization: `Bearer ${token}` } })).json();
+    expect(unconfigured.vaultAccessible).toBe(false);
+    expect((await fetch(`${base}/api/games/42/queue`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })).status).toBe(400);
     const selected = join(dataDir, 'selected');
     await mkdir(selected);
     await mkdir(join(selected, 'Installers'));
     const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
     expect((await fetch(`${base}/api/storage/select`, { method: 'POST', headers, body: JSON.stringify({ path: selected }) })).status).toBe(200);
-    const browser = await (await fetch(`${base}/api/storage`, { headers })).json();
-    expect(browser.root).toBe(selected);
-    expect(browser.dirs).toContain('Installers');
-    const childPath = `${browser.root}/Installers`;
+    const storage = await (await fetch(`${base}/api/storage`, { headers })).json();
+    expect(storage.free).toBeGreaterThan(0);
+    expect(storage.dirs).toBeUndefined();
+    const childPath = join(selected, 'Installers');
+    const database = new Database(join(dataDir, 'vault.sqlite'));
+    try { database.query('INSERT INTO games(id,title,first_seen) VALUES (?,?,?)').run('42', 'Game', new Date().toISOString()); }
+    finally { database.close(); }
+    const outside = await mkdir(join(dataDir, 'outside'), { recursive: true }).then(() => join(dataDir, 'outside'));
+    expect((await fetch(`${base}/api/games/42/link`, { method: 'POST', headers, body: JSON.stringify({ folder: outside }) })).status).toBe(400);
+    const linked = await (await fetch(`${base}/api/games/42/link`, { method: 'POST', headers, body: JSON.stringify({ folder: childPath }) })).json();
+    expect(linked.folder).toBe('Installers');
     expect((await fetch(`${base}/api/storage/select`, { method: 'POST', headers, body: JSON.stringify({ path: childPath }) })).status).toBe(200);
     await rename(selected, join(dataDir, 'disconnected'));
     const health = await (await fetch(`${base}/api/health`, { headers })).json();
@@ -56,6 +68,9 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
       socket!.onerror = () => reject(new Error('Queue socket rejected'));
     }), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Queue socket timed out')), 5000))]);
     expect(JSON.parse(message).type).toBe('queue');
+    expect((await fetch(`${base}/api/shutdown`, { method: 'POST' })).status).toBe(401);
+    expect((await fetch(`${base}/api/shutdown`, { method: 'POST', headers })).status).toBe(200);
+    expect(await Promise.race([child.exited, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Sidecar shutdown timed out')), 5000))])).toBe(0);
   } finally {
     socket?.close();
     child.kill();

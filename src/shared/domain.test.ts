@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
-import { completion, manifestFingerprint, normalizeTitle, safeName, statusFor, transition, withinRoot, type RemoteFile } from './domain';
+import { completion, desiredFingerprint, manifestFingerprint, normalizeTitle, safeName, statusFor, transition, withinRoot, type RemoteFile } from './domain';
 
 const file = (partial: Partial<RemoteFile> = {}): RemoteFile => ({
   key: 'one', gameId: '42', name: 'setup.exe', category: 'main', platform: 'windows', language: 'English',
@@ -32,9 +32,18 @@ describe('archive state', () => {
     expect(manifestFingerprint([file()])).toBe(manifestFingerprint([file({ name: 'resolved-filename.exe' })]));
     expect(statusFor([file()], [], true, true)).toBe('Update Available');
   });
+  test('ignores remote changes to unselected platforms and extras', () => {
+    const before = [file({ verified: true }), file({ key: 'linux', platform: 'linux', selected: false }), file({ key: 'extra', category: 'extras', selected: false })];
+    const after = [before[0]!, { ...before[1]!, version: '2' }, { ...before[2]!, size: 500 }];
+    expect(manifestFingerprint(before)).not.toBe(manifestFingerprint(after));
+    expect(desiredFingerprint(before)).toBe(desiredFingerprint(after));
+    expect(statusFor(after, [], desiredFingerprint(before) !== desiredFingerprint(after), true)).toBe('Vaulted');
+  });
   test('requires main and selected DLC but not optional extras', () => {
     expect(statusFor([file({ verified: true }), file({ key: 'extra', category: 'extras', selected: false })], [], false, true)).toBe('Vaulted');
     expect(statusFor([file({ verified: true }), file({ key: 'dlc', category: 'dlc' })], [], false, true)).toBe('Incomplete');
+    expect(statusFor([file({ verified: true }), file({ key: 'extra', category: 'extras', selected: true })], [], false, true)).toBe('Incomplete');
+    expect(statusFor([file({ verified: true }), file({ key: 'patch', category: 'other', selected: true })], [], false, true)).toBe('Incomplete');
   });
   test('enforces queue transitions', () => {
     expect(transition('downloading', 'paused')).toBe(true);

@@ -18,3 +18,17 @@ test('verifies checksum XML against local bytes and rejects unavailable checksum
     expect(await verifyFile(path, 17, 'https://cdn.gog.com/test.xml')).toBe(false);
   } finally { globalThis.fetch = originalFetch; await rm(dir, { recursive: true, force: true }); }
 });
+
+test('rejects checksum metadata without a valid hash or with uncovered chunks', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gog-vault-hashes-'));
+  const path = join(dir, 'installer.bin');
+  const originalFetch = globalThis.fetch;
+  try {
+    await writeFile(path, 'offline installer');
+    globalThis.fetch = Object.assign(async () => new Response('<file md5="invalid" total_size="17"/>'), { preconnect: originalFetch.preconnect });
+    expect(await verifyFile(path, 17, 'https://cdn.gog.com/test.xml')).toBe(false);
+    const partialHash = new Bun.CryptoHasher('md5').update('offline').digest('hex');
+    globalThis.fetch = Object.assign(async () => new Response(`<file total_size="17"><chunk from="0" to="6">${partialHash}</chunk></file>`), { preconnect: originalFetch.preconnect });
+    expect(await verifyFile(path, 17, 'https://cdn.gog.com/test.xml')).toBe(false);
+  } finally { globalThis.fetch = originalFetch; await rm(dir, { recursive: true, force: true }); }
+});

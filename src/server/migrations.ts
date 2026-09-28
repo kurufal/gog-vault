@@ -7,7 +7,11 @@ const migrations = [
    CREATE TABLE download_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT NOT NULL REFERENCES games(id), state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', current_file TEXT NOT NULL DEFAULT '', bytes INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, speed INTEGER NOT NULL DEFAULT 0);
    CREATE TABLE download_files (job_id INTEGER NOT NULL REFERENCES download_jobs(id) ON DELETE CASCADE, file_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(job_id,file_key));
    CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, message TEXT NOT NULL);
-   CREATE INDEX idx_jobs_state ON download_jobs(state);`
+  CREATE INDEX idx_jobs_state ON download_jobs(state);`,
+  `ALTER TABLE games ADD COLUMN archived_selected_hash TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE download_files ADD COLUMN snapshot TEXT NOT NULL DEFAULT '';
+   ALTER TABLE download_files ADD COLUMN destination TEXT NOT NULL DEFAULT '';
+   ALTER TABLE download_jobs ADD COLUMN desired_hash TEXT NOT NULL DEFAULT '';`
 ];
 
 export function migrate(db: Database) {

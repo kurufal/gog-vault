@@ -2,7 +2,10 @@
 
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder, Manager, RunEvent, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::{process::{CommandChild, CommandEvent}, ShellExt};
@@ -23,12 +26,28 @@ fn backend_session(backend: tauri::State<'_, Backend>) -> Option<Session> {
     backend.session.lock().ok()?.clone()
 }
 
+fn stop_backend(session: &Session) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], session.port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(2)) else { return false };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let request = format!("POST /api/shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", session.token);
+    if stream.write_all(request.as_bytes()).is_err() { return false; }
+    let mut response = [0u8; 128];
+    matches!(stream.read(&mut response), Ok(size) if response[..size].starts_with(b"HTTP/1.1 200") || response[..size].starts_with(b"HTTP/1.0 200"))
+}
+
 fn main() {
     let mut random = [0u8; 32];
     OsRng.fill_bytes(&mut random);
     let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -54,7 +73,13 @@ fn main() {
                     _ => {}
                 })
                 .build(app)?;
-            let data_dir = app.path().app_data_dir()?;
+            let legacy_dir = app.path().app_data_dir()?;
+            let local_dir = app.path().app_local_data_dir()?;
+            let data_dir = if local_dir.join("vault.sqlite").exists() || !legacy_dir.join("vault.sqlite").exists() {
+                local_dir
+            } else {
+                legacy_dir
+            };
             std::fs::create_dir_all(&data_dir)?;
             let command = app.shell().sidecar("gog-vault-sidecar")?
                 .env("GOG_VAULT_SESSION_TOKEN", &token)
@@ -101,8 +126,10 @@ fn main() {
 
     app.run(|app, event| {
         if let RunEvent::Exit = event {
-            if let Some(child) = app.state::<Backend>().child.lock().unwrap().take() {
-                let _ = child.kill();
+            let backend = app.state::<Backend>();
+            let graceful = backend.session.lock().unwrap().as_ref().is_some_and(stop_backend);
+            if let Some(child) = backend.child.lock().unwrap().take() {
+                if !graceful { let _ = child.kill(); }
             }
         }
     });

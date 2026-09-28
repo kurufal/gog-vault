@@ -1,18 +1,14 @@
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { defaults, completion, manifestFingerprint, statusFor, type Game, type Job, type RemoteFile, type Settings, type JobState } from '../shared/domain';
+import { defaults, completion, desiredFingerprint, manifestFingerprint, statusFor, type Game, type Job, type RemoteFile, type Settings, type JobState } from '../shared/domain';
 import { migrate } from './migrations';
 
 export const configDir = process.env.GOG_VAULT_DATA_DIR || './config';
-export const defaultVault = join(configDir, 'vault');
 mkdirSync(configDir, { recursive: true });
 export const db = new Database(join(configDir, 'vault.sqlite'), { create: true });
 db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
 migrate(db);
-if (!db.query('SELECT value FROM settings WHERE key=?').get('vaultPath')) {
-  mkdirSync(defaultVault, { recursive: true });
-}
 
 type Row = Record<string, any>;
 export const now = () => new Date().toISOString();
@@ -35,6 +31,9 @@ export function filesFor(gameId: string): RemoteFile[] {
     checksumUrl: row.checksum_url, dlc: row.dlc, selected: !!row.selected, verified: !!row.verified
   }));
 }
+for (const row of db.query("SELECT id FROM games WHERE archived_hash!='' AND archived_selected_hash='' ").all() as { id: string }[]) {
+  db.query('UPDATE games SET archived_selected_hash=? WHERE id=?').run(desiredFingerprint(filesFor(row.id)), row.id);
+}
 export function jobsFor(gameId?: string): Job[] {
   const rows = (gameId ? db.query('SELECT * FROM download_jobs WHERE game_id=? ORDER BY id DESC').all(gameId) : db.query('SELECT * FROM download_jobs ORDER BY id DESC').all()) as Row[];
   return rows.map(row => ({ id: row.id, gameId: row.game_id, state: row.state, createdAt: row.created_at,
@@ -50,7 +49,7 @@ export function gameById(id: string): Game | null {
     firstSeen: row.first_seen, refreshedAt: row.refreshed_at, scannedAt: row.scanned_at, folder: row.folder,
     localSize: row.local_size, remoteSize: files.filter(file => file.selected).reduce((n, f) => n + f.size, 0),
     manifestHash: row.manifest_hash, archivedHash: row.archived_hash,
-    status: statusFor(files, jobsFor(id), !!row.archived_hash && row.archived_hash !== manifestHash, !!row.folder),
+    status: statusFor(files, jobsFor(id), !!row.archived_selected_hash && row.archived_selected_hash !== desiredFingerprint(files), !!row.folder),
     completion: { main: completion(files, 'main'), dlc: completion(files, 'dlc'), extras: completion(files, 'extras'), other: completion(files, 'other') }
   };
 }

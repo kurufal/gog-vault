@@ -25,12 +25,16 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run sidecar
       - run: bun run typecheck
-      - run: bun test
+      - run: bun run test
       - run: bun x tauri build --bundles ${{ matrix.bundles }}
+      - name: Package Windows portable ZIP
+        if: runner.os == 'Windows'
+        run: bun scripts/build-portable.ts
       - uses: actions/upload-artifact@v4
         with:
           name: gog-vault-${{ matrix.os }}
           path: |
             src-tauri/target/release/bundle/nsis/*
+            src-tauri/target/release/bundle/portable/*.zip
             src-tauri/target/release/bundle/deb/*
             src-tauri/target/release/bundle/appimage/*

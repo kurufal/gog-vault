@@ -6,8 +6,8 @@ import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
 import { refreshLibrary, refreshState } from './gog/library';
 import { activity, configDir, db, filesFor, gameById, games, jobsFor, replaceFiles, saveSettings, settings, upsertGame } from './db';
-import { browse, mapFolder, scanGame, scanVault, scanState, selectVault, vaultPath } from './storage';
-import { broadcast, command, enqueue, schedule, startQueue, subscribe } from './queue';
+import { mapFolder, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
+import { broadcast, command, enqueue, schedule, shutdownQueue, startQueue, subscribe } from './queue';
 
 const { token, host, port } = startupConfig();
 const allowedOrigins = new Set(['http://tauri.localhost', 'tauri://localhost', ...(process.env.GOG_VAULT_DEV === '1' ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
@@ -50,7 +50,7 @@ const app = new Elysia()
     platform: t.Optional(t.Union([t.Literal('windows'), t.Literal('linux'), t.Literal('mac')])), language: t.Optional(t.String()),
     dlc: t.Optional(t.Boolean()), extras: t.Optional(t.Boolean()), retries: t.Optional(t.Number({ minimum: 0, maximum: 10 })),
     timeout: t.Optional(t.Number({ minimum: 10, maximum: 3600 })), view: t.Optional(t.String()), reducedMotion: t.Optional(t.Boolean()) }) })
-  .get('/api/storage', async ({ query }) => browse(query.path ?? ''), { query: t.Object({ path: t.Optional(t.String()) }) })
+  .get('/api/storage', () => storageInfo())
   .post('/api/storage/select', async ({ body }) => {
     return saveSettings({ vaultPath: await selectVault(body.path) });
   }, { body: t.Object({ path: t.String() }) })
@@ -84,9 +84,15 @@ const app = new Elysia()
     if (!['pause', 'resume', 'cancel', 'remove'].includes(params.action)) throw new Error('Invalid queue action');
     command(Number(params.id), params.action as 'pause' | 'resume' | 'cancel' | 'remove'); return { ok: true };
   })
+  .post('/api/shutdown', async () => {
+    await shutdownQueue();
+    db.close();
+    setTimeout(() => process.exit(0), 50).unref();
+    return { ok: true };
+  })
   .get('/api/dashboard', async () => {
     const all = games(); const queue = jobsFor();
-    const disk = await browse().catch(() => ({ free: 0 }));
+    const disk = await storageInfo().catch(() => ({ free: 0 }));
     return { counts: { owned: all.length, vaulted: all.filter(g => g.status === 'Vaulted').length,
       missing: all.filter(g => g.status === 'Not Downloaded').length, incomplete: all.filter(g => g.status === 'Incomplete').length,
       updates: all.filter(g => g.status === 'Update Available').length, downloading: queue.filter(j => j.state === 'downloading').length,

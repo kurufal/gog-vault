@@ -53,14 +53,17 @@ export function manifestFingerprint(files: RemoteFile[]): string {
     [key, size, version, category, platform, language].join('|')).sort().join('\n');
   return new Bun.CryptoHasher('sha256').update(entries).digest('hex');
 }
+export function desiredFingerprint(files: RemoteFile[]): string {
+  return manifestFingerprint(files.filter(file => file.selected));
+}
 export function statusFor(files: RemoteFile[], jobs: Job[], changed: boolean, hasFolder: boolean): VaultStatus {
   const active = jobs.find(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state));
   if (active) return ({ queued: 'Queued', downloading: 'Downloading', paused: 'Paused', verifying: 'Verifying' } as const)[active.state as 'queued'];
   if (jobs[0]?.state === 'error') return 'Error';
   const main = completion(files, 'main');
-  const dlc = completion(files, 'dlc');
+  const selected = files.filter(file => file.selected);
   if (changed && hasFolder) return 'Update Available';
-  if (main === 100 && (dlc === null || dlc === 100)) return 'Vaulted';
+  if (main === 100 && selected.every(file => file.verified)) return 'Vaulted';
   if (hasFolder || files.some(file => file.verified)) return 'Incomplete';
   return 'Not Downloaded';
 }

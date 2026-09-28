@@ -1,12 +1,13 @@
 import { mkdir, readdir, realpath, stat, writeFile, access, constants, lstat } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { normalizeTitle, safeName, withinRoot, type Game } from '../shared/domain';
-import { activity, db, defaultVault, filesFor, gameById, games, now, settings } from './db';
-import { secureLink } from './gog/products';
+import { isAbsolute, join, relative, sep } from 'node:path';
+import { desiredFingerprint, normalizeTitle, safeName, withinRoot, type Game } from '../shared/domain';
+import { activity, db, filesFor, gameById, games, now, settings } from './db';
+import { secureLink, trustedGogUrl } from './gog/products';
 import { verifyFile } from './transfer';
 
 export async function vaultPath(relativePath = ''): Promise<string> {
-  const selected = settings().vaultPath || defaultVault;
+  const selected = settings().vaultPath;
+  if (!selected) throw new Error('Select a vault directory first');
   if (!isAbsolute(selected) || selected.includes('\0')) throw new Error('Invalid vault directory');
   const root = await realpath(selected);
   const path = withinRoot(root, relativePath);
@@ -15,24 +16,13 @@ export async function vaultPath(relativePath = ''): Promise<string> {
   if (!(await stat(real)).isDirectory()) throw new Error('Not a directory');
   return real;
 }
-export async function browse(relativePath = '') {
-  const path = await vaultPath(relativePath);
-  const root = await vaultPath();
-  const entries = await readdir(path, { withFileTypes: true });
-  const dirs: string[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-    const target = await realpath(join(path, entry.name));
-    if (target.startsWith(root + sep)) dirs.push(entry.name);
-  }
-  const storage = await statfsInfo(path);
-  return { root, path: relative(root, path).replaceAll('\\', '/'), dirs: dirs.sort(), ...storage };
-}
+export async function storageInfo() { return statfsInfo(await vaultPath()); }
 export async function selectVault(path: string) {
   if (!isAbsolute(path) || path.includes('\0')) throw new Error('Select an absolute directory');
   const real = await realpath(path);
   if (!(await stat(real)).isDirectory()) throw new Error('Not a directory');
   await access(real, constants.R_OK | constants.W_OK);
+  if ((await statfsInfo(real)).free <= 0) throw new Error('Vault directory has no free space');
   return real;
 }
 async function statfsInfo(path: string) {
@@ -42,12 +32,16 @@ async function statfsInfo(path: string) {
   try { await access(path, constants.W_OK); } catch { writable = false; }
   return { writable, free: data.bavail * data.bsize, total: data.blocks * data.bsize };
 }
-export async function gameFolder(game: Game, create = false): Promise<string> {
-  const base = await vaultPath();
+export function folderName(game: Game): string {
   const preferred = safeName(game.title);
   const occupied = db.query('SELECT id FROM games WHERE folder=? AND id!=?').get(preferred, game.id);
-  const folder = game.folder || (occupied ? `${preferred.slice(0, 140)} [${game.id}]` : preferred);
+  return game.folder || (occupied ? `${preferred.slice(0, 140)} [${game.id}]` : preferred);
+}
+export async function gameFolder(game: Game, create = false, destination = folderName(game)): Promise<string> {
+  const base = await vaultPath();
+  const folder = destination;
   if (folder.includes('/') || folder.includes('\\') || folder === '.' || folder === '..') throw new Error('Invalid game folder mapping');
+  if (game.folder && game.folder !== folder) throw new Error('Game folder mapping changed since queueing');
   const target = withinRoot(base, folder);
   if (create) {
     if (!game.folder && await lstat(target).then(() => true).catch(() => false)) throw new Error('Existing game folder must be scanned or linked first');
@@ -61,13 +55,13 @@ export async function gameFolder(game: Game, create = false): Promise<string> {
 export async function mapFolder(gameId: string, folder: string) {
   const game = gameById(gameId);
   if (!game) throw new Error('Game not found');
-  if (!folder || folder.includes('/') || folder.includes('\\') || folder.startsWith('.')) throw new Error('Select a direct child of the vault');
   const base = await vaultPath();
-  const real = await realpath(withinRoot(base, folder));
-  if (!real.startsWith(base + sep) || !(await stat(real)).isDirectory()) throw new Error('Invalid folder');
-  const existing = db.query('SELECT id FROM games WHERE folder=? AND id!=?').get(folder, gameId);
+  const real = await realpath(isAbsolute(folder) ? folder : withinRoot(base, folder));
+  const name = relative(base, real);
+  if (!name || name.startsWith('.') || name.includes('/') || name.includes('\\') || !(await stat(real)).isDirectory()) throw new Error('Select a direct child of the vault');
+  const existing = db.query('SELECT id FROM games WHERE folder=? AND id!=?').get(name, gameId);
   if (existing) throw new Error('Folder already linked to another game');
-  db.query('UPDATE games SET folder=? WHERE id=?').run(folder, gameId);
+  db.query('UPDATE games SET folder=? WHERE id=?').run(name, gameId);
   activity(`${game.title} linked to a local folder`);
 }
 export async function scanGame(id: string) {
@@ -102,9 +96,9 @@ export async function scanGame(id: string) {
   }
   db.query('UPDATE games SET scanned_at=?,local_size=? WHERE id=?').run(now(), localSize, id);
   const all = filesFor(id);
-  const required = all.filter(file => file.selected && (file.category === 'main' || file.category === 'dlc'));
+  const required = all.filter(file => file.selected);
   if (required.some(file => file.category === 'main') && required.every(file => file.verified) && !current.archivedHash) {
-    db.query('UPDATE games SET archived_hash=manifest_hash WHERE id=?').run(id);
+    db.query('UPDATE games SET archived_hash=manifest_hash,archived_selected_hash=? WHERE id=?').run(desiredFingerprint(all), id);
   }
   activity(`${current.title} scanned`);
   await writeOfflineMetadata(id);
@@ -140,7 +134,7 @@ export async function writeOfflineMetadata(gameId: string) {
   await writeSafe('metadata.json', JSON.stringify(metadata, null, 2));
   await writeSafe('manifest.json', JSON.stringify(filesFor(gameId).map(({ downlink, checksumUrl, ...file }) => file), null, 2));
   for (const [name, url] of [['cover', cover], ['background', background]] as const) {
-    if (!/^https:\/\/[^/]*\.gog\.com\//.test(url)) continue;
+    if (!trustedGogUrl(url, true)) continue;
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(15000) });
       if (response.ok && Number(response.headers.get('content-length') || 0) < 10_000_000) {

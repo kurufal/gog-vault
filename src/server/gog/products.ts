@@ -7,6 +7,13 @@ const record = z.object({ id: z.union([z.string(), z.number()]), title: z.string
 const obj = (value: unknown): Record<string, any> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
 const array = (value: unknown): any[] => Array.isArray(value) ? value : [];
 const image = (value: unknown) => typeof value === 'string' ? (value.startsWith('//') ? 'https:' + value : value.startsWith('https://') ? value : '') : '';
+export function trustedGogUrl(value: string, artwork = false): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password &&
+      (/(^|\.)gog\.com$/.test(url.hostname) || artwork && /(^|\.)gog-statics\.com$/.test(url.hostname));
+  } catch { return false; }
+}
 const platform = (value: string): Platform => value === 'osx' || value === 'mac' ? 'mac' : value === 'linux' ? 'linux' : 'windows';
 
 export function parseProduct(raw: unknown): Partial<Game> & { id: string; title: string } {
@@ -56,9 +63,9 @@ export async function secureLink(file: RemoteFile): Promise<{ url: string; check
   const data = await gogRequest<Record<string, unknown>>(file.downlink);
   if (typeof data.downlink !== 'string') throw new Error('Missing secure download link');
   const url = new URL(data.downlink);
-  if (url.protocol !== 'https:' || !/(^|\.)gog\.com$/.test(url.hostname)) throw new Error('Untrusted download host');
+  if (!trustedGogUrl(url.href)) throw new Error('Untrusted download host');
   const filename = decodeURIComponent(url.pathname.split('/').pop() || '');
-  if (data.checksum && (typeof data.checksum !== 'string' || !/^https:\/\/[^/]*\.gog\.com\//.test(data.checksum))) throw new Error('Untrusted checksum URL');
+  if (data.checksum && (typeof data.checksum !== 'string' || !trustedGogUrl(data.checksum))) throw new Error('Untrusted checksum URL');
   const checksum = typeof data.checksum === 'string' ? data.checksum : undefined;
   return { url: url.href, checksum, filename };
 }

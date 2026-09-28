@@ -4,7 +4,6 @@ import { FaApple, FaLinux, FaWindows } from "react-icons/fa";
 import {
   Activity,
   ArrowDownToLine,
-  ArrowLeft,
   ArrowRight,
   Check,
   ChevronDown,
@@ -49,9 +48,6 @@ type Page = "dashboard" | "library" | "settings";
 type Detail = { game: Game; files: RemoteFile[] };
 type Account = { connected: boolean; username: string; loginUrl: string };
 type Storage = {
-  root: string;
-  path: string;
-  dirs: string[];
   writable: boolean;
   free: number;
   total: number;
@@ -160,7 +156,6 @@ function App() {
   const [sort, setSort] = useState("Title A-Z");
   const [columnSort, setColumnSort] = useState<{ label: string; descending: boolean } | null>(null);
   const [storage, setStorage] = useState<Storage | null>(null);
-  const [storagePath, setStoragePath] = useState("");
   const [code, setCode] = useState("");
 
   const reload = async () => {
@@ -194,6 +189,7 @@ function App() {
       .then(([config, user]) => {
         setSettings(config);
         setAccount(user);
+        if (config.vaultPath) void api<Storage>("/storage").then(setStorage).catch(() => {});
       })
       .catch((e) => setError(e.message));
     void reload().catch((e) => setError(e.message));
@@ -245,16 +241,6 @@ function App() {
     notify(async () => {
       setSettings(await api<Settings>("/settings", "PATCH", input));
     }, "Saving settings");
-  const showStorage = async (path: string) => {
-    try {
-      setStorage(
-        await api<Storage>(`/storage?path=${encodeURIComponent(path)}`),
-      );
-      setStoragePath(path);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  };
   const visible = games
     .filter(
       (g) =>
@@ -841,7 +827,7 @@ function App() {
                   <div className="setting-line">
                     <span>Selected directory</span>
                     <strong>
-                      {settings?.vaultPath || "Default vault"}
+                      {settings?.vaultPath || "No vault selected"}
                     </strong>
                   </div>
                   <div className="setting-line">
@@ -871,7 +857,7 @@ function App() {
                         const path = await pickVault();
                         if (path) {
                           setSettings(await api<Settings>("/storage/select", "POST", { path }));
-                          await showStorage("");
+                          setStorage(await api<Storage>("/storage"));
                         }
                       }, "Selecting storage")}
                     >
@@ -899,53 +885,6 @@ function App() {
                   )}
                   {scan.error && (
                     <p className="field-help error-text">{scan.error}</p>
-                  )}
-                  {storage && (
-                    <div className="directory-browser">
-                      <div className="browser-location">
-                        <button
-                          title="Parent folder"
-                          onClick={() =>
-                            void showStorage(
-                              storagePath.split("/").slice(0, -1).join("/"),
-                            )
-                          }
-                          disabled={!storagePath}
-                        >
-                          <ArrowLeft size={16} />
-                        </button>
-                        <span>{settings?.vaultPath || "Default vault"}/{storagePath}</span>
-                        <button
-                          className="primary-button"
-                          onClick={() =>
-                            void notify(async () => {
-                              setSettings(
-                                await api<Settings>("/storage/select", "POST", {
-                                  path: storagePath ? `${storage.root}/${storagePath}` : storage.root,
-                                }),
-                              );
-                            }, "Selecting storage")
-                          }
-                        >
-                          Use this folder
-                        </button>
-                      </div>
-                      {storage.dirs.map((dir) => (
-                        <button
-                          className="directory"
-                          key={dir}
-                          onClick={() =>
-                            void showStorage(
-                              [storagePath, dir].filter(Boolean).join("/"),
-                            )
-                          }
-                        >
-                          <HardDrive size={15} />
-                          {dir}
-                          <ChevronRight size={15} />
-                        </button>
-                      ))}
-                    </div>
                   )}
                 </section>
                 <section className="settings-section">
@@ -1249,10 +1188,17 @@ function App() {
       {detail && (
         <GameModal
           detail={detail}
-          vaultPath={settings?.vaultPath || "Default vault"}
+          vaultPath={settings?.vaultPath || "No vault selected"}
           busy={!!busy}
           close={() => setDetail(null)}
           update={updateDetail}
+          onLinkFolder={() => void notify(async () => {
+            const folder = await pickVault();
+            if (folder) {
+              await api(`/games/${detail.game.id}/link`, "POST", { folder });
+              await openGame(detail.game.id);
+            }
+          }, "Linking folder")}
           queue={jobs.find(
             (job) =>
               job.gameId === detail.game.id &&
@@ -1276,6 +1222,7 @@ function GameModal({
   vaultPath,
   close,
   update,
+  onLinkFolder,
   busy,
   queue,
   onQueue,
@@ -1284,6 +1231,7 @@ function GameModal({
   vaultPath: string;
   close: () => void;
   update: (path: string, method?: string, body?: unknown) => void;
+  onLinkFolder: () => void;
   busy: boolean;
   queue?: Job;
   onQueue: (action: { id: number; command: string }) => void;
@@ -1291,8 +1239,6 @@ function GameModal({
   const { game, files } = detail;
   const [platform, setPlatform] = useState("All systems");
   const [language, setLanguage] = useState("All languages");
-  const [folder, setFolder] = useState("");
-  const [folders, setFolders] = useState<string[]>([]);
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key === "Escape") close();
@@ -1458,28 +1404,12 @@ function GameModal({
           {!game.folder && (
             <div className="link-folder">
               <span>Have an existing archive? Link its folder:</span>
-              <select
-                value={folder}
-                onFocus={() =>
-                  void api<Storage>("/storage").then((data) =>
-                    setFolders(data.dirs),
-                  )
-                }
-                onChange={(event) => setFolder(event.target.value)}
-              >
-                <option value="">Select a folder</option>
-                {folders.map((name) => (
-                  <option key={name}>{name}</option>
-                ))}
-              </select>
               <button
                 className="secondary-button"
-                disabled={!folder}
-                onClick={() =>
-                  update(`/games/${game.id}/link`, "POST", { folder })
-                }
+                onClick={onLinkFolder}
               >
-                Link folder
+                <HardDrive size={15} />
+                Choose game folder
               </button>
             </div>
           )}

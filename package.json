@@ -9,8 +9,9 @@
     "build:web": "vite build",
     "sidecar": "bun scripts/build-sidecar.ts",
     "build": "bun run sidecar && bun scripts/build-desktop.ts",
+    "portable": "bun run sidecar && bun x tauri build --bundles nsis && bun scripts/build-portable.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test --isolate"
   },
   "dependencies": {
     "@fontsource/audiowide": "^5.2.8",

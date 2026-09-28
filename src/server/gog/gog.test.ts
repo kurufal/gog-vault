@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { parseCode } from './auth';
-import { parseDownloads, parseProduct } from './products';
+import { parseDownloads, parseProduct, trustedGogUrl } from './products';
 
 describe('GOG auth callback', () => {
   test('accepts a code or a GOG redirect URL', () => {
@@ -41,5 +41,13 @@ describe('GOG response adapters', () => {
     const malicious = structuredClone(response);
     malicious.downloads.installers[0]!.files[0]!.downlink = 'https://example.com/evil';
     expect(parseDownloads(malicious, '42')).toHaveLength(4);
+  });
+  test('trusts only HTTPS GOG hosts without URL userinfo', () => {
+    expect(trustedGogUrl('https://cdn.gog.com/installer.xml')).toBe(true);
+    expect(trustedGogUrl('https://images.gog-statics.com/cover.jpg', true)).toBe(true);
+    expect(trustedGogUrl('https://cdn.gog.com@evil.example/installer.xml')).toBe(false);
+    expect(trustedGogUrl('https://cdn.gog.com.evil.example/installer.xml')).toBe(false);
+    expect(trustedGogUrl('http://cdn.gog.com/installer.xml')).toBe(false);
+    expect(trustedGogUrl('https://images.gog-statics.com/cover.jpg')).toBe(false);
   });
 });
