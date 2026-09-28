@@ -1,0 +1,13 @@
+services:
+  gog-vault:
+    build: .
+    container_name: gog-vault
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      TZ: ${TZ:-UTC}
+      GOG_VAULT_SECRET_KEY: ${GOG_VAULT_SECRET_KEY:-}
+    volumes:
+      - ${CONFIG_PATH:-./config}:/config
+      - ${VAULT_PATH:-./vault}:/vault
