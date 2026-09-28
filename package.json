@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --hot src/server/index.ts",
-    "dev:web": "vite --host 0.0.0.0",
-    "start": "bun src/server/index.ts",
-    "build": "vite build",
+    "dev": "bun run sidecar && tauri dev",
+    "dev:web": "vite --host 127.0.0.1",
+    "build:web": "vite build",
+    "sidecar": "bun scripts/build-sidecar.ts",
+    "build": "bun run sidecar && bun scripts/build-desktop.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
@@ -23,6 +24,10 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@tauri-apps/plugin-opener": "^2.0.0",
     "@types/bun": "latest",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

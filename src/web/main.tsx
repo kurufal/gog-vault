@@ -42,12 +42,14 @@ import type {
   Platform,
   Category,
 } from "../shared/domain";
+import { api, localArtwork, openUrl, pickVault, queueSocket } from "./desktop";
 import "./style.css";
 
 type Page = "dashboard" | "library" | "settings";
 type Detail = { game: Game; files: RemoteFile[] };
 type Account = { connected: boolean; username: string; loginUrl: string };
 type Storage = {
+  root: string;
   path: string;
   dirs: string[];
   writable: boolean;
@@ -71,20 +73,6 @@ function columnValue(game: Game, label: string): string | number {
   if (label === "Platforms") return game.platforms.join(",");
   if (label === "Status") return game.status;
   return game.title;
-}
-async function api<T>(
-  path: string,
-  method = "GET",
-  body?: unknown,
-): Promise<T> {
-  const response = await fetch("/api" + path, {
-    method,
-    headers: body === undefined ? {} : { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data as T;
 }
 function Platforms({ platforms }: { platforms: Platform[] }) {
   return (
@@ -122,9 +110,19 @@ function Artwork({
   type?: "cover" | "background";
 }) {
   const [fallback, setFallback] = useState(false);
+  const [local, setLocal] = useState("");
   const remote = type === "cover" ? game.cover : game.background;
-  const source =
-    game.folder && !fallback ? `/api/art/${game.id}/${type}` : remote;
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    if (game.folder) void localArtwork(game.id, type).then(url => {
+      objectUrl = url;
+      if (active) setLocal(url);
+      else URL.revokeObjectURL(url);
+    }).catch(() => {});
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); setLocal(""); };
+  }, [game.id, game.folder, type]);
+  const source = local && !fallback ? local : remote;
   return source ? (
     <img src={source} onError={() => setFallback(true)} alt="" loading="lazy" />
   ) : (
@@ -202,13 +200,14 @@ function App() {
     const timer = setInterval(() => {
       void reload().catch(() => {});
     }, 6000);
-    let socket: WebSocket;
+    let socket: WebSocket | undefined;
     let reconnect: ReturnType<typeof setTimeout>;
+    let stopped = false;
     function connect() {
-      socket = new WebSocket(
-        `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/queue`,
-      );
-      socket.onmessage = (event) => {
+      void queueSocket().then(connection => {
+        if (stopped) { connection.close(); return; }
+        socket = connection;
+        connection.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
           if (message.type === "queue") {
@@ -216,17 +215,16 @@ function App() {
             void api<Game[]>("/games").then(setGames);
           }
         } catch {}
-      };
-      socket.onclose = () => {
-        reconnect = setTimeout(connect, 3000);
-      };
+        };
+        connection.onclose = () => { if (!stopped) reconnect = setTimeout(connect, 3000); };
+      }).catch(e => setError((e as Error).message));
     }
     connect();
     return () => {
+      stopped = true;
       clearInterval(timer);
       clearTimeout(reconnect);
-      socket.onclose = null;
-      socket.close();
+      if (socket) { socket.onclose = null; socket.close(); }
     };
   }, []);
   const openGame = async (id: string) => {
@@ -773,11 +771,7 @@ function App() {
                         className="primary-button"
                         onClick={() => {
                           if (account?.loginUrl)
-                            window.open(
-                              account.loginUrl,
-                              "_blank",
-                              "noopener,noreferrer",
-                            );
+                            void openUrl(account.loginUrl).catch((e) => setError(e.message));
                         }}
                       >
                         Connect GOG <ArrowRight size={16} />
@@ -841,19 +835,18 @@ function App() {
                     <HardDrive size={21} />
                     <div>
                       <h2>Storage</h2>
-                      <p>Files are written on the server inside /vault.</p>
+                      <p>Choose a local drive or network share for your archive.</p>
                     </div>
                   </div>
                   <div className="setting-line">
                     <span>Selected directory</span>
                     <strong>
-                      /vault
-                      {settings?.vaultPath ? `/${settings.vaultPath}` : ""}
+                      {settings?.vaultPath || "Default vault"}
                     </strong>
                   </div>
                   <div className="setting-line">
                     <span>Configuration</span>
-                    <strong>/config</strong>
+                    <strong>Application data</strong>
                   </div>
                   <div className="setting-line">
                     <span>Free space</span>
@@ -874,12 +867,16 @@ function App() {
                   <div className="settings-actions">
                     <button
                       className="secondary-button"
-                      onClick={() =>
-                        void showStorage(settings?.vaultPath || "")
-                      }
+                      onClick={() => void notify(async () => {
+                        const path = await pickVault();
+                        if (path) {
+                          setSettings(await api<Settings>("/storage/select", "POST", { path }));
+                          await showStorage("");
+                        }
+                      }, "Selecting storage")}
                     >
                       <HardDrive size={16} />
-                      Browse server folders
+                      Choose vault folder
                     </button>
                     <button
                       className="secondary-button"
@@ -917,14 +914,14 @@ function App() {
                         >
                           <ArrowLeft size={16} />
                         </button>
-                        <span>/vault/{storagePath}</span>
+                        <span>{settings?.vaultPath || "Default vault"}/{storagePath}</span>
                         <button
                           className="primary-button"
                           onClick={() =>
                             void notify(async () => {
                               setSettings(
                                 await api<Settings>("/storage/select", "POST", {
-                                  path: storagePath,
+                                  path: storagePath ? `${storage.root}/${storagePath}` : storage.root,
                                 }),
                               );
                             }, "Selecting storage")
@@ -1252,6 +1249,7 @@ function App() {
       {detail && (
         <GameModal
           detail={detail}
+          vaultPath={settings?.vaultPath || "Default vault"}
           busy={!!busy}
           close={() => setDetail(null)}
           update={updateDetail}
@@ -1275,6 +1273,7 @@ function App() {
 
 function GameModal({
   detail,
+  vaultPath,
   close,
   update,
   busy,
@@ -1282,6 +1281,7 @@ function GameModal({
   onQueue,
 }: {
   detail: Detail;
+  vaultPath: string;
   close: () => void;
   update: (path: string, method?: string, body?: unknown) => void;
   busy: boolean;
@@ -1428,7 +1428,7 @@ function GameModal({
               <div>
                 <span>LOCAL FOLDER</span>
                 <strong>
-                  {game.folder ? `/vault/${game.folder}` : "Not linked"}
+                  {game.folder ? `${vaultPath}/${game.folder}` : "Not linked"}
                 </strong>
               </div>
               <div>

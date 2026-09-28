@@ -3,7 +3,7 @@ import { readdir, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { transition, type Job, type JobState } from '../shared/domain';
 import { downloadFile } from './transfer';
-import { gameFolder, writeOfflineMetadata } from './storage';
+import { gameFolder, vaultPath, writeOfflineMetadata } from './storage';
 
 const running = new Map<number, AbortController>();
 const listeners = new Set<(jobs: Job[]) => void>();
@@ -12,6 +12,7 @@ export function broadcast() { const jobs = jobsFor(); for (const listener of lis
 export function startQueue() {
   db.query("UPDATE download_jobs SET state='queued',updated_at=? WHERE state IN ('downloading','verifying')").run(now());
   schedule();
+  setInterval(schedule, 15000).unref();
 }
 export function enqueue(gameId: string) {
   const game = gameById(gameId);
@@ -44,7 +45,7 @@ let scheduling = false;
 export function schedule() {
   if (scheduling) return;
   scheduling = true;
-  queueMicrotask(() => {
+  void vaultPath().then(() => {
     scheduling = false;
     const slots = Math.max(1, settings().concurrency) - running.size;
     for (const job of jobsFor().filter(entry => entry.state === 'queued').slice(0, Math.max(0, slots))) {
@@ -52,7 +53,7 @@ export function schedule() {
       running.set(job.id, controller);
       void run(job, controller).finally(() => { running.delete(job.id); broadcast(); schedule(); });
     }
-  });
+  }).catch(() => { scheduling = false; });
 }
 async function run(job: Job, controller: AbortController) {
   const game = gameById(job.gameId);
@@ -94,6 +95,7 @@ async function run(job: Job, controller: AbortController) {
     changeJob(job.id, 'complete');
     db.query('UPDATE download_jobs SET bytes=total,speed=0,current_file=? WHERE id=?').run('', job.id);
     activity(`${game.title} download verified`);
+    console.log(JSON.stringify({ event: 'download_complete', title: game.title }));
   } catch (error) {
     if (!controller.signal.aborted) {
       const message = error instanceof Error ? error.message : 'Download failed';

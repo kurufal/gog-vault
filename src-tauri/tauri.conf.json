@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GOG Vault",
+  "version": "0.1.0",
+  "identifier": "app.gogvault.desktop",
+  "build": {
+    "beforeDevCommand": "bun run dev:web",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "bun run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "GOG Vault", "width": 1360, "height": 850, "minWidth": 900, "minHeight": 620 }],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' https://*.gog.com https://*.gog-statics.com data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/gog-vault-sidecar"],
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}

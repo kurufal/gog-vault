@@ -1,15 +1,32 @@
 import { Elysia, t } from 'elysia';
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { access, constants } from 'node:fs/promises';
+import { startupConfig, validSession } from './startup';
 import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
 import { refreshLibrary, refreshState } from './gog/library';
-import { activity, configDir, db, filesFor, gameById, games, jobsFor, replaceFiles, saveSettings, settings, upsertGame, vaultRoot } from './db';
-import { browse, mapFolder, scanGame, scanVault, scanState, vaultPath } from './storage';
+import { activity, configDir, db, filesFor, gameById, games, jobsFor, replaceFiles, saveSettings, settings, upsertGame } from './db';
+import { browse, mapFolder, scanGame, scanVault, scanState, selectVault, vaultPath } from './storage';
 import { broadcast, command, enqueue, schedule, startQueue, subscribe } from './queue';
 
+const { token, host, port } = startupConfig();
+const allowedOrigins = new Set(['http://tauri.localhost', 'tauri://localhost', ...(process.env.GOG_VAULT_DEV === '1' ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
 const app = new Elysia()
+  .onRequest(({ request }) => {
+    const origin = request.headers.get('origin');
+    if (origin && !allowedOrigins.has(origin)) return new Response('Forbidden', { status: 403 });
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: {
+      'Access-Control-Allow-Origin': origin || '', 'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type'
+    } });
+    const url = new URL(request.url);
+    const provided = url.pathname === '/ws/queue' ? url.searchParams.get('session') : request.headers.get('authorization')?.replace(/^Bearer /, '') || null;
+    if (!validSession(token, provided)) return new Response('Unauthorized', { status: 401 });
+  })
+  .onAfterHandle(({ request, set }) => {
+    const origin = request.headers.get('origin');
+    if (origin && allowedOrigins.has(origin)) set.headers['Access-Control-Allow-Origin'] = origin;
+  })
   .onError(({ error, code, set }) => {
     const message = code === 'VALIDATION' ? 'Invalid request' : error instanceof Error ? error.message : 'Request failed';
     set.status = code === 'VALIDATION' ? 400 : /not found/i.test(message) ? 404 : /invalid|unsafe|escapes|select|cannot|already|missing|no |stop /i.test(message) ? 400 : 500;
@@ -20,8 +37,8 @@ const app = new Elysia()
     let configWritable = false, vaultAccessible = false, vaultWritable = false, database = false;
     try { db.query('SELECT 1').get(); database = true; } catch {}
     try { await access(configDir, constants.W_OK); configWritable = true; } catch {}
-    try { await access(vaultRoot, constants.R_OK); vaultAccessible = true; await access(vaultRoot, constants.W_OK); vaultWritable = true; } catch {}
-    const healthy = database && configWritable && vaultAccessible && vaultWritable;
+    try { const path = await vaultPath(); await access(path, constants.R_OK); vaultAccessible = true; await access(path, constants.W_OK); vaultWritable = true; } catch {}
+    const healthy = database && configWritable;
     if (!healthy) set.status = 503;
     return { healthy, database, configWritable, vaultAccessible, vaultWritable };
   })
@@ -33,10 +50,9 @@ const app = new Elysia()
     platform: t.Optional(t.Union([t.Literal('windows'), t.Literal('linux'), t.Literal('mac')])), language: t.Optional(t.String()),
     dlc: t.Optional(t.Boolean()), extras: t.Optional(t.Boolean()), retries: t.Optional(t.Number({ minimum: 0, maximum: 10 })),
     timeout: t.Optional(t.Number({ minimum: 10, maximum: 3600 })), view: t.Optional(t.String()), reducedMotion: t.Optional(t.Boolean()) }) })
-  .get('/api/storage', async ({ query }) => browse(query.path ?? settings().vaultPath), { query: t.Object({ path: t.Optional(t.String()) }) })
+  .get('/api/storage', async ({ query }) => browse(query.path ?? ''), { query: t.Object({ path: t.Optional(t.String()) }) })
   .post('/api/storage/select', async ({ body }) => {
-    await vaultPath(body.path);
-    return saveSettings({ vaultPath: body.path });
+    return saveSettings({ vaultPath: await selectVault(body.path) });
   }, { body: t.Object({ path: t.String() }) })
   .get('/api/gog/auth', async () => ({ ...await accountInfo(), loginUrl }))
   .post('/api/gog/auth', async ({ body }) => { const result = await connect(body.code); activity(`GOG account connected: ${result.username}`); return result; }, { body: t.Object({ code: t.String() }) })
@@ -70,7 +86,7 @@ const app = new Elysia()
   })
   .get('/api/dashboard', async () => {
     const all = games(); const queue = jobsFor();
-    const disk = await browse(settings().vaultPath);
+    const disk = await browse().catch(() => ({ free: 0 }));
     return { counts: { owned: all.length, vaulted: all.filter(g => g.status === 'Vaulted').length,
       missing: all.filter(g => g.status === 'Not Downloaded').length, incomplete: all.filter(g => g.status === 'Incomplete').length,
       updates: all.filter(g => g.status === 'Update Available').length, downloading: queue.filter(j => j.state === 'downloading').length,
@@ -86,27 +102,15 @@ const app = new Elysia()
     if (await realpath(dir) !== dir) throw new Error('Artwork not found');
     for (const ext of ['jpg', 'png']) {
       const file = join(dir, `${params.kind}.${ext}`);
-      if (existsSync(file)) { set.headers['Cache-Control'] = 'private, max-age=3600'; return Bun.file(file); }
+      if (await Bun.file(file).exists()) { set.headers['Cache-Control'] = 'private, max-age=3600'; return Bun.file(file); }
     }
     throw new Error('Artwork not found');
-  })
-  .get('/api/texture/:name', ({ params }) => {
-    if (!['noise.gif', 'line-BG.png'].includes(params.name)) throw new Error('Texture not found');
-    return Bun.file(join(import.meta.dir, '../..', params.name));
   })
   .ws('/ws/queue', {
     open(ws) { const unsubscribe = subscribe(jobs => ws.send(JSON.stringify({ type: 'queue', jobs }))); (ws.data as any).unsubscribe = unsubscribe; ws.send(JSON.stringify({ type: 'queue', jobs: jobsFor() })); },
     close(ws) { (ws.data as any).unsubscribe?.(); }
-  })
-  .get('/', () => Bun.file(join(import.meta.dir, '../..', 'dist/index.html')))
-  .get('/*', ({ request, set }) => {
-    const path = new URL(request.url).pathname;
-    if (path.startsWith('/api/') || path.startsWith('/ws/')) { set.status = 404; return { error: 'Not found' }; }
-    const filename = join(import.meta.dir, '../..', 'dist', path.replace(/^\/+/, ''));
-    if (existsSync(filename) && !path.includes('..')) return Bun.file(filename);
-    return Bun.file(join(import.meta.dir, '../..', 'dist/index.html'));
   });
 
 startQueue();
-app.listen({ hostname: '0.0.0.0', port: Number(process.env.PORT || 3000) });
-console.log(`GOG Vault listening on ${app.server?.hostname}:${app.server?.port}`);
+app.listen({ hostname: host, port });
+console.log(JSON.stringify({ ready: true, port: app.server?.port }));

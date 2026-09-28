@@ -1,12 +1,14 @@
 import { mkdir, readdir, realpath, stat, writeFile, access, constants, lstat } from 'node:fs/promises';
-import { join, relative, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { normalizeTitle, safeName, withinRoot, type Game } from '../shared/domain';
-import { activity, db, filesFor, gameById, games, now, settings, vaultRoot } from './db';
+import { activity, db, defaultVault, filesFor, gameById, games, now, settings } from './db';
 import { secureLink } from './gog/products';
 import { verifyFile } from './transfer';
 
-export async function vaultPath(relativePath = settings().vaultPath): Promise<string> {
-  const root = await realpath(vaultRoot);
+export async function vaultPath(relativePath = ''): Promise<string> {
+  const selected = settings().vaultPath || defaultVault;
+  if (!isAbsolute(selected) || selected.includes('\0')) throw new Error('Invalid vault directory');
+  const root = await realpath(selected);
   const path = withinRoot(root, relativePath);
   const real = await realpath(path);
   if (real !== root && !real.startsWith(root + sep)) throw new Error('Path escapes vault through a symlink');
@@ -15,7 +17,7 @@ export async function vaultPath(relativePath = settings().vaultPath): Promise<st
 }
 export async function browse(relativePath = '') {
   const path = await vaultPath(relativePath);
-  const root = await realpath(vaultRoot);
+  const root = await vaultPath();
   const entries = await readdir(path, { withFileTypes: true });
   const dirs: string[] = [];
   for (const entry of entries) {
@@ -24,7 +26,14 @@ export async function browse(relativePath = '') {
     if (target.startsWith(root + sep)) dirs.push(entry.name);
   }
   const storage = await statfsInfo(path);
-  return { path: relative(root, path).replaceAll('\\', '/'), dirs: dirs.sort(), ...storage };
+  return { root, path: relative(root, path).replaceAll('\\', '/'), dirs: dirs.sort(), ...storage };
+}
+export async function selectVault(path: string) {
+  if (!isAbsolute(path) || path.includes('\0')) throw new Error('Select an absolute directory');
+  const real = await realpath(path);
+  if (!(await stat(real)).isDirectory()) throw new Error('Not a directory');
+  await access(real, constants.R_OK | constants.W_OK);
+  return real;
 }
 async function statfsInfo(path: string) {
   const { statfs } = await import('node:fs/promises');
@@ -106,6 +115,7 @@ export async function scanVault() {
   if (scanState.running) return;
   scanState.running = true; scanState.done = 0; scanState.error = '';
   try {
+    await vaultPath();
     const all = games(); scanState.total = all.length;
     for (const game of all) {
       try { await scanGame(game.id); } catch (error) { console.warn(`Scan ${game.id}: ${error instanceof Error ? error.message : 'failed'}`); }

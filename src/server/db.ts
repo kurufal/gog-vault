@@ -4,13 +4,15 @@ import { join } from 'node:path';
 import { defaults, completion, manifestFingerprint, statusFor, type Game, type Job, type RemoteFile, type Settings, type JobState } from '../shared/domain';
 import { migrate } from './migrations';
 
-export const configDir = process.env.CONFIG_DIR || './config';
-export const vaultRoot = process.env.VAULT_ROOT || './vault';
+export const configDir = process.env.GOG_VAULT_DATA_DIR || './config';
+export const defaultVault = join(configDir, 'vault');
 mkdirSync(configDir, { recursive: true });
-mkdirSync(vaultRoot, { recursive: true });
 export const db = new Database(join(configDir, 'vault.sqlite'), { create: true });
 db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
 migrate(db);
+if (!db.query('SELECT value FROM settings WHERE key=?').get('vaultPath')) {
+  mkdirSync(defaultVault, { recursive: true });
+}
 
 type Row = Record<string, any>;
 export const now = () => new Date().toISOString();

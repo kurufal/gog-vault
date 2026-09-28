@@ -6,5 +6,5 @@ export default defineConfig({
   root: 'src/web',
   base: '/',
   build: { outDir: '../../dist', emptyOutDir: true },
-  server: { proxy: { '/api': 'http://localhost:3000', '/ws': { target: 'ws://localhost:3000', ws: true } } }
+  server: { host: '127.0.0.1' }
 });
