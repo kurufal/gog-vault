@@ -1,17 +1,20 @@
 import { Elysia, t } from 'elysia';
+import { randomUUID } from 'node:crypto';
 import { join, sep } from 'node:path';
 import { access, constants } from 'node:fs/promises';
-import { withinRoot } from '../shared/domain';
+import { withinRoot } from './paths';
 import { startupConfig, validSession } from './startup';
 import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
 import { refreshLibrary, refreshState } from './gog/library';
 import { activity, configDir, db, filesFor, gameById, games, jobsFor, mediaFor, replaceFiles, replaceMedia, saveSettings, settings, upsertGame } from './db';
-import { cancelScan, mapFolder, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
+import { cancelScan, ignoreFolder, importGame, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
 import { archiveMedia, selectMedia } from './media';
 import { broadcast, command, enqueue, schedule, shutdownQueue, startQueue, subscribe } from './queue';
 
 const { token, host, port } = startupConfig();
+let playbackPort = port;
+const mediaTickets = new Map<string, { id: string; key: string; expires: number }>();
 const allowedOrigins = new Set(['http://tauri.localhost', 'tauri://localhost', ...(process.env.GOG_VAULT_DEV === '1' ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
 const app = new Elysia()
   .onRequest(({ request }) => {
@@ -22,6 +25,10 @@ const app = new Elysia()
       'Access-Control-Allow-Headers': 'Authorization, Content-Type'
     } });
     const url = new URL(request.url);
+    const mediaMatch = /^\/api\/media\/(\d+)\/([a-f0-9]{20})$/.exec(url.pathname);
+    const ticket = url.searchParams.get('ticket');
+    const grant = ticket ? mediaTickets.get(ticket) : undefined;
+    if (request.method === 'GET' && mediaMatch && grant?.id === mediaMatch[1] && grant.key === mediaMatch[2] && grant.expires > Date.now()) return;
     const provided = url.pathname === '/ws/queue' ? url.searchParams.get('session') : request.headers.get('authorization')?.replace(/^Bearer /, '') || null;
     if (!validSession(token, provided)) return new Response('Unauthorized', { status: 401 });
   })
@@ -55,7 +62,10 @@ const app = new Elysia()
     timeout: t.Optional(t.Number({ minimum: 10, maximum: 3600 })), view: t.Optional(t.String()), reducedMotion: t.Optional(t.Boolean()) }) })
   .get('/api/storage', () => storageInfo())
   .post('/api/storage/select', async ({ body }) => {
-    return saveSettings({ vaultPath: await selectVault(body.path) });
+    const path = await selectVault(body.path);
+    const config = saveSettings({ vaultPath: path });
+    loadScanFolders(path);
+    return config;
   }, { body: t.Object({ path: t.String() }) })
   .get('/api/gog/auth', async () => ({ ...await accountInfo(), loginUrl }))
   .post('/api/gog/auth', async ({ body }) => { const result = await connect(body.code); activity(`GOG account connected: ${result.username}`); return result; }, { body: t.Object({ code: t.String() }) })
@@ -95,26 +105,25 @@ const app = new Elysia()
     return { game: gameById(params.id), files: filesFor(params.id), media: mediaFor(params.id) };
   }, { body: t.Object({ files: t.Array(t.Object({ key: t.String(), selected: t.Boolean() })) }) })
   .post('/api/games/:id/media/archive', async ({ params }) => archiveMedia(params.id))
-  .post('/api/games/:id/link', async ({ params, body }) => { await mapFolder(params.id, body.folder); return gameById(params.id); }, { body: t.Object({ folder: t.String() }) })
+  .post('/api/games/:id/link', async ({ params, body }) => linkAndScan(params.id, body.folder), { body: t.Object({ folder: t.String() }) })
   .post('/api/games/:id/scan', async ({ params }) => scanGame(params.id))
   .post('/api/games/:id/verify', async ({ params }) => scanGame(params.id, true))
   .post('/api/storage/scan', () => { void scanVault(); return { started: true }; })
   .get('/api/storage/scan', () => scanState)
+  .get('/api/storage/matches', async () => matchingReview())
+  .post('/api/storage/matches/ignore', async ({ body }) => ignoreFolder(body.folder), { body: t.Object({ folder: t.String() }) })
   .post('/api/storage/scan/cancel', () => { cancelScan(); return { cancelled: true }; })
   .get('/api/storage/organize', async () => organizePreview())
   .post('/api/storage/organize/:id', async ({ params }) => organizeGame(params.id))
+  .post('/api/storage/import/preview', async ({ body }) => importPreview(body.path), { body: t.Object({ path: t.String() }) })
+  .post('/api/storage/import', async ({ body }) => importGame(body.source, body.id, body.signature, body.mode), { body: t.Object({ source: t.String(), id: t.String(), signature: t.String(), mode: t.Union([t.Literal('copy'), t.Literal('move')]) }) })
   .post('/api/games/:id/queue', ({ params }) => ({ id: enqueue(params.id) }))
   .get('/api/queue', () => jobsFor())
   .post('/api/queue/:id/:action', ({ params }) => {
     if (!['pause', 'resume', 'cancel', 'remove'].includes(params.action)) throw new Error('Invalid queue action');
     command(Number(params.id), params.action as 'pause' | 'resume' | 'cancel' | 'remove'); return { ok: true };
   })
-  .post('/api/shutdown', async () => {
-    await shutdownQueue();
-    db.close();
-    setTimeout(() => process.exit(0), 50).unref();
-    return { ok: true };
-  })
+  .post('/api/shutdown', async () => { await stopServer(); return { ok: true }; })
   .get('/api/dashboard', async () => {
     const all = games(); const queue = jobsFor();
     const disk = await storageInfo().catch(() => ({ available: null }));
@@ -129,15 +138,25 @@ const app = new Elysia()
     const game = gameById(params.id);
     if (!game?.folder) throw new Error('Artwork not found');
     const dir = join(await vaultPath(), game.folder, '.gog-vault');
-    const { realpath } = await import('node:fs/promises');
+    const { realpath, lstat } = await import('node:fs/promises');
     if (await realpath(dir) !== dir) throw new Error('Artwork not found');
-    for (const ext of ['jpg', 'png', 'webp']) {
-      const file = join(dir, `${params.kind}.${ext}`);
-      if (await Bun.file(file).exists()) { set.headers['Cache-Control'] = 'private, max-age=3600'; return Bun.file(file); }
+    for (const folder of [join(dir, 'artwork'), dir]) {
+      if (folder !== dir && !await lstat(folder).then(info => info.isDirectory()).catch(() => false)) continue;
+      if (await realpath(folder) !== folder) continue;
+      for (const ext of ['jpg', 'png', 'webp']) {
+        const file = join(folder, `${params.kind}.${ext}`);
+        if (await lstat(file).then(info => info.isFile()).catch(() => false)) { set.headers['Cache-Control'] = 'private, max-age=3600'; return Bun.file(file); }
+      }
     }
     throw new Error('Artwork not found');
   })
-  .get('/api/media/:id/:key', async ({ params, set }) => {
+  .get('/api/media-url/:id/:key', ({ params }) => {
+    if (!mediaFor(params.id).some(item => item.key === params.key && item.localPath)) throw new Error('Media not archived');
+    const ticket = randomUUID();
+    mediaTickets.set(ticket, { id: params.id, key: params.key, expires: Date.now() + 6 * 60 * 60 * 1000 });
+    return { url: `http://127.0.0.1:${playbackPort}/api/media/${encodeURIComponent(params.id)}/${encodeURIComponent(params.key)}?ticket=${ticket}` };
+  })
+  .get('/api/media/:id/:key', async ({ params, set, request }) => {
     if (!/^\d+$/.test(params.id) || !/^[a-f0-9]{20}$/.test(params.key)) throw new Error('Invalid media asset');
     const asset = mediaFor(params.id).find(item => item.key === params.key);
     const game = gameById(params.id);
@@ -148,8 +167,21 @@ const app = new Elysia()
     const { realpath, lstat } = await import('node:fs/promises');
     const resolved = await realpath(path);
     if (!resolved.startsWith(folder + sep) || !(await lstat(resolved)).isFile()) throw new Error('Unsafe media file');
-    set.headers['Cache-Control'] = 'private, max-age=3600';
-    return Bun.file(resolved);
+    const file = Bun.file(resolved);
+    const headers = { 'Content-Type': asset.mimeType || file.type || 'application/octet-stream',
+      'Accept-Ranges': 'bytes', 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' };
+    const range = request.headers.get('range');
+    if (!range) return new Response(file, { headers });
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const start = match?.[1] ? Number(match[1]) : match?.[2] ? Math.max(0, file.size - Number(match[2])) : NaN;
+    const end = match?.[1] && match[2] ? Math.min(file.size - 1, Number(match[2])) : file.size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start > end || end >= file.size) {
+      set.status = 416;
+      set.headers['Content-Range'] = `bytes */${file.size}`;
+      return new Response(null, { status: 416, headers: { ...headers, 'Content-Range': `bytes */${file.size}` } });
+    }
+    return new Response(file.slice(start, end + 1), { status: 206, headers: { ...headers,
+      'Content-Range': `bytes ${start}-${end}/${file.size}`, 'Content-Length': String(end - start + 1) } });
   })
   .ws('/ws/queue', {
     open(ws) { const unsubscribe = subscribe(jobs => ws.send(JSON.stringify({ type: 'queue', jobs }))); (ws.data as any).unsubscribe = unsubscribe; ws.send(JSON.stringify({ type: 'queue', jobs: jobsFor() })); },
@@ -158,7 +190,23 @@ const app = new Elysia()
 
 startQueue();
 app.listen({ hostname: host, port });
+playbackPort = app.server?.port || port;
 console.log(JSON.stringify({ ready: true, port: app.server?.port }));
+let stopping = false;
+async function stopServer() {
+  if (stopping) return;
+  stopping = true;
+  await shutdownQueue();
+  db.close();
+  setTimeout(() => process.exit(0), 50).unref();
+}
+const parentPid = Number(process.env.GOG_VAULT_PARENT_PID);
+if (Number.isSafeInteger(parentPid) && parentPid > 0) {
+  setInterval(() => {
+    try { process.kill(parentPid, 0); }
+    catch { void stopServer(); }
+  }, 1000).unref();
+}
 const automation = settings();
 if (automation.autoScan && automation.vaultPath) void scanVault();
 if (automation.autoRefresh) void accountInfo().then(account => { if (account.connected) return refreshLibrary(); }).catch(() => {});

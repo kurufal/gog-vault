@@ -55,6 +55,9 @@ export async function localMedia(gameId: string, key: string): Promise<string> {
   if (!response.ok) throw new Error('Media not archived');
   return URL.createObjectURL(await response.blob());
 }
+export async function streamedMedia(gameId: string, key: string): Promise<string> {
+  return (await api<{ url: string }>(`/media-url/${encodeURIComponent(gameId)}/${encodeURIComponent(key)}`)).url;
+}
 
 export async function pickVault(): Promise<string | null> {
   return open({ directory: true, multiple: false });

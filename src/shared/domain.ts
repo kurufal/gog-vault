@@ -1,5 +1,3 @@
-import { isAbsolute, resolve, sep } from 'node:path';
-
 export type Category = 'main' | 'dlc' | 'extras' | 'patches' | 'languagePacks' | 'other';
 export type Platform = 'windows' | 'linux' | 'mac';
 export type JobState = 'queued' | 'downloading' | 'paused' | 'verifying' | 'complete' | 'error' | 'cancelled';
@@ -8,9 +6,15 @@ export interface RemoteFile {
   key: string; gameId: string; name: string; category: Category; platform: Platform;
   language: string; version: string; size: number; downlink: string; checksumUrl?: string;
   dlc?: string; selected: boolean; verified: boolean; matched?: boolean;
+  verificationSource?: 'gog-checksum' | 'local-sha256' | ''; verifiedSize?: number;
+}
+export interface DownloadFailure {
+  stage: string; productId: string; fileId: string; filename: string; partNumber: number | null;
+  httpStatus: number | null; errorCode: string; safeMessage: string; technicalMessage: string;
+  timestamp: string; retryable: boolean;
 }
 export interface Game {
-  id: string; title: string; slug: string; cover: string; background: string;
+  id: string; title: string; slug: string; cover: string; background: string; logo?: string;
   releaseDate: string; platforms: Platform[]; languages: string[]; firstSeen: string;
   refreshedAt: string; scannedAt: string; folder: string; localSize: number;
   remoteSize: number; status: VaultStatus; manifestHash: string; archivedHash: string;
@@ -19,6 +23,7 @@ export interface Game {
 export interface Job {
   id: number; gameId: string; state: JobState; createdAt: string; updatedAt: string;
   error: string; currentFile: string; bytes: number; total: number; speed: number;
+  errorDetails?: DownloadFailure | null;
 }
 export const defaults = {
   vaultPath: '', concurrency: 2, platform: 'windows' as Platform, language: 'English',
@@ -27,21 +32,19 @@ export const defaults = {
 };
 export type Settings = typeof defaults;
 
+export function usedCapacity(total: number | null, free: number | null): number | null {
+  if (total === null || free === null || !Number.isSafeInteger(total) || !Number.isSafeInteger(free) || free < 0 || free > total) return null;
+  return total - free;
+}
+
 export function safeName(value: string): string {
-  const name = value.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').trim();
+  const name = value.replace(/^[\\/]+|[\\/]+$/g, '').replace(/\s*[/\\]\s*/g, ' - ').replace(/[:<>"|?*\x00-\x1f]/g, ' ').replace(/\s+/g, ' ').trim().replace(/[. ]+$/g, '');
   const clean = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(name) ? `_${name}` : name;
   return clean.slice(0, 180) || 'Untitled';
 }
 export function normalizeTitle(value: string): string {
   return value.normalize('NFKD').toLowerCase().replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
-}
-export function withinRoot(root: string, relative: string): string {
-  if (isAbsolute(relative) || /^[a-z]:/i.test(relative) || relative.includes('\0') || relative.includes('\\')) throw new Error('Invalid vault path');
-  const base = resolve(root);
-  const result = resolve(base, relative);
-  if (result !== base && !result.startsWith(base + sep)) throw new Error('Path escapes vault');
-  return result;
 }
 export function completion(files: RemoteFile[], category: Category): number | null {
   const selected = files.filter(file => file.category === category && file.selected);
@@ -82,5 +85,11 @@ export function transition(from: JobState, to: JobState): boolean {
 export type MediaRole = 'hero' | 'card' | 'logo' | 'icon' | 'videoPoster' | 'screenshot' | 'additionalArtwork' | 'video';
 export interface MediaAsset {
   key: string; gameId: string; role: MediaRole; url: string; poster: string;
-  localPath: string; size: number; selected: boolean; external: boolean;
+  sourceUrl?: string; localPath: string; size: number; selected: boolean; external: boolean;
+  width?: number; height?: number; mimeType?: string;
+  sha256?: string; provider?: string; videoId?: string; embedUrl?: string; title?: string;
+}
+
+export function removeUnresolvedFolder(folders: string[], folder: string): string[] {
+  return folders.filter(item => item !== folder);
 }

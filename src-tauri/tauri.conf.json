@@ -12,7 +12,7 @@
   "app": {
     "windows": [{ "title": "GOG Vault", "width": 1360, "height": 850, "minWidth": 900, "minHeight": 620 }],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' https://*.gog.com https://*.gog-statics.com data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' https://*.gog.com https://*.gog-statics.com https://i.ytimg.com data: blob:; media-src 'self' http://127.0.0.1:* https://*.gog.com https://*.gog-statics.com blob:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     }
   },
   "bundle": {

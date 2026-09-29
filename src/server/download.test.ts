@@ -41,7 +41,7 @@ test('HTTP 416 on a complete unknown-size range verifies the existing partial', 
   try {
     await writeFile(join(dir, 'installer.exe.part'), bytes);
     globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
-      if (String(input).includes('hash.xml')) return new Response(xml(bytes));
+      if (String(input).includes('hash.xml')) return new Response(`<file md5="${new Bun.CryptoHasher('md5').update(bytes).digest('hex')}"/>`);
       requests++;
       expect(new Headers(init?.headers).get('Range')).toBe(`bytes=${Buffer.byteLength(bytes)}-`);
       return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${Buffer.byteLength(bytes)}` } });
@@ -84,13 +84,30 @@ test('existing installer survives a temporary checksum metadata outage without a
   } finally { globalThis.fetch = previousFetch; await rm(dir, { recursive: true, force: true }); }
 });
 
-test('missing checksum metadata refuses the installer before downloading bytes', async () => {
+test('missing GOG checksum archives a complete file with expected size and local SHA-256', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vault-no-hash-'));
   const previousFetch = globalThis.fetch;
   try {
-    globalThis.fetch = Object.assign(async () => { throw new Error('Downloaded without a checksum'); }, { preconnect: previousFetch.preconnect });
-    await expect(downloadFile({ ...file(17), key: 'no-checksum' }, dir, new AbortController().signal, () => {}))
-      .rejects.toThrow('Checksum metadata unavailable');
-    expect(await readdir(dir)).toEqual([]);
+    const bytes = 'offline installer';
+    globalThis.fetch = Object.assign(async () => new Response(bytes), { preconnect: previousFetch.preconnect });
+    let result: { sha256: string; source: string; size: number } | undefined;
+    expect(await downloadFile({ ...file(Buffer.byteLength(bytes)), key: 'no-checksum' }, dir, new AbortController().signal, () => {}, () => {}, () => {}, info => { result = info; })).toBe('installer.exe');
+    expect(result).toMatchObject({ size: Buffer.byteLength(bytes), source: 'local-sha256', sha256: new Bun.CryptoHasher('sha256').update(bytes).digest('hex') });
+    expect(await readFile(join(dir, 'installer.exe'), 'utf8')).toBe(bytes);
+  } finally { globalThis.fetch = previousFetch; await rm(dir, { recursive: true, force: true }); }
+});
+
+test('official checksum size outranks a smaller manifest placeholder for an existing first part', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vault-beyond-'));
+  const previousFetch = globalThis.fetch;
+  const bytes = 'x'.repeat(1_517_168);
+  try {
+    await writeFile(join(dir, 'installer.exe.part'), bytes);
+    globalThis.fetch = Object.assign(async (input: string | URL | Request) => {
+      if (String(input).includes('hash.xml')) return new Response(xml(bytes));
+      throw new Error('A complete, checksum-matching partial must not be downloaded again');
+    }, { preconnect: previousFetch.preconnect });
+    expect(await downloadFile(file(1_048_576), dir, new AbortController().signal, () => {})).toBe('installer.exe');
+    expect((await readFile(join(dir, 'installer.exe'))).byteLength).toBe(1_517_168);
   } finally { globalThis.fetch = previousFetch; await rm(dir, { recursive: true, force: true }); }
 });

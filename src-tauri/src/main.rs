@@ -55,13 +55,32 @@ async fn disk_capacity(window: tauri::WebviewWindow, path: String) -> Result<Dis
     if window.label() != "main" { return Err("Unauthorized window".into()); }
     let folder = std::path::Path::new(&path);
     if !folder.is_dir() { return Err("Vault location is unavailable".into()); }
-    let total_bytes = fs2::total_space(folder).map_err(|_| "Drive or share capacity unavailable")?;
-    let free_bytes = fs2::free_space(folder).map_err(|_| "Drive or share capacity unavailable")?;
-    let available_bytes = fs2::available_space(folder).map_err(|_| "Drive or share capacity unavailable")?;
+    let (total_bytes, free_bytes, available_bytes) = filesystem_capacity(folder)
+        .map_err(|_| "Drive or share capacity unavailable")?;
     if total_bytes == 0 || free_bytes > total_bytes || available_bytes > free_bytes {
         return Err("Drive or share capacity unavailable".into());
     }
     Ok(DiskCapacity { total_bytes, free_bytes, available_bytes })
+}
+
+#[cfg(windows)]
+fn filesystem_capacity(path: &std::path::Path) -> std::io::Result<(u64, u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0u64;
+    let mut total = 0u64;
+    let mut free = 0u64;
+    if unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((total, free, available))
+}
+
+#[cfg(not(windows))]
+fn filesystem_capacity(path: &std::path::Path) -> std::io::Result<(u64, u64, u64)> {
+    Ok((fs2::total_space(path)?, fs2::free_space(path)?, fs2::available_space(path)?))
 }
 
 fn stop_backend(session: &Session) -> bool {
@@ -123,6 +142,7 @@ fn main() {
             let command = app.shell().sidecar("gog-vault-sidecar")?
                 .env("GOG_VAULT_SESSION_TOKEN", &token)
                 .env("GOG_VAULT_DATA_DIR", data_dir.to_string_lossy().as_ref())
+                .env("GOG_VAULT_PARENT_PID", std::process::id().to_string())
                 .env("GOG_VAULT_DEV", if cfg!(debug_assertions) { "1" } else { "0" });
             let (mut events, child) = command.spawn()?;
             app.state::<Backend>().child.lock().unwrap().replace(child);
@@ -158,11 +178,8 @@ fn main() {
             if window.label() == "gog-auth" && matches!(event, WindowEvent::Destroyed) {
                 auth::window_closed(&window.app_handle());
             }
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
+            if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
+                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!())
@@ -172,10 +189,13 @@ fn main() {
         if let RunEvent::Exit = event {
             let _ = auth::cancel(app);
             let backend = app.state::<Backend>();
-            let graceful = backend.session.lock().unwrap().as_ref().is_some_and(stop_backend);
+            let session = backend.session.lock().unwrap().clone();
+            if let Some(session) = session.as_ref() {
+                let _ = stop_backend(session);
+            }
             let child = backend.child.lock().unwrap().take();
             if let Some(child) = child {
-                if !graceful { let _ = child.kill(); }
+                let _ = child.kill();
             }
         }
     });

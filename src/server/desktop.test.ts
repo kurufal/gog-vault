@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -45,7 +45,8 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
     const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
     expect((await fetch(`${base}/api/storage/select`, { method: 'POST', headers, body: JSON.stringify({ path: selected }) })).status).toBe(200);
     const storage = await (await fetch(`${base}/api/storage`, { headers })).json();
-    expect(storage.free).toBeGreaterThan(0);
+    if (process.platform === 'win32') expect(storage.free).toBeNull();
+    else expect(storage.free).toBeGreaterThan(0);
     expect(storage.dirs).toBeUndefined();
     const childPath = join(selected, 'Installers');
     const database = new Database(join(dataDir, 'vault.sqlite'));
@@ -55,6 +56,23 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
     expect((await fetch(`${base}/api/games/42/link`, { method: 'POST', headers, body: JSON.stringify({ folder: outside }) })).status).toBe(400);
     const linked = await (await fetch(`${base}/api/games/42/link`, { method: 'POST', headers, body: JSON.stringify({ folder: childPath }) })).json();
     expect(linked.folder).toBe('Installers');
+    const mediaKey = 'abcdef0123456789abcd';
+    const mediaDir = join(childPath, '.gog-vault', 'videos');
+    await mkdir(mediaDir, { recursive: true });
+    await writeFile(join(mediaDir, `${mediaKey}.mp4`), 'abcdefghij');
+    const mediaDb = new Database(join(dataDir, 'vault.sqlite'));
+    try { mediaDb.query('INSERT INTO media_assets(game_id,key,role,url,local_path,mime_type) VALUES (?,?,?,?,?,?)')
+      .run('42', mediaKey, 'video', 'https://cdn.gog.com/trailer.mp4', `.gog-vault/videos/${mediaKey}.mp4`, 'video/mp4'); }
+    finally { mediaDb.close(); }
+    expect((await fetch(`${base}/api/media/42/${mediaKey}`)).status).toBe(401);
+    const ticketResponse = await fetch(`${base}/api/media-url/42/${mediaKey}`, { headers });
+    expect(ticketResponse.status).toBe(200);
+    const { url: mediaUrl } = await ticketResponse.json() as { url: string };
+    const ranged = await fetch(mediaUrl, { headers: { Range: 'bytes=2-5' } });
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get('Content-Range')).toBe('bytes 2-5/10');
+    expect(await ranged.text()).toBe('cdef');
+    expect((await fetch(mediaUrl.replace(/ticket=[^&]+/, 'ticket=invalid'))).status).toBe(401);
     expect((await fetch(`${base}/api/storage/select`, { method: 'POST', headers, body: JSON.stringify({ path: childPath }) })).status).toBe(200);
     await rename(selected, join(dataDir, 'disconnected'));
     const health = await (await fetch(`${base}/api/health`, { headers })).json();
@@ -73,6 +91,23 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
     expect(await Promise.race([child.exited, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Sidecar shutdown timed out')), 5000))])).toBe(0);
   } finally {
     socket?.close();
+    child.kill();
+    await child.exited;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : [])]) test(`${entry} exits when its desktop parent is gone`, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'gog-vault-orphan-'));
+  const child = Bun.spawn(entry === binary ? [binary] : [process.execPath, entry], {
+    env: { ...process.env, GOG_VAULT_DATA_DIR: dataDir, GOG_VAULT_SESSION_TOKEN: 'ab'.repeat(32), GOG_VAULT_PARENT_PID: '2147483647' },
+    stdout: 'pipe', stderr: 'pipe'
+  });
+  try {
+    const { value } = await Promise.race([child.stdout.getReader().read(), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Sidecar startup timed out')), 10000))]);
+    expect(JSON.parse(new TextDecoder().decode(value).trim()).ready).toBe(true);
+    expect(await Promise.race([child.exited, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Orphan sidecar did not exit')), 5000))])).toBe(0);
+  } finally {
     child.kill();
     await child.exited;
     await rm(dataDir, { recursive: true, force: true });

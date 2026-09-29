@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCode } from './auth';
 import { createCredentialStore } from './credentials';
-import { parseDownloads, parseMedia, parseProduct, trustedGogUrl } from './products';
+import { catalogCover, parseDownloads, parseMedia, parseProduct, trustedGogUrl } from './products';
 import { defaults } from '../../shared/domain';
 
 describe('GOG auth callback', () => {
@@ -108,6 +108,7 @@ describe('GOG response adapters', () => {
   test('prefers a product card image and never promotes a small icon over the hero', () => {
     const images = { icon: '//images.gog.com/icon.png', logo: '//images.gog.com/logo.png', background: '//images.gog.com/hero.jpg' };
     expect(parseProduct({ ...response, image: '//images.gog.com/card.jpg', images }).cover).toBe('https://images.gog.com/card.jpg');
+    expect(parseProduct({ ...response, image: '//images.gog.com/thumb.jpg', images: { ...images, cover: '//images.gog.com/card.jpg' } }).cover).toBe('https://images.gog.com/card.jpg');
     const fallback = parseProduct({ ...response, images });
     expect(fallback.cover).toBe('https://images.gog.com/hero.jpg');
     expect(fallback.background).toBe('https://images.gog.com/hero.jpg');
@@ -119,6 +120,30 @@ describe('GOG response adapters', () => {
     expect(assets.map(asset => asset.role)).toEqual(['hero', 'card', 'logo', 'icon', 'screenshot', 'video', 'videoPoster', 'video']);
     expect(assets.every(asset => !asset.selected)).toBe(true);
     expect(assets.find(asset => asset.external)?.poster).toBe('https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg');
+  });
+  test('selects a catalog card by product ID and keeps large screenshots and YouTube videos separate', () => {
+    expect(catalogCover({ products: [{ id: 5, coverHorizontal: 'https://images.gog-statics.com/wrong.png' }, { id: 42, coverHorizontal: 'https://images.gog-statics.com/card.png' }] }, '42')).toBe('https://images.gog-statics.com/card.png');
+    const media = parseMedia({ images: { background: '//images.gog.com/hero.jpg', logo2x: '//images.gog.com/logo.jpg' }, image: 'https://images.gog-statics.com/card.png',
+      screenshots: [{ formatted_images: [{ formatter_name: 'ggvgt', image_url: 'https://images.gog-statics.com/thumb.jpg' }, { formatter_name: 'ggvgl_2x', image_url: 'https://images.gog-statics.com/full.jpg' }] }],
+      videos: [{ provider: 'youtube', video_url: 'https://www.youtube.com/embed/abcdefghijk?rel=0', thumbnail_url: 'https://img.youtube.com/vi/abcdefghijk/hqdefault.jpg' }] }, '42');
+    expect(media.find(asset => asset.role === 'card')?.url).toBe('https://images.gog-statics.com/card.png');
+    expect(media.find(asset => asset.role === 'hero')?.url).toBe('https://images.gog.com/hero.jpg');
+    expect(media.find(asset => asset.role === 'logo')?.url).toBe('https://images.gog.com/logo.jpg');
+    expect(media.find(asset => asset.role === 'screenshot')?.url).toBe('https://images.gog-statics.com/full.jpg');
+    expect(media.find(asset => asset.role === 'video')?.url).toBe('https://www.youtube.com/watch?v=abcdefghijk');
+  });
+  test('classifies Agony-shaped YouTube entries and direct media without enabling video archives', () => {
+    const media = parseMedia({ videos: [
+      { provider: 'youtube', video_url: 'https://www.youtube.com/embed/GZ5ZjtNPkiE?wmode=opaque&rel=0', thumbnail_url: 'https://img.youtube.com/vi/GZ5ZjtNPkiE/hqdefault.jpg' },
+      { provider: 'youtube', video_url: 'https://www.youtube.com/embed/DEhZBfF-mxI?wmode=opaque&rel=0', thumbnail_url: 'https://img.youtube.com/vi/DEhZBfF-mxI/hqdefault.jpg' },
+      { video_url: 'https://cdn.gog.com/trailer.mp4', thumbnail_url: 'https://images.gog.com/poster.jpg' }
+    ] }, '42').filter(asset => asset.role === 'video');
+    expect(media).toHaveLength(3);
+    expect(media.slice(0, 2).map(asset => [asset.provider, asset.videoId, asset.poster, asset.external, asset.selected])).toEqual([
+      ['youtube', 'GZ5ZjtNPkiE', 'https://img.youtube.com/vi/GZ5ZjtNPkiE/hqdefault.jpg', true, false],
+      ['youtube', 'DEhZBfF-mxI', 'https://img.youtube.com/vi/DEhZBfF-mxI/hqdefault.jpg', true, false]
+    ]);
+    expect(media[2]).toMatchObject({ provider: 'direct', external: false, selected: false });
   });
   test('preserves all platforms, multipart installers and bonus content', () => {
     const files = parseDownloads(response, '42');

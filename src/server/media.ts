@@ -1,8 +1,10 @@
-import { mkdir, open, realpath, lstat, rename, unlink } from 'node:fs/promises';
+import { mkdir, open, realpath, lstat, rename, unlink, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { imageSize } from 'image-size';
 import { db, gameById, mediaFor } from './db';
 import { trustedGogUrl } from './gog/products';
-import { gameFolder } from './storage';
+import { gameFolder, writeOfflineMetadata } from './storage';
 
 export function selectMedia(gameId: string, files: { key: string; selected: boolean }[]) {
   const update = db.query("UPDATE media_assets SET selected=? WHERE game_id=? AND key=? AND (role IN ('screenshot','additionalArtwork') OR role='video' AND external=0)");
@@ -39,18 +41,23 @@ export async function archiveMedia(gameId: string) {
     const handle = await open(partial, 'wx');
     try {
       let bytes = 0;
+      const hash = createHash('sha256');
       const reader = response.body.getReader();
       while (true) {
         const { done, value: chunk } = await reader.read();
         if (done) break;
         bytes += chunk.byteLength;
         if (bytes > limit) throw new Error('Media file exceeds archive size limit');
+        hash.update(chunk);
         await handle.write(chunk);
       }
       await handle.close();
+      const dimensions = kind === 'screenshots' ? imageSize(await readFile(partial)) : null;
       if (await lstat(destination).then(() => true).catch(() => false)) throw new Error('Media destination already exists');
       await rename(partial, destination);
-      db.query('UPDATE media_assets SET local_path=?,size=? WHERE game_id=? AND key=?').run(`.gog-vault/${kind}/${filename}`, bytes, gameId, asset.key);
+      db.query('UPDATE media_assets SET local_path=?,size=?,width=?,height=?,mime_type=?,sha256=? WHERE game_id=? AND key=?').run(`.gog-vault/${kind}/${filename}`, bytes,
+        dimensions?.width || 0, dimensions?.height || 0, contentType.split(';')[0], hash.digest('hex'), gameId, asset.key);
+      if (process.env.GOG_VAULT_DEBUG_MEDIA === '1') console.log(JSON.stringify({ role: asset.role, url: new URL(asset.url).origin + new URL(asset.url).pathname, width: dimensions?.width || 0, height: dimensions?.height || 0, mimeType: contentType.split(';')[0] }));
       downloaded++;
     } catch (error) {
       await handle.close().catch(() => {});
@@ -58,5 +65,6 @@ export async function archiveMedia(gameId: string) {
       throw error;
     }
   }
+  if (downloaded) await writeOfflineMetadata(gameId);
   return { downloaded, media: mediaFor(gameId) };
 }

@@ -15,7 +15,19 @@ const migrations = [
     `ALTER TABLE remote_files ADD COLUMN matched INTEGER NOT NULL DEFAULT 0;
     CREATE TABLE local_files (game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE, relative_path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms INTEGER NOT NULL, sha256 TEXT NOT NULL DEFAULT '', verified_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(game_id, relative_path));`,
     `CREATE TABLE media_assets (game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE, key TEXT NOT NULL, role TEXT NOT NULL, url TEXT NOT NULL, poster TEXT NOT NULL DEFAULT '', local_path TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, selected INTEGER NOT NULL DEFAULT 0, external INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(game_id,key));`,
-    `CREATE TABLE unlinked_folders (vault_path TEXT NOT NULL, folder TEXT NOT NULL, discovered_at TEXT NOT NULL, PRIMARY KEY(vault_path,folder));`
+    `CREATE TABLE unlinked_folders (vault_path TEXT NOT NULL, folder TEXT NOT NULL, discovered_at TEXT NOT NULL, PRIMARY KEY(vault_path,folder));`,
+    `ALTER TABLE media_assets ADD COLUMN width INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE media_assets ADD COLUMN height INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE media_assets ADD COLUMN mime_type TEXT NOT NULL DEFAULT '';`,
+      `CREATE TABLE ignored_folders (vault_path TEXT NOT NULL, folder TEXT NOT NULL, ignored_at TEXT NOT NULL, PRIMARY KEY(vault_path,folder));`,
+      `ALTER TABLE media_assets ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';
+       ALTER TABLE media_assets ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+       ALTER TABLE media_assets ADD COLUMN video_id TEXT NOT NULL DEFAULT '';
+       ALTER TABLE media_assets ADD COLUMN embed_url TEXT NOT NULL DEFAULT '';
+      ALTER TABLE media_assets ADD COLUMN title TEXT NOT NULL DEFAULT '';`,
+          `ALTER TABLE remote_files ADD COLUMN verification_source TEXT NOT NULL DEFAULT '';
+      ALTER TABLE remote_files ADD COLUMN verified_size INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE download_jobs ADD COLUMN error_details TEXT NOT NULL DEFAULT '';`
 ];
 
 export function migrate(db: Database) {

@@ -12,6 +12,7 @@ import {
   CircleAlert,
   Database,
   Download,
+  FolderInput,
   HardDrive,
   LayoutGrid,
   List,
@@ -33,7 +34,7 @@ import "@fontsource/inter/400.css";
 import "@fontsource/inter/500.css";
 import "@fontsource/inter/600.css";
 import "@fontsource/inter/700.css";
-import type {
+import { removeUnresolvedFolder, usedCapacity, type
   Game,
   Job,
   MediaAsset,
@@ -42,14 +43,18 @@ import type {
   Platform,
   Category,
 } from "../shared/domain";
-import { api, cancelGogLogin, diskCapacity, localArtwork, localMedia, onGogAuthStatus, openUrl, pickVault, queueSocket, startGogLogin } from "./desktop";
+import { playableVideoSource, uniqueMedia } from '../shared/media';
+import { api, cancelGogLogin, diskCapacity, localArtwork, localMedia, streamedMedia, onGogAuthStatus, openUrl, pickVault, queueSocket, startGogLogin } from "./desktop";
 import "./style.css";
 import "./polish.css";
 
 type Page = "dashboard" | "library" | "settings";
 type Detail = { game: Game; files: RemoteFile[]; media: MediaAsset[] };
-type OrganizeProposal = { id: string; title: string; current: string; proposed: string; conflict: boolean; confidence: 'high' | 'review' };
+type OrganizeProposal = { id: string; title: string; current: string; proposed: string; conflict: boolean; conflictWith: string[]; confidence: 'high' | 'review' };
+type MatchFolder = { folder: string; localPath: string; candidates: { id: string; title: string; confidence: number; reasons: string[] }[] };
 type DownloadProposal = { id: string; title: string; files: number; bytes: number };
+type ImportPlan = { source: string; files: number; bytes: number; signature: string; metadataId: string;
+  candidates: { id: string; title: string; confidence: number; reasons: string[] }[]; error: string };
 type Account = { connected: boolean; username: string; loginUrl: string; credentialError?: string };
 type Storage = {
   writable: boolean;
@@ -112,11 +117,11 @@ function Artwork({
   type = "cover",
 }: {
   game: Game;
-  type?: "cover" | "background";
+  type?: "cover" | "background" | "logo";
 }) {
   const [fallback, setFallback] = useState(false);
   const [local, setLocal] = useState("");
-  const remote = type === "cover" ? game.cover : game.background;
+  const remote = type === "cover" ? game.cover : type === "logo" ? game.logo : game.background;
   useEffect(() => {
     let active = true;
     let objectUrl = "";
@@ -162,10 +167,19 @@ function App() {
     current: "",
     startedAt: "",
     unlinked: [] as string[],
+    ignored: 0,
     cancelled: false,
   });
   const [unlinkedProduct, setUnlinkedProduct] = useState<Record<string, string>>({});
+  const [matches, setMatches] = useState<MatchFolder[] | null>(null);
+  const [matchSearch, setMatchSearch] = useState('');
+  const [matchFilter, setMatchFilter] = useState('All');
+  const [matchSort, setMatchSort] = useState('Confidence');
   const [organize, setOrganize] = useState<OrganizeProposal[] | null>(null);
+  const [imports, setImports] = useState<ImportPlan[] | null>(null);
+  const [importMapping, setImportMapping] = useState<Record<string, string>>({});
+  const [importMode, setImportMode] = useState<'copy' | 'move'>('copy');
+  const [moveConfirmation, setMoveConfirmation] = useState('');
   const [downloadPreview, setDownloadPreview] = useState<DownloadProposal[] | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
@@ -203,15 +217,69 @@ function App() {
       setBusy("");
     }
   };
+  const linkFolder = async (gameId: string, folder: string) => {
+    setBusy('Linking folder');
+    setError('');
+    try {
+      const game = await api<Game>(`/games/${gameId}/link`, 'POST', { folder });
+      setGames(current => current.map(item => item.id === gameId ? game : item));
+      setScan(current => ({ ...current, unlinked: removeUnresolvedFolder(current.unlinked, folder) }));
+      setMatches(current => current?.filter(item => item.folder !== folder).map(item => ({ ...item, candidates: item.candidates.filter(candidate => candidate.id !== gameId) })) || null);
+      setUnlinkedProduct(current => { const next = { ...current }; delete next[folder]; return next; });
+      if (detail?.game.id === gameId) setDetail(await api<Detail>(`/games/${gameId}`));
+    } catch (cause) { setError((cause as Error).message); }
+    finally { setBusy(''); }
+  };
+  const reviewMatches = async () => {
+    try {
+      const review = await api<{ folders: MatchFolder[]; ignored: number }>('/storage/matches');
+      setMatches(review.folders);
+      setScan(current => ({ ...current, ignored: review.ignored }));
+    } catch (cause) { setError((cause as Error).message); }
+  };
+  const ignoreMatch = async (folder: string) => {
+    setBusy('Ignoring folder');
+    try {
+      await api('/storage/matches/ignore', 'POST', { folder });
+      setMatches(current => current?.filter(item => item.folder !== folder) || null);
+      setScan(current => ({ ...current, unlinked: removeUnresolvedFolder(current.unlinked, folder), ignored: current.ignored + 1 }));
+    } catch (cause) { setError((cause as Error).message); }
+    finally { setBusy(''); }
+  };
   const previewOrganize = async () => {
     try { setOrganize(await api<OrganizeProposal[]>('/storage/organize')); }
     catch (cause) { setError((cause as Error).message); }
   };
+  const previewImport = async () => {
+    try {
+      const path = await pickVault();
+      if (!path) return;
+      const plans = await api<ImportPlan[]>('/storage/import/preview', 'POST', { path });
+      setImports(plans);
+      setImportMapping(Object.fromEntries(plans.filter(item => item.metadataId).map(item => [item.source, item.metadataId])));
+      setImportMode('copy'); setMoveConfirmation('');
+    } catch (cause) { setError((cause as Error).message); }
+  };
+  const acceptImports = async () => {
+    if (!imports || importMode === 'move' && moveConfirmation !== 'MOVE') return;
+    const chosen = imports.filter(item => importMapping[item.source] && !item.error);
+    setBusy(`Importing ${chosen.length} folders`); setError('');
+    for (const item of chosen) {
+      try {
+        await api('/storage/import', 'POST', { source: item.source, id: importMapping[item.source], signature: item.signature, mode: importMode });
+        setImports(current => current?.filter(plan => plan.source !== item.source) || null);
+      } catch (cause) {
+        setImports(current => current?.map(plan => plan.source === item.source ? { ...plan, error: (cause as Error).message } : plan) || null);
+      }
+    }
+    try { await reload(); } catch (cause) { setError((cause as Error).message); }
+    setBusy('');
+  };
   const acceptOrganize = async (proposals: OrganizeProposal[]) => {
     await notify(async () => {
       for (const proposal of proposals) await api(`/storage/organize/${proposal.id}`, 'POST');
-      await previewOrganize();
     }, 'Organizing vault');
+    await previewOrganize();
   };
   const previewDownloads = async () => {
     try { setDownloadPreview(await api<DownloadProposal[]>('/library/download-preview')); }
@@ -398,9 +466,7 @@ function App() {
       </aside>
       <main className="main">
         <header className="topbar">
-          <span className="breadcrumb">
-            SYSTEM <ChevronRight size={13} /> <b>{page.toUpperCase()}</b>
-          </span>
+          <h1 className="topbar-title">{page === 'dashboard' ? 'Dashboard' : page === 'library' ? 'Library' : 'Settings'}</h1>
           <div className="top-actions">
             <span className="top-status">
               <span className="online-dot" />{" "}
@@ -442,46 +508,7 @@ function App() {
         <div className="page-content">
           {page === "dashboard" && (
             <>
-              <div className="page-heading">
-                <div className="eyebrow">
-                  OVERVIEW // YOUR OFFLINE COLLECTION
-                </div>
-                <h1>
-                  Command center<span className="accent">.</span>
-                </h1>
-                <p>Every game you own. Every installer you keep.</p>
-              </div>
-              <section className="hero-panel">
-                <div className="hero-copy">
-                  <span className="eyebrow">VAULT STATUS / LIVE</span>
-                  <h2>
-                    {account?.connected
-                      ? "Your library, under your control."
-                      : "Your archive starts here."}
-                  </h2>
-                  <p>
-                    {account?.connected
-                      ? "Keep your owned games safe, verified and ready to install offline."
-                      : "Connect your GOG account to inventory owned games and start building your offline vault."}
-                  </p>
-                  <button
-                    className="primary-button"
-                    onClick={() =>
-                      nav(account?.connected ? "library" : "settings")
-                    }
-                  >
-                    {account?.connected ? "Explore library" : "Connect GOG"}{" "}
-                    <ArrowRight size={17} />
-                  </button>
-                </div>
-                <div className="hero-signal">
-                  <span>GOG / VAULT</span>
-                  <strong>
-                    {String(dashboard?.counts.owned || 0).padStart(3, "0")}
-                  </strong>
-                  <small>OWNED TITLES INDEXED</small>
-                </div>
-              </section>
+              {!account?.connected && <button className="secondary-button" onClick={() => nav('settings')}>Connect GOG <ArrowRight size={16} /></button>}
               <div className="section-header">
                 <h2>Archive telemetry</h2>
                 <span>LIVE INDEX / {new Date().toLocaleDateString()}</span>
@@ -541,15 +568,6 @@ function App() {
           {page === "library" && (
             <>
               <div className="page-heading inline-heading">
-                <div>
-                  <div className="eyebrow">
-                    COLLECTION // {games.length} OWNED TITLES
-                  </div>
-                  <h1>
-                    Game library<span className="accent">.</span>
-                  </h1>
-                  <p>Discover what is ready for offline play.</p>
-                </div>
                 <button
                   className="secondary-button"
                   disabled={!account?.connected || !!busy || refresh.running}
@@ -570,8 +588,10 @@ function App() {
                 </div>
               )}
               <div className="library-tools">
+                {settings?.vaultPath && <button className="secondary-button" disabled={scan.running} onClick={() => void notify(() => api('/storage/scan', 'POST'), 'Starting scan')}><Search size={16} />Scan Directory</button>}
                 {settings?.vaultPath && <button className="secondary-button" disabled={!!busy} onClick={() => void previewDownloads()}><Download size={16} />Download missing</button>}
                 {settings?.vaultPath && <button className="secondary-button" onClick={() => void previewOrganize()}><HardDrive size={16} />Organize vault</button>}
+                {settings?.vaultPath && <button className="secondary-button" disabled={!!busy} onClick={() => void previewImport()}><FolderInput size={16} />Import Games</button>}
                 <div className="search-wrap">
                   <Search size={18} />
                   <input
@@ -734,7 +754,7 @@ function App() {
                         onClick={() => void openGame(game.id)}
                       >
                         <div className="game-art">
-                          <Artwork game={game} />
+                          <Artwork game={game} type="logo" />
                           {game.status === "Update Available" && (
                             <span className="update-tag">UPDATE</span>
                           )}
@@ -793,13 +813,6 @@ function App() {
           )}
           {page === "settings" && (
             <>
-              <div className="page-heading">
-                <div className="eyebrow">CONFIGURATION // CONTROL PANEL</div>
-                <h1>
-                  Settings<span className="accent">.</span>
-                </h1>
-                <p>Configure your account, archive and downloads.</p>
-              </div>
               <div className="settings-layout">
                 <section className="settings-section">
                   <div className="section-title">
@@ -917,17 +930,13 @@ function App() {
                     </strong>
                   </div>
                   <div className="setting-line">
-                    <span>APP DATA LOCATION</span>
-                    <strong>{storage?.appDataPath || "Managed separately by GOG Vault"}</strong>
-                  </div>
-                  <div className="setting-line">
                     <span>VAULT SIZE (INDEXED)</span>
                     <strong>
                       {storage ? fmt(storage.indexedBytes) : "Scan vault to index files"}
                     </strong>
                   </div>
-                  <div className="setting-line"><span>DRIVE / SHARE CAPACITY</span><strong>{storage?.total == null ? "Capacity unavailable" : fmt(storage.total)}</strong></div>
-                  <div className="setting-line"><span>USED ON DRIVE</span><strong>{storage?.total == null || storage.free == null ? "Capacity unavailable" : fmt(storage.total - storage.free)}</strong></div>
+                  <div className="setting-line"><span>{settings?.vaultPath.startsWith('\\\\') ? 'SHARE CAPACITY' : 'DRIVE CAPACITY'}</span><strong>{storage?.total == null ? "Capacity unavailable" : fmt(storage.total)}</strong></div>
+                  <div className="setting-line"><span>{settings?.vaultPath.startsWith('\\\\') ? 'USED ON SHARE' : 'USED ON DRIVE'}</span><strong>{storage && usedCapacity(storage.total, storage.free) !== null ? fmt(usedCapacity(storage.total, storage.free)!) : "Capacity unavailable"}</strong></div>
                   <div className="setting-line"><span>FREE SPACE</span><strong>{storage?.available == null ? "Capacity unavailable" : fmt(storage.available)}</strong></div>
                   <div className="setting-line"><span>STORAGE</span><strong>{storage ? "Online" : settings?.vaultPath ? "Unavailable" : "Not configured"}</strong></div>
                   <div className="setting-line">
@@ -940,6 +949,7 @@ function App() {
                         : "Check directory"}
                     </strong>
                   </div>
+                  <details className="app-data-info"><summary>App Data</summary><p>Database, settings, cache, logs and queue state</p><strong>{storage?.appDataPath || "Managed separately by GOG Vault"}</strong></details>
                   <div className="settings-actions">
                     <button
                       className="secondary-button"
@@ -965,7 +975,7 @@ function App() {
                       }
                     >
                       <Search size={16} />
-                      Fast scan
+                      Scan Directory
                     </button>
                     {scan.running && <button className="secondary-button" onClick={() => void api('/storage/scan/cancel', 'POST').catch((e) => setError(String(e)))}><Square size={15} />Cancel scan</button>}
                     {settings?.vaultPath && <button className="secondary-button" onClick={() => void previewOrganize()}><HardDrive size={16} />Preview organization</button>}
@@ -975,25 +985,23 @@ function App() {
                       {scan.phase}: {scan.done} / {scan.total} games {scan.current && `· ${scan.current}`}
                     </p>
                   )}
-                  {scan.unlinked.length > 0 && <div className="unlinked-folders"><h3>Needs matching</h3>{scan.unlinked.map(folder => <div className="unlinked-row" key={folder}><strong>{folder}</strong><select aria-label={`Match ${folder} to product`} value={unlinkedProduct[folder] || ''} onChange={event => setUnlinkedProduct(old => ({ ...old, [folder]: event.target.value }))}><option value="">Select GOG product</option>{games.filter(game => !game.folder).map(game => <option key={game.id} value={game.id}>{game.title} ({game.id})</option>)}</select><button className="secondary-button" disabled={!unlinkedProduct[folder] || !!busy} onClick={() => void notify(async () => { await api(`/games/${unlinkedProduct[folder]}/link`, 'POST', { folder }); await api(`/games/${unlinkedProduct[folder]}/scan`, 'POST'); setScan(old => ({ ...old, unlinked: old.unlinked.filter(item => item !== folder) })); }, 'Linking folder')}>Link folder</button></div>)}</div>}
+                  <div className="match-summary"><strong>Directory scan</strong><span>Last scan: {scan.startedAt ? new Date(scan.startedAt).toLocaleString() : 'Not yet'}</span><span>Games matched: {games.filter(game => game.folder).length}</span><span>Needs matching: {scan.unlinked.length}</span><span>Ignored folders: {scan.ignored}</span><button className="secondary-button" disabled={!scan.unlinked.length} onClick={() => void reviewMatches()}>Review matches</button></div>
                   {scan.error && (
                     <p className="field-help error-text">{scan.error}</p>
                   )}
                 </section>
-                <section className="settings-section">
+                <section className="settings-section downloads-section">
                   <div className="section-title">
                     <Download size={21} />
                     <div>
                       <h2>Downloads</h2>
-                      <p>
-                        Choose the default copy to archive. Override files per
-                        game.
-                      </p>
                     </div>
                   </div>
                   {settings && (
-                    <div className="settings-fields">
-                      <label>
+                    <div className="settings-fields download-settings">
+                      <div className="defaults-choices"><strong>Platforms</strong>{(['windows', 'linux', 'mac'] as Platform[]).map(value => <label className="checkbox-line" key={value}><input type="checkbox" checked={settings.platforms.includes(value)} onChange={event => void changeSettings({ platforms: event.target.checked ? [...settings.platforms, value] : settings.platforms.filter(item => item !== value) })} />{value === 'mac' ? 'macOS' : value}</label>)}</div>
+                      <div className="defaults-choices language-choices"><strong>Languages</strong><div>{[...new Set(['English', ...games.flatMap(game => game.languages), ...settings.languages])].map(value => <label className="checkbox-line" key={value}><input type="checkbox" checked={settings.languages.includes(value)} onChange={event => void changeSettings({ languages: event.target.checked ? [...settings.languages, value] : settings.languages.filter(item => item !== value) })} />{value}</label>)}</div></div>
+                      <div className="download-group"><strong>Transfer</strong><label>
                         Concurrent games
                         <input
                           type="number"
@@ -1007,8 +1015,6 @@ function App() {
                           }
                         />
                       </label>
-                      <div className="defaults-choices"><strong>Platforms</strong>{(['windows', 'linux', 'mac'] as Platform[]).map(value => <label className="checkbox-line" key={value}><input type="checkbox" checked={settings.platforms.includes(value)} onChange={event => void changeSettings({ platforms: event.target.checked ? [...settings.platforms, value] : settings.platforms.filter(item => item !== value) })} />{value === 'mac' ? 'macOS' : value}</label>)}</div>
-                      <div className="defaults-choices"><strong>Languages</strong>{[...new Set(['English', ...games.flatMap(game => game.languages), ...settings.languages])].map(value => <label className="checkbox-line" key={value}><input type="checkbox" checked={settings.languages.includes(value)} onChange={event => void changeSettings({ languages: event.target.checked ? [...settings.languages, value] : settings.languages.filter(item => item !== value) })} />{value}</label>)}</div>
                       <label>
                         Retry count
                         <input
@@ -1036,7 +1042,8 @@ function App() {
                             })
                           }
                         />
-                      </label>
+                      </label></div>
+                      <div className="download-group"><strong>Content</strong><span className="fixed-default">Main installers · always selected</span>
                       <label className="checkbox-line">
                         <input
                           type="checkbox"
@@ -1062,47 +1069,19 @@ function App() {
                       <label className="checkbox-line"><input type="checkbox" checked={settings.storeImages} onChange={event => void changeSettings({ storeImages: event.target.checked })} />Archive store images by default</label>
                       <label className="checkbox-line"><input type="checkbox" checked={settings.storeVideos} onChange={event => void changeSettings({ storeVideos: event.target.checked })} />Archive store videos by default</label>
                       <label className="checkbox-line"><input type="checkbox" checked={settings.patches} onChange={event => void changeSettings({ patches: event.target.checked })} />Select patches by default</label>
-                      <label className="checkbox-line"><input type="checkbox" checked={settings.languagePacks} onChange={event => void changeSettings({ languagePacks: event.target.checked })} />Select language packs by default</label>
-                      <label className="checkbox-line"><input type="checkbox" checked={settings.autoRefresh} onChange={event => void changeSettings({ autoRefresh: event.target.checked })} />Refresh GOG library at launch</label>
-                      <label className="checkbox-line"><input type="checkbox" checked={settings.autoScan} onChange={event => void changeSettings({ autoScan: event.target.checked })} />Fast scan selected vault at launch</label>
+                      <label className="checkbox-line"><input type="checkbox" checked={settings.languagePacks} onChange={event => void changeSettings({ languagePacks: event.target.checked })} />Select language packs by default</label></div>
                     </div>
                   )}
                 </section>
                 <section className="settings-section">
                   <div className="section-title">
-                    <SlidersHorizontal size={21} />
-                    <div>
-                      <h2>Library & appearance</h2>
-                      <p>Metadata refresh and interface preferences.</p>
-                    </div>
+                    <RefreshCw size={21} />
+                    <h2>Automation</h2>
                   </div>
-                  <div className="settings-actions">
-                    <button
-                      className="secondary-button"
-                      disabled={!account?.connected}
-                      onClick={() =>
-                        void notify(
-                          () => api("/gog/library", "POST"),
-                          "Starting refresh",
-                        )
-                      }
-                    >
-                      <RefreshCw size={16} />
-                      Refresh metadata
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={() =>
-                        void notify(
-                          () => api("/storage/scan", "POST"),
-                          "Starting scan",
-                        )
-                      }
-                    >
-                      <ShieldCheck size={16} />
-                      Rescan files
-                    </button>
-                  </div>
+                  {settings && <><label className="checkbox-line"><input type="checkbox" checked={settings.autoRefresh} onChange={event => void changeSettings({ autoRefresh: event.target.checked })} />Refresh GOG library at launch</label><label className="checkbox-line"><input type="checkbox" checked={settings.autoScan} onChange={event => void changeSettings({ autoScan: event.target.checked })} />Scan Directory at launch</label></>}
+                </section>
+                <section className="settings-section">
+                  <div className="section-title"><SlidersHorizontal size={21} /><h2>Application</h2></div>
                   {settings && (
                     <label className="checkbox-line">
                       <input
@@ -1123,8 +1102,23 @@ function App() {
           )}
         </div>
       </main>
+      {matches && <div className="organize-backdrop" role="presentation" onClick={() => setMatches(null)}><section role="dialog" aria-modal="true" aria-label="Match existing folders" className="organize-dialog matches-dialog" onClick={event => event.stopPropagation()}><div className="organize-header"><h2>Match existing folders</h2><button title="Close matches" aria-label="Close matches" onClick={() => setMatches(null)}><X size={18} /></button></div><p>{matches.length ? `${matches.length} folders need attention` : 'No folders need matching.'}</p>{matches.length > 0 && <div className="match-filters"><input aria-label="Search folders" placeholder="Search folders" value={matchSearch} onChange={event => setMatchSearch(event.target.value)} /><select aria-label="Filter match confidence" value={matchFilter} onChange={event => setMatchFilter(event.target.value)}><option>All</option><option>High confidence</option><option>Low confidence</option></select><select aria-label="Sort matches" value={matchSort} onChange={event => setMatchSort(event.target.value)}><option>Confidence</option><option>Folder name</option></select></div>}<div className="organize-list">{matches.filter(item => (!matchSearch || item.folder.toLowerCase().includes(matchSearch.toLowerCase()) || item.candidates.some(candidate => candidate.title.toLowerCase().includes(matchSearch.toLowerCase()))) && (matchFilter === 'All' || (item.candidates[0]?.confidence || 0) >= 85 === (matchFilter === 'High confidence'))).sort((left, right) => matchSort === 'Folder name' ? left.folder.localeCompare(right.folder) : (right.candidates[0]?.confidence || 0) - (left.candidates[0]?.confidence || 0)).map(item => { const suggested = item.candidates[0]; const selected = unlinkedProduct[item.folder] || (suggested && suggested.confidence >= 70 ? suggested.id : ''); const choice = item.candidates.find(candidate => candidate.id === selected); return <div className="organize-item match-item" key={item.folder}><strong>{item.folder}</strong><span>Local folder: {item.localPath}</span><span>Best match: {suggested ? `${suggested.title} · GOG ${suggested.id}` : 'No reliable suggestion'}</span><span>Match confidence: {suggested ? `${suggested.confidence}%` : 'Unavailable'}</span>{suggested && <details><summary>Match evidence</summary><ul>{suggested.reasons.map(reason => <li key={reason}>{reason}</li>)}</ul></details>}<div className="unlinked-controls"><select aria-label={`Match ${item.folder} to product`} value={selected} onChange={event => setUnlinkedProduct(current => ({ ...current, [item.folder]: event.target.value }))}><option value="">Select GOG product</option>{item.candidates.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.title} · GOG {candidate.id} ({candidate.confidence}%)</option>)}{games.filter(game => !game.folder && !item.candidates.some(candidate => candidate.id === game.id)).map(game => <option key={game.id} value={game.id}>{game.title} · GOG {game.id}</option>)}</select><button className="primary-button" disabled={!selected || !!busy} onClick={() => void linkFolder(selected, item.folder)}>Link</button><button className="secondary-button" disabled={!!busy} onClick={() => void ignoreMatch(item.folder)}>Ignore folder</button></div>{choice && choice !== suggested && <small>Selected GOG {choice.id}: {choice.confidence}% · {choice.reasons.join('; ')}</small>}</div>; })}</div><div className="settings-actions"><button className="secondary-button" onClick={() => setMatches(null)}>Close</button></div></section></div>}
       {downloadPreview && <div className="organize-backdrop" role="presentation" onClick={() => setDownloadPreview(null)}><section role="dialog" aria-modal="true" aria-label="Download missing preview" className="organize-dialog" onClick={event => event.stopPropagation()}><div className="organize-header"><h2>Download missing</h2><button title="Close preview" aria-label="Close preview" onClick={() => setDownloadPreview(null)}><X size={18} /></button></div><p>{downloadPreview.length} games · {downloadPreview.reduce((sum, item) => sum + item.files, 0)} selected missing files · {fmt(downloadPreview.reduce((sum, item) => sum + item.bytes, 0))}. Existing matched files are excluded.</p><div className="organize-list">{downloadPreview.map(item => <div className="organize-item" key={item.id}><strong>{item.title} <small>GOG {item.id}</small></strong><span>{item.files} files · {fmt(item.bytes)}</span></div>)}</div><div className="settings-actions"><button className="primary-button" disabled={!downloadPreview.length || !!busy} onClick={() => void acceptDownloads()}>Add to queue</button><button className="secondary-button" onClick={() => setDownloadPreview(null)}>Cancel</button></div></section></div>}
-      {organize && <div className="organize-backdrop" role="presentation" onClick={() => setOrganize(null)}><section role="dialog" aria-modal="true" aria-label="Organize vault preview" className="organize-dialog" onClick={event => event.stopPropagation()}><div className="organize-header"><h2>Organize vault</h2><button title="Close preview" aria-label="Close preview" onClick={() => setOrganize(null)}><X size={18} /></button></div><p>Review folder names before any change. Installer files remain inside their current game folder.</p>{organize.length ? <><div className="organize-list">{organize.map(proposal => <div className="organize-item" key={proposal.id}><strong>{proposal.title} <small>GOG {proposal.id}</small></strong><span>{proposal.current}</span><span>→ {proposal.proposed}</span><small>{proposal.conflict ? 'Destination occupied — keep current' : proposal.confidence === 'high' ? 'Product ID confirmed by local metadata' : 'Linked folder — review before accepting'}</small><button className="secondary-button" disabled={proposal.conflict || !!busy} onClick={() => void acceptOrganize([proposal])}>Accept rename</button></div>)}</div><div className="settings-actions"><button className="secondary-button" disabled={!!busy || !organize.some(item => !item.conflict && item.confidence === 'high')} onClick={() => void acceptOrganize(organize.filter(item => !item.conflict && item.confidence === 'high'))}>Accept all high-confidence</button><button className="secondary-button" onClick={() => setOrganize(null)}>Keep current names</button></div></> : <p>All linked game folders already use their suggested names.</p>}</section></div>}
+      {imports && <div className="organize-backdrop" role="presentation" onClick={() => { if (!busy) setImports(null); }}><section role="dialog" aria-modal="true" aria-label="Import Games preview" className="organize-dialog matches-dialog" onClick={event => event.stopPropagation()}>
+        <div className="organize-header"><h2>Import Games</h2><button title="Close import" disabled={!!busy} onClick={() => setImports(null)}><X size={18} /></button></div>
+        <p>{imports.length} folders · {fmt(imports.reduce((sum, item) => sum + item.bytes, 0))}. Review every product ID before copying. Existing vault folders are never overwritten.</p>
+        <div className="organize-list">{imports.map(item => <div className="organize-item" key={item.source}>
+          <strong>{item.source.split(/[\\/]/).pop()}</strong><span>{item.source}</span><small>{item.files} files · {fmt(item.bytes)}{item.metadataId ? ` · Local metadata: GOG ${item.metadataId}` : ''}</small>
+          {item.error ? <span role="alert" className="import-error">{item.error}</span> : <><label className="import-map">GOG product ID
+            <input list="import-products" value={importMapping[item.source] || ''} onChange={event => setImportMapping(old => ({ ...old, [item.source]: event.target.value }))} placeholder="Choose or enter a product ID" aria-label={`Product ID for ${item.source}`} />
+          </label><small>{item.candidates.map(candidate => `${candidate.title} (${candidate.id}, ${candidate.confidence}%)`).join(' · ') || 'No suggested match; enter a GOG product ID to continue.'}</small></>}
+        </div>)}</div>
+        <datalist id="import-products">{games.filter(game => !game.folder).map(game => <option key={game.id} value={game.id} label={game.title} />)}</datalist>
+        <div className="import-mode" role="group" aria-label="Import mode"><button className={importMode === 'copy' ? 'selected' : ''} onClick={() => setImportMode('copy')}>Copy</button><button className={importMode === 'move' ? 'selected' : ''} onClick={() => setImportMode('move')}>Move</button></div>
+        {importMode === 'move' && <label className="import-map">Source files are removed only after the vault copy is SHA-256 checked. Type MOVE to confirm<input value={moveConfirmation} onChange={event => setMoveConfirmation(event.target.value)} aria-label="Type MOVE to confirm source removal" /></label>}
+        <div className="settings-actions"><button className="primary-button" disabled={!!busy || !imports.some(item => !item.error && importMapping[item.source]) || importMode === 'move' && moveConfirmation !== 'MOVE'} onClick={() => void acceptImports()}>Import selected ({importMode})</button><button className="secondary-button" disabled={!!busy} onClick={() => setImports(null)}>Close</button></div>
+      </section></div>}
+      {organize && <div className="organize-backdrop" role="presentation" onClick={() => setOrganize(null)}><section role="dialog" aria-modal="true" aria-label="Organize vault preview" className="organize-dialog" onClick={event => event.stopPropagation()}><div className="organize-header"><h2>Organize vault</h2><button title="Close preview" aria-label="Close preview" onClick={() => setOrganize(null)}><X size={18} /></button></div><p>Review folder names before any change. Installer files remain inside their current game folder.</p>{organize.length ? <><div className="organize-list">{organize.map(proposal => <div className="organize-item" key={proposal.id}><strong>{proposal.title} <small>GOG {proposal.id}</small></strong><span>{proposal.current}</span><span>→ {proposal.proposed}</span><small>{proposal.conflict ? `Destination occupied${proposal.conflictWith.length ? ` or mapped to GOG ${proposal.conflictWith.join(', ')}` : ''} — keep current` : proposal.confidence === 'high' ? 'Product ID confirmed by local metadata' : 'Linked folder — review before accepting'}</small><button className="secondary-button" disabled={proposal.conflict || !!busy} onClick={() => void acceptOrganize([proposal])}>Accept rename</button></div>)}</div><div className="settings-actions"><button className="secondary-button" disabled={!!busy || !organize.some(item => !item.conflict && item.confidence === 'high')} onClick={() => void acceptOrganize(organize.filter(item => !item.conflict && item.confidence === 'high'))}>Accept all high-confidence</button><button className="secondary-button" onClick={() => setOrganize(null)}>Keep current names</button></div></> : <p>All linked game folders already use their suggested names.</p>}</section></div>}
       <div
         className={`queue-overlay ${queueOpen ? "visible" : ""}`}
         onClick={() => setQueueOpen(false)}
@@ -1167,8 +1161,13 @@ function App() {
                     </div>
                   </div>
                   <p className="queue-filename">
-                    {job.currentFile || job.error || "Waiting in queue"}
+                    {job.state === 'error' ? job.error || 'Download failed' : job.currentFile || 'Waiting in queue'}
                   </p>
+                  {job.state === 'error' && job.errorDetails && <div className="queue-failure">
+                    <strong>{job.errorDetails.partNumber ? `Part ${job.errorDetails.partNumber} · ` : ''}{job.errorDetails.stage.replaceAll('_', ' ')}{job.errorDetails.httpStatus ? ` · HTTP ${job.errorDetails.httpStatus}` : ''}</strong>
+                    <small>{job.errorDetails.filename || job.errorDetails.fileId} · GOG {job.errorDetails.productId}{job.errorDetails.errorCode ? ` · ${job.errorDetails.errorCode}` : ''}</small>
+                    <span>{job.errorDetails.retryable ? 'Resume retries this part; completed parts are kept.' : 'Review this failure before retrying.'}</span>
+                  </div>}
                   <div className="queue-progress">
                     <span
                       style={{
@@ -1270,13 +1269,7 @@ function App() {
             await api(`/games/${detail.game.id}/media/archive`, "POST");
             await openGame(detail.game.id);
           }, "Archiving media")}
-          onLinkFolder={() => void notify(async () => {
-            const folder = await pickVault();
-            if (folder) {
-              await api(`/games/${detail.game.id}/link`, "POST", { folder });
-              await openGame(detail.game.id);
-            }
-          }, "Linking folder")}
+          onLinkFolder={() => void pickVault().then(folder => { if (folder) return linkFolder(detail.game.id, folder); }).catch(cause => setError((cause as Error).message))}
           queue={jobs.find(
             (job) =>
               job.gameId === detail.game.id &&
@@ -1327,19 +1320,19 @@ function GameModal({
   const [activeMedia, setActiveMedia] = useState(0);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [localSources, setLocalSources] = useState<Record<string, string>>({});
-  const gallery = media.filter(asset => ['hero', 'card', 'logo', 'icon', 'screenshot', 'additionalArtwork', 'video'].includes(asset.role));
-  const imageCount = media.filter(asset => asset.role === 'screenshot' || asset.role === 'additionalArtwork').length;
-  const videoCount = media.filter(asset => asset.role === 'video').length;
+  const gallery = uniqueMedia(media);
+  const imageCount = gallery.filter(asset => asset.role !== 'video').length;
+  const videoCount = gallery.filter(asset => asset.role === 'video').length;
   useEffect(() => {
     let active = true;
     const objectUrls: string[] = [];
     for (const asset of [...gallery, ...media.filter(item => item.role === 'videoPoster')]) {
       const kind = { hero: 'background', card: 'cover', logo: 'logo', icon: 'icon', videoPoster: 'videoPoster' } as const;
-      const load = asset.localPath ? localMedia(game.id, asset.key)
+      const load = asset.localPath ? asset.role === 'video' ? streamedMedia(game.id, asset.key) : localMedia(game.id, asset.key)
         : asset.role in kind ? localArtwork(game.id, kind[asset.role as keyof typeof kind])
           : null;
       if (load) void load.then(url => {
-        objectUrls.push(url);
+        if (!asset.localPath || asset.role !== 'video') objectUrls.push(url);
         if (active) setLocalSources(old => ({ ...old, [asset.key]: url }));
         else URL.revokeObjectURL(url);
       }).catch(() => {});
@@ -1434,13 +1427,13 @@ function GameModal({
             {mediaOpen && (
               <div className="media-rail">
                 {gallery.map((asset, index) => (
-                  <button key={asset.key} className="media-thumb" title={asset.role === 'video' ? 'Play video' : `View ${asset.role}`} onClick={() => { setActiveMedia(index); setPreviewOpen(true); }}>
+                  <button key={asset.key} className={`media-thumb ${asset.roles.length === 1 && asset.role === 'icon' ? 'media-icon' : ''}`} title={asset.role === 'video' ? 'Play video' : `View ${asset.roles.join(', ')}`} onClick={() => { setActiveMedia(index); setPreviewOpen(true); }}>
                     {asset.role === 'video' ? (() => {
                       const poster = media.find(item => item.role === 'videoPoster' && item.url === asset.poster);
                       return asset.poster ? <img src={poster && localSources[poster.key] || asset.poster} alt="Video poster" loading="lazy" /> : null;
-                    })() : <img src={localSources[asset.key] || asset.url} alt={asset.role} loading="lazy" />}
+                    })() : <img src={localSources[asset.key] || asset.url} alt={asset.roles.join(', ')} loading="lazy" style={asset.role === 'icon' ? { width: Math.min(asset.width || 64, 88), height: Math.min(asset.height || 64, 52) } : undefined} />}
                     {asset.role === 'video' && <Play size={24} fill="currentColor" className="media-play" />}
-                    <small>{asset.role === 'video' ? 'VIDEO' : asset.role.toUpperCase()}</small>
+                    <small>{asset.roles.map(role => role.toUpperCase()).join(' · ')}</small>
                   </button>
                 ))}
               </div>
@@ -1463,7 +1456,7 @@ function GameModal({
               onClick={() => update(`/games/${game.id}/scan`)}
             >
               <Search size={16} />
-              Fast scan
+              Scan Directory
             </button>
             <button
               className="secondary-button"
@@ -1471,7 +1464,7 @@ function GameModal({
               onClick={() => update(`/games/${game.id}/verify`)}
             >
               <ShieldCheck size={16} />
-              Full verify
+              Full Verify
             </button>
             {queue ? (
               <>
@@ -1639,10 +1632,10 @@ function GameModal({
                           ? "macOS"
                           : file.platform} · {file.language}
                         {file.version && ` · Version ${file.version}`}
-                        {file.verified ? " · Checksum verified" : file.matched ? " · Matched by name and size" : game.folder ? " · Missing" : ""}
+                        {file.verified ? file.verificationSource === 'local-sha256' ? ' · Local SHA-256 verified (GOG checksum unavailable)' : ' · GOG checksum verified' : file.matched ? " · Matched by name and size" : game.folder ? " · Missing" : ""}
                       </small>
                     </span>
-                    <span className="file-size">{fmt(file.size)}</span>
+                    <span className="file-size">{fmt(file.verifiedSize || file.size)}</span>
                   </label>
                 ))}
               {!shown.some((file) => file.category === category) && (
@@ -1670,10 +1663,12 @@ function GameModal({
           <div className="media-lightbox" role="dialog" aria-modal="true" aria-label="Media preview" onMouseDown={event => { if (event.target === event.currentTarget) setPreviewOpen(false); }}>
             <button className="icon-button media-lightbox-close" title="Close preview" onClick={() => setPreviewOpen(false)}><X size={22} /></button>
             <button className="icon-button media-previous" title="Previous media" onClick={() => setActiveMedia((activeMedia - 1 + gallery.length) % gallery.length)}><ChevronLeft size={25} /></button>
-            {gallery[activeMedia]!.role === 'video' ? gallery[activeMedia]!.external ? (
-              <div className="media-lightbox-video"><img src={localSources[gallery[activeMedia]!.key] || gallery[activeMedia]!.poster} alt="Video poster" /><button className="primary-button" onClick={() => void openUrl(gallery[activeMedia]!.url)}>Play in browser <Play size={16} /></button></div>
+            {gallery[activeMedia]!.role === 'video' ? gallery[activeMedia]!.external ? gallery[activeMedia]!.embedUrl && /^(https:\/\/www\.youtube-nocookie\.com\/embed\/[A-Za-z0-9_-]{11}|https:\/\/player\.vimeo\.com\/video\/\d+)$/.test(gallery[activeMedia]!.embedUrl!) ? (
+              <iframe key={gallery[activeMedia]!.key} className="media-embed" src={gallery[activeMedia]!.embedUrl} title={gallery[activeMedia]!.title || 'Video'} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="no-referrer" />
             ) : (
-              <video controls autoPlay poster={gallery[activeMedia]!.poster} src={localSources[gallery[activeMedia]!.key] || gallery[activeMedia]!.url} />
+              <div className="media-lightbox-video">{gallery[activeMedia]!.poster && <img src={gallery[activeMedia]!.poster} alt="Video poster" />}{gallery[activeMedia]!.title && <strong>{gallery[activeMedia]!.title}</strong>}<button className="primary-button" onClick={() => void openUrl(gallery[activeMedia]!.url)}>Open video <Play size={16} /></button></div>
+            ) : (
+              <video key={gallery[activeMedia]!.key} controls autoPlay preload="metadata" poster={gallery[activeMedia]!.poster} src={playableVideoSource(gallery[activeMedia]!, localSources[gallery[activeMedia]!.key]) || undefined} />
             ) : (
               <img src={localSources[gallery[activeMedia]!.key] || gallery[activeMedia]!.url} alt={gallery[activeMedia]!.role} />
             )}
