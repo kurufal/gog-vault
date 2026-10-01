@@ -4,7 +4,6 @@
   "version": "0.1.0",
   "identifier": "app.gogvault.desktop",
   "build": {
-    "beforeDevCommand": "bun run dev:web",
     "devUrl": "http://127.0.0.1:5173",
     "beforeBuildCommand": "bun run build:web",
     "frontendDist": "../dist"

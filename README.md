@@ -13,7 +13,7 @@ bun install
 bun run dev
 ```
 
-`bun run dev` compiles the local Bun sidecar and starts Tauri with Vite. `bun run build` compiles the sidecar and packages the native application; `bun run portable` builds the Windows NSIS installer and portable ZIP on Windows x64. `bun run test`, `bun run typecheck`, `bun run build:web` and `bun run sidecar` run individual checks/builds. Tests use Bun's per-file isolation for mocked dependencies. Windows and Linux installers must be built on their respective operating systems. Sidecar binaries are generated and ignored by Git.
+`bun run dev` compiles the local Bun sidecar, starts Vite, and runs Tauri; when the desktop window closes, it closes Vite cleanly. Run development through this command rather than invoking `tauri dev` directly. `bun run build` compiles the sidecar and packages the native application; `bun run portable` builds the Windows NSIS installer and portable ZIP on Windows x64. `bun run test`, `bun run typecheck`, `bun run build:web` and `bun run sidecar` run individual checks/builds. Tests use Bun's per-file isolation for mocked dependencies. Windows and Linux installers must be built on their respective operating systems. Sidecar binaries are generated and ignored by Git.
 
 ## First Use
 
