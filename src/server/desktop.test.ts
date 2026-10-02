@@ -61,8 +61,16 @@ for (const entry of ['src/server/index.ts', ...(existsSync(binary) ? [binary] : 
     await mkdir(mediaDir, { recursive: true });
     await writeFile(join(mediaDir, `${mediaKey}.mp4`), 'abcdefghij');
     const mediaDb = new Database(join(dataDir, 'vault.sqlite'));
-    try { mediaDb.query('INSERT INTO media_assets(game_id,key,role,url,local_path,mime_type) VALUES (?,?,?,?,?,?)')
-      .run('42', mediaKey, 'video', 'https://cdn.gog.com/trailer.mp4', `.gog-vault/videos/${mediaKey}.mp4`, 'video/mp4'); }
+    try {
+      if (mediaDb.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vaults'").get()) {
+        mediaDb.query('INSERT INTO media_assets(game_id,key,role,url,mime_type) VALUES (?,?,?,?,?)')
+          .run('42', mediaKey, 'video', 'https://cdn.gog.com/trailer.mp4', 'video/mp4');
+        const vault = mediaDb.query('SELECT id FROM vaults').get() as { id: number };
+        mediaDb.query('INSERT INTO vault_media(vault_id,game_id,media_key,local_path) VALUES (?,?,?,?)')
+          .run(vault.id, '42', mediaKey, `.gog-vault/videos/${mediaKey}.mp4`);
+      } else mediaDb.query('INSERT INTO media_assets(game_id,key,role,url,local_path,mime_type) VALUES (?,?,?,?,?,?)')
+        .run('42', mediaKey, 'video', 'https://cdn.gog.com/trailer.mp4', `.gog-vault/videos/${mediaKey}.mp4`, 'video/mp4');
+    }
     finally { mediaDb.close(); }
     expect((await fetch(`${base}/api/media/42/${mediaKey}`)).status).toBe(401);
     const ticketResponse = await fetch(`${base}/api/media-url/42/${mediaKey}`, { headers });

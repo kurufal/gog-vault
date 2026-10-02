@@ -1,7 +1,8 @@
 import { afterAll, expect, mock, test } from 'bun:test';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, win32 } from 'node:path';
+import { uniqueMedia } from '../shared/media';
 
 const directory = await mkdtemp(join(tmpdir(), 'gog-vault-adoption-'));
 const previousDataDir = process.env.GOG_VAULT_DATA_DIR;
@@ -14,13 +15,20 @@ mock.module('./gog/products', () => ({
   secureLink: async (file: { key: string }) => {
     lookups++;
     if (!online) throw new Error('GOG unavailable');
-    return { url: 'https://cdn.gog.com/file', filename: file.key === 'one' ? 'setup_agony_v1.exe' : 'setup_agony_v1-1.bin' };
+    return { url: 'https://cdn.gog.com/file', filename: file.key === 'one' ? 'setup_agony_v1.exe' :
+      file.key === 'official-size' ? 'setup_official.exe' :
+      file.key === 'beyond-main' ? 'setup_beyond_two_souls_1.0.exe' :
+      file.key === 'beyond-part' ? 'setup_beyond_two_souls_1.0-1.bin' : 'setup_agony_v1-1.bin',
+      checksum: file.key === 'official-size' ? 'https://cdn.gog.com/official.xml' : undefined };
   }
 }));
-const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles } = await import('./db');
+const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, activeVault } = await import('./db');
 const { scanGame, scanVault, findGameFolder, linkAndScan, organizePreview, organizeGame, importPreview, importGame, scanState, matchingReview, ignoreFolder, writeOfflineMetadata } = await import('./storage');
+const { enqueueVerification, cancelVerification, verificationJobs, hasActiveVerification } = await import('./verification');
 const { archiveMedia } = await import('./media');
+const { enqueueImports, importJobs, importCommand, shutdownImports, subscribeImports } = await import('./imports');
 afterAll(async () => {
+  await shutdownImports();
   db.close();
   if (previousDataDir === undefined) delete process.env.GOG_VAULT_DATA_DIR;
   else process.env.GOG_VAULT_DATA_DIR = previousDataDir;
@@ -44,6 +52,7 @@ test('adopts an existing multipart installer without redownloading or calling ol
   expect((await scanGame('42')).folder).toBe('');
   const first = await linkAndScan('42', 'Agony');
   expect(first.folder).toBe('Agony');
+  expect(first.folderPath).toBe(join(root, 'Agony'));
   expect(first.localSize).toBe(103);
   expect(first.completion.main).toBe(100);
   expect(first.status).toBe('Needs Verification');
@@ -52,12 +61,12 @@ test('adopts an existing multipart installer without redownloading or calling ol
   online = false;
   expect((await scanGame('42')).completion.main).toBe(100);
   expect(lookups).toBe(2);
-  expect((db.query('SELECT archived_selected_hash AS hash FROM games WHERE id=?').get('42') as { hash: string }).hash).not.toBe('');
+  expect(gameById('42')?.folder).toBe('Agony');
   db.query('UPDATE remote_files SET version=?,matched=0,verified=0 WHERE game_id=? AND key=?').run('2', '42', 'one');
-  expect((await scanGame('42')).status).toBe('Update Available');
+  expect((await scanGame('42')).status).toBe('Needs Verification');
   expect((await readFile(join(folder, 'setup_agony_v1.exe'))).byteLength).toBe(32);
-  expect(db.query('SELECT COUNT(*) AS total FROM local_files WHERE game_id=?').get('42')).toEqual({ total: 5 });
-  expect(db.query('SELECT size FROM local_files WHERE game_id=? AND relative_path=?').get('42', 'Previous Versions/setup_agony_old.exe')).toEqual({ size: 7 });
+  expect(db.query('SELECT COUNT(*) AS total FROM vault_local_files WHERE game_id=?').get('42')).toEqual({ total: 5 });
+  expect(db.query('SELECT size FROM vault_local_files WHERE game_id=? AND relative_path=?').get('42', 'Previous Versions/setup_agony_old.exe')).toEqual({ size: 7 });
   expect((await readFile(join(folder, 'setup_agony_v1.exe'))).byteLength).toBe(32);
   insert.run('42', 'missing', 'Missing installer', 'main', 'windows', 'English', '1', 999, 'https://api.gog.com/products/42/downlink/installer/missing');
   const previousLookups = lookups;
@@ -91,7 +100,7 @@ test('offline artwork persists image dimensions and replaces only stale role ext
   await mkdir(offline, { recursive: true });
   saveSettings({ vaultPath: root });
   upsertGame({ id: 'artwork-id', title: 'Artwork', cover: 'https://images.gog.com/card.png', background: 'https://images.gog.com/hero.jpg' });
-  db.query('UPDATE games SET folder=? WHERE id=?').run('Artwork', 'artwork-id');
+  mapVaultGame('artwork-id', 'Artwork');
   replaceMedia('artwork-id', ['card', 'hero'].map(role => ({ key: role, gameId: 'artwork-id', role: role as 'card' | 'hero',
     url: role === 'card' ? 'https://images.gog.com/card.png' : 'https://images.gog.com/hero.jpg', poster: '', localPath: '', size: 0, selected: false, external: false })));
   await writeFile(join(offline, 'cover.jpg'), 'obsolete');
@@ -129,7 +138,7 @@ test('organization previews linked folders, refuses conflicts, and preserves ins
   await writeFile(join(original, 'setup.exe'), Buffer.from('installer'));
   saveSettings({ vaultPath: root });
   upsertGame({ id: 'organize-1', title: 'Batman: New Edition' });
-  db.query('UPDATE games SET folder=? WHERE id=?').run('Batman Old', 'organize-1');
+  mapVaultGame('organize-1', 'Batman Old');
   const proposal = (await organizePreview()).find(item => item.id === 'organize-1')!;
   expect(proposal.current).toBe(original);
   expect(proposal.conflict).toBe(false);
@@ -150,7 +159,7 @@ test('organization marks duplicate-title destinations as conflicting', async () 
   saveSettings({ vaultPath: root });
   for (const [id, folder] of [['dupe-1', 'First'], ['dupe-2', 'Second']]) {
     upsertGame({ id, title: 'Shared Title' });
-    db.query('UPDATE games SET folder=? WHERE id=?').run(folder, id);
+    mapVaultGame(id, folder);
   }
   expect((await organizePreview()).filter(item => item.title === 'Shared Title').map(item => item.conflict)).toEqual([true, true]);
 });
@@ -162,7 +171,7 @@ test.skipIf(process.platform !== 'win32')('case-only organization renames throug
   await writeFile(join(source, 'setup.exe'), 'preserve installer');
   saveSettings({ vaultPath: root });
   upsertGame({ id: 'doom-3-id', title: 'DOOM 3' });
-  db.query('UPDATE games SET folder=? WHERE id=?').run('doom 3', 'doom-3-id');
+  mapVaultGame('doom-3-id', 'doom 3');
   const proposal = (await organizePreview()).find(item => item.id === 'doom-3-id')!;
   expect(proposal.conflict).toBe(false);
   expect((await organizeGame('doom-3-id'))?.folder).toBe('DOOM 3');
@@ -180,7 +189,7 @@ test('manual link immediately rescans existing files and clears Needs Matching',
   upsertGame({ id: 'manual-1', title: 'Different Store Title' });
   db.query(`INSERT INTO remote_files(game_id,key,name,category,platform,language,version,size,downlink,selected) VALUES (?,?,?,?,?,?,?,?,?,1)`)
     .run('manual-1', 'one', 'setup_agony_v1.exe', 'main', 'windows', 'English', '1', 32, 'https://api.gog.com/products/42/downlink/installer/one');
-  db.query('INSERT INTO unlinked_folders(vault_path,folder,discovered_at) VALUES (?,?,?)').run(root, folder, new Date().toISOString());
+  db.query('INSERT INTO unlinked_folders(vault_path,folder,discovered_at,vault_id) VALUES (?,?,?,?)').run(root, folder, new Date().toISOString(), activeVault()!.id);
   scanState.unlinked = [folder];
   const game = await linkAndScan('manual-1', folder);
   expect(game.folder).toBe(folder);
@@ -195,7 +204,7 @@ test('selected screenshot archive saves measured dimensions and local path', asy
   await mkdir(join(root, 'Screenshots'), { recursive: true });
   saveSettings({ vaultPath: root });
   upsertGame({ id: 'screenshot-id', title: 'Screenshots' });
-  db.query('UPDATE games SET folder=? WHERE id=?').run('Screenshots', 'screenshot-id');
+  mapVaultGame('screenshot-id', 'Screenshots');
   replaceMedia('screenshot-id', [{ key: 'screenshot', gameId: 'screenshot-id', role: 'screenshot', url: 'https://images.gog.com/screenshot.png', poster: '', localPath: '', size: 0, selected: true, external: false }]);
   db.query('UPDATE media_assets SET selected=1 WHERE game_id=? AND key=?').run('screenshot-id', 'screenshot');
   const originalFetch = globalThis.fetch;
@@ -270,4 +279,372 @@ test('external import previews separate folders, copies without overwriting, and
   await importGame(refreshed.source, 'import-2', refreshed.signature, 'move');
   expect(await readFile(join(root, 'Second Game', 'installer.bin'), 'utf8')).toBe('changed');
   await expect(access(join(archive, 'Second Game', 'installer.bin'))).rejects.toThrow();
+});
+
+test('COPY returns a durable job immediately and streams progress without changing its source', async () => {
+  const root = join(directory, 'worker-vault');
+  const source = join(directory, 'worker-source');
+  await mkdir(root);
+  await mkdir(source);
+  await writeFile(join(source, 'installer.bin'), Buffer.alloc(4 * 1024 * 1024, 7));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'worker-game', title: 'Worker Game' });
+  const preview = (await importPreview(source))[0]!;
+  const events: string[] = [];
+  const unsubscribe = subscribeImports(jobs => {
+    const current = jobs.find(job => job.gameId === 'worker-game');
+    if (current) events.push(current.state);
+  });
+  try {
+    const startedAt = Date.now();
+    const { importJobId, status } = enqueueImports([{ source: preview.source, id: 'worker-game', signature: preview.signature }], 'copy');
+    expect(status).toBe('queued');
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(importJobs().find(job => job.batchId === importJobId)?.state).not.toBe('completed');
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Import did not finish')), 15000);
+      const poll = setInterval(() => {
+        const state = importJobs().find(job => job.batchId === importJobId)?.state;
+        if (state === 'completed' || state === 'failed') {
+          clearInterval(poll); clearTimeout(timeout);
+          state === 'completed' ? resolve() : reject(new Error(`Import failed: ${JSON.stringify(importJobs().find(job => job.batchId === importJobId)?.errorDetails)}`));
+        }
+      }, 20);
+    });
+    expect(events).toContain('copying');
+    expect(events).toContain('verifying');
+    expect(importJobs().find(job => job.batchId === importJobId)).toMatchObject({ bytes: 4 * 1024 * 1024, total: 4 * 1024 * 1024, filesDone: 1 });
+    expect(await readFile(join(root, 'Worker Game', 'installer.bin'))).toEqual(await readFile(join(source, 'installer.bin')));
+    const completed = importJobs().find(job => job.batchId === importJobId)!;
+    importCommand(completed.id, 'remove');
+    expect(importJobs().find(job => job.id === completed.id)).toBeUndefined();
+    expect(await readFile(join(root, 'Worker Game', 'installer.bin'))).toEqual(await readFile(join(source, 'installer.bin')));
+  } finally { unsubscribe(); }
+});
+
+test('cancelling a COPY leaves the source and never links an incomplete destination', async () => {
+  const root = join(directory, 'cancel-vault');
+  const source = join(directory, 'cancel-source');
+  await mkdir(root);
+  await mkdir(source);
+  await writeFile(join(source, 'installer.bin'), Buffer.alloc(1024 * 1024, 3));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'cancel-game', title: 'Cancelled Game' });
+  const preview = (await importPreview(source))[0]!;
+  const { importJobId } = enqueueImports([{ source: preview.source, id: 'cancel-game', signature: preview.signature }], 'copy');
+  const job = importJobs().find(item => item.batchId === importJobId)!;
+  importCommand(job.id, 'cancel');
+  expect(importJobs().find(item => item.id === job.id)?.state).toBe('cancelled');
+  expect(await readFile(join(source, 'installer.bin'))).toHaveLength(1024 * 1024);
+  expect((db.query('SELECT folder FROM games WHERE id=?').get('cancel-game') as { folder: string }).folder).toBe('');
+});
+test('hidden games remain owned and hidden after metadata refresh', () => {
+  upsertGame({ id: 'hide-fixture', title: 'Visible Game' });
+  const owned = games().length;
+  setHiddenGames(['hide-fixture'], true);
+  upsertGame({ id: 'hide-fixture', title: 'Renamed Game' });
+  expect(gameById('hide-fixture')).toMatchObject({ hiddenFromLibrary: true, title: 'Renamed Game' });
+  expect(games().length).toBe(owned);
+  setHiddenGames(['hide-fixture'], false);
+  expect(gameById('hide-fixture')?.hiddenFromLibrary).toBe(false);
+});
+test('Beyond: Two Souls remains owned but archives only in its selected vault', async () => {
+  const first = join(directory, 'beyond-vault-a');
+  const second = join(directory, 'beyond-vault-b');
+  await mkdir(join(first, 'Beyond Two Souls', '.gog-vault'), { recursive: true });
+  await mkdir(second);
+  await writeFile(join(first, 'Beyond Two Souls', '.gog-vault', 'metadata.json'), JSON.stringify({ id: 'beyond-switch' }));
+  saveSettings({ vaultPath: first });
+  upsertGame({ id: 'beyond-switch', title: 'Beyond: Two Souls', platforms: ['windows'] });
+  db.query(`INSERT INTO remote_files(game_id,key,name,category,platform,language,version,size,downlink,selected)
+    VALUES (?,?,?,?,?,?,?,?,?,1)`).run('beyond-switch', 'installer', 'setup.exe', 'main', 'windows', 'English', '1', 4, 'https://api.gog.com/test');
+  mapVaultGame('beyond-switch', 'Beyond Two Souls');
+  saveFileState('beyond-switch', 'installer', { name: 'setup.exe', matched: true, verified: true, verificationSource: 'local-sha256', verifiedSize: 4 });
+  const firstId = activeVault()!.id;
+  const owned = games().length;
+  expect(gameById('beyond-switch')).toMatchObject({ status: 'Vaulted', folder: 'Beyond Two Souls', completion: { main: 100 } });
+  saveSettings({ vaultPath: second });
+  expect(activeVault()!.id).not.toBe(firstId);
+  expect(games()).toHaveLength(owned);
+  expect(gameById('beyond-switch')).toMatchObject({ status: 'Not Downloaded', folder: '', completion: { main: 0 } });
+  const source = join(directory, 'beyond-external-source');
+  await mkdir(join(source, '.gog-vault'), { recursive: true });
+  await writeFile(join(source, 'setup.exe'), 'test');
+  await writeFile(join(source, '.gog-vault', 'metadata.json'), JSON.stringify({ id: 'beyond-switch' }));
+  const preview = (await importPreview(source))[0]!;
+  expect(preview.candidates.find(candidate => candidate.id === 'beyond-switch')?.existingFolder).toBe(false);
+  expect(db.query('SELECT folder FROM vault_games WHERE vault_id=? AND game_id=?').get(activeVault()!.id, 'beyond-switch')).toBeNull();
+  const { importJobId } = enqueueImports([{ source: preview.source, id: 'beyond-switch', signature: preview.signature }], 'copy');
+  const job = importJobs().find(item => item.batchId === importJobId)!;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Second vault COPY timed out')); }, 15000);
+    const unsubscribe = subscribeImports(items => {
+      const state = items.find(item => item.id === job.id)?.state;
+      if (state === 'completed' || state === 'failed') {
+        clearTimeout(timeout); unsubscribe(); state === 'completed' ? resolve() : reject(new Error('Second vault COPY failed'));
+      }
+    });
+  });
+  expect(gameById('beyond-switch')).toMatchObject({ status: 'Vaulted', folder: 'Beyond Two Souls', completion: { main: 100 } });
+  expect(await readFile(join(source, 'setup.exe'), 'utf8')).toBe('test');
+  saveSettings({ vaultPath: first });
+  expect(gameById('beyond-switch')).toMatchObject({ status: 'Vaulted', folder: 'Beyond Two Souls', completion: { main: 100 } });
+  await rm(join(first, 'Beyond Two Souls'), { recursive: true });
+  expect(await scanGame('beyond-switch')).toMatchObject({ status: 'Not Downloaded', folder: '', completion: { main: 0 } });
+  saveSettings({ vaultPath: second });
+  expect(gameById('beyond-switch')).toMatchObject({ status: 'Vaulted', completion: { main: 100 } });
+});
+test('vault switching refuses queued filesystem jobs without changing the selected root', async () => {
+  const first = join(directory, 'guard-vault-a');
+  const second = join(directory, 'guard-vault-b');
+  await mkdir(first); await mkdir(second);
+  saveSettings({ vaultPath: first });
+  upsertGame({ id: 'guard-game', title: 'Guarded Game' });
+  const vaultId = activeVault()!.id;
+  db.query('INSERT INTO download_jobs(game_id,state,created_at,updated_at,vault_id) VALUES (?,?,?,?,?)')
+    .run('guard-game', 'queued', new Date().toISOString(), new Date().toISOString(), vaultId);
+  expect(() => saveSettings({ vaultPath: second })).toThrow('Finish or cancel active filesystem jobs');
+  expect(activeVault()!.id).toBe(vaultId);
+  expect(gameById('guard-game')?.status).toBe('Queued');
+  db.query("UPDATE download_jobs SET state='cancelled' WHERE game_id=?").run('guard-game');
+  saveSettings({ vaultPath: second });
+  expect(activeVault()!.id).not.toBe(vaultId);
+  expect(gameById('guard-game')?.status).toBe('Not Downloaded');
+});
+test('retry waits for cancelled worker to settle before resuming a COPY', async () => {
+  const root = join(directory, 'retry-vault');
+  const source = join(directory, 'retry-source');
+  await mkdir(root);
+  await mkdir(source);
+  await writeFile(join(source, 'installer.bin'), Buffer.alloc(24 * 1024 * 1024, 4));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'retry-game', title: 'Retry Game' });
+  const preview = (await importPreview(source))[0]!;
+  const { importJobId } = enqueueImports([{ source: preview.source, id: 'retry-game', signature: preview.signature }], 'copy');
+  const job = importJobs().find(item => item.batchId === importJobId)!;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Import did not start')); }, 15000);
+    const unsubscribe = subscribeImports(items => {
+      if (items.find(item => item.id === job.id)?.state === 'copying') { clearTimeout(timeout); unsubscribe(); resolve(); }
+    });
+  });
+  importCommand(job.id, 'cancel');
+  expect(() => importCommand(job.id, 'retry')).toThrow('still stopping');
+  await new Promise<void>((resolve, reject) => {
+    let retrying = false;
+    const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Cancelled worker did not settle')); }, 15000);
+    const unsubscribe = subscribeImports(() => {
+      if (retrying) return;
+      try { retrying = true; importCommand(job.id, 'retry'); clearTimeout(timeout); unsubscribe(); resolve(); }
+      catch (error) { retrying = false;
+        if (!(error instanceof Error) || !error.message.includes('still stopping')) { clearTimeout(timeout); unsubscribe(); reject(error); }
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Retry did not finish')); }, 15000);
+    const unsubscribe = subscribeImports(items => {
+      const state = items.find(item => item.id === job.id)?.state;
+      if (state === 'completed' || state === 'failed') { clearTimeout(timeout); unsubscribe(); state === 'completed' ? resolve() : reject(new Error('Retry failed')); }
+    });
+  });
+  expect((await readFile(join(source, 'installer.bin'))).byteLength).toBe(24 * 1024 * 1024);
+  expect((await readFile(join(root, 'Retry Game', 'installer.bin'))).byteLength).toBe(24 * 1024 * 1024);
+});
+test('MOVE removes only verified disposable source after destination is committed', async () => {
+  const root = join(directory, 'move-vault');
+  const source = join(directory, 'move-source');
+  await mkdir(root);
+  await mkdir(source);
+  await writeFile(join(source, 'installer.bin'), Buffer.alloc(512 * 1024, 5));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'move-game', title: 'Moved Game' });
+  const preview = (await importPreview(source))[0]!;
+  const { importJobId } = enqueueImports([{ source: preview.source, id: 'move-game', signature: preview.signature }], 'move');
+  const job = importJobs().find(item => item.batchId === importJobId)!;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => { unsubscribe(); reject(new Error('MOVE timed out')); }, 15000);
+    const unsubscribe = subscribeImports(items => {
+      const state = items.find(item => item.id === job.id)?.state;
+      if (state === 'completed' || state === 'failed') {
+        clearTimeout(timeout); unsubscribe();
+        state === 'completed' ? resolve() : reject(new Error(`MOVE failed: ${JSON.stringify(importJobs().find(item => item.id === job.id)?.errorDetails)}`));
+      }
+    });
+  });
+  expect((await readFile(join(root, 'Moved Game', 'installer.bin'))).byteLength).toBe(512 * 1024);
+  expect(await access(join(source, 'installer.bin')).then(() => true).catch(() => false)).toBe(false);
+  expect(gameById('move-game')?.folder).toBe('Moved Game');
+});
+
+test('multipart COPY reconciles display labels with signed filenames and survives an offline scan', async () => {
+  online = true;
+  const root = join(directory, 'multipart-vault');
+  const archive = join(directory, 'multipart-source');
+  const source = join(archive, 'Beyond Two Souls');
+  await mkdir(root);
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0.exe'), Buffer.alloc(30, 1));
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0-1.bin'), Buffer.alloc(50, 2));
+  await mkdir(join(source, 'Previous Versions'));
+  await writeFile(join(source, 'Previous Versions', 'setup_beyond_two_souls_0.9.exe'), Buffer.alloc(12, 3));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'beyond-copy', title: 'Beyond: Two Souls' });
+  replaceFiles('beyond-copy', ['beyond-main', 'beyond-part'].map((key, index) => ({
+    key, gameId: 'beyond-copy', name: `Beyond: Two Souls (Part ${index + 1} of 2)`, category: 'main' as const,
+    platform: 'windows' as const, language: 'English', version: '1.0', size: index ? 50 : 30,
+    downlink: `https://api.gog.com/products/beyond-copy/downlink/${key}`, selected: true, verified: false
+  })));
+  const preview = (await importPreview(source))[0]!;
+  await importGame(preview.source, 'beyond-copy', preview.signature, 'copy');
+  expect(gameById('beyond-copy')).toMatchObject({ status: 'Vaulted', completion: { main: 100 } });
+  expect(filesFor('beyond-copy').map(file => [file.name, file.verified])).toEqual([
+    ['setup_beyond_two_souls_1.0.exe', true], ['setup_beyond_two_souls_1.0-1.bin', true]
+  ]);
+  online = false;
+  expect(await scanGame('beyond-copy')).toMatchObject({ status: 'Vaulted', completion: { main: 100 } });
+  online = true;
+  expect((await readFile(join(source, 'setup_beyond_two_souls_1.0.exe'))).byteLength).toBe(30);
+  replaceFiles('beyond-copy', ['beyond-main', 'beyond-part'].map((key, index) => ({
+    key, gameId: 'beyond-copy', name: `Beyond: Two Souls (Part ${index + 1} of 2)`, category: 'main' as const,
+    platform: 'windows' as const, language: 'English', version: '2.0', size: index ? 50 : 30,
+    downlink: `https://api.gog.com/products/beyond-copy/downlink/${key}`, selected: true, verified: false
+  })));
+  expect(await scanGame('beyond-copy')).toMatchObject({ status: 'Vaulted', previousInstallerParts: 2, completion: { main: 100 } });
+  expect(filesFor('beyond-copy').every(file => !file.verified)).toBe(true);
+});
+
+test('offline multipart COPY stays identified and verifies on a later online scan', async () => {
+  const root = join(directory, 'offline-multipart-vault');
+  const source = join(directory, 'offline-multipart-source');
+  await mkdir(root);
+  await mkdir(source);
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0.exe'), Buffer.alloc(31, 1));
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0-1.bin'), Buffer.alloc(51, 2));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'offline-import', title: 'Beyond: Two Souls Offline' });
+  replaceFiles('offline-import', ['beyond-main', 'beyond-part'].map((key, index) => ({
+    key, gameId: 'offline-import', name: `Beyond: Two Souls (Part ${index + 1} of 2)`, category: 'main' as const,
+    platform: 'windows' as const, language: 'English', version: '1', size: index ? 51 : 31,
+    downlink: `https://api.gog.com/products/offline-import/downlink/${key}`, selected: true, verified: false
+  })));
+  const preview = (await importPreview(source))[0]!;
+  online = false;
+  try {
+    await importGame(preview.source, 'offline-import', preview.signature, 'copy');
+    expect(gameById('offline-import')).toMatchObject({ status: 'Needs Verification', completion: { main: 100 } });
+    expect((await scanGame('offline-import')).status).toBe('Needs Verification');
+    online = true;
+    expect(await scanGame('offline-import')).toMatchObject({ status: 'Vaulted', completion: { main: 100 } });
+  } finally { online = true; }
+});
+
+test('a complete older multipart set remains identified without becoming current verified files', async () => {
+  const root = join(directory, 'previous-build-vault');
+  const source = join(directory, 'previous-build-source');
+  await mkdir(root);
+  await mkdir(source);
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0_(67183).exe'), Buffer.alloc(35, 1));
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0_(67183)-1.bin'), Buffer.alloc(55, 2));
+  await writeFile(join(source, 'setup_beyond_two_souls_1.0_(67183)-2.bin'), Buffer.alloc(75, 3));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'previous-build', title: 'Beyond: Two Souls' });
+  replaceFiles('previous-build', [30, 50, 70].map((size, index) => ({
+    key: `previous-${index}`, gameId: 'previous-build', name: `Beyond: Two Souls (Part ${index + 1} of 3)`,
+    category: 'main' as const, platform: 'windows' as const, language: 'English', version: '2.0', size,
+    downlink: `https://api.gog.com/products/previous-build/downlink/${index}`, selected: true, verified: false
+  })));
+  const preview = (await importPreview(source))[0]!;
+  await importGame(preview.source, 'previous-build', preview.signature, 'copy');
+  expect(gameById('previous-build')).toMatchObject({ status: 'Vaulted', previousInstallerParts: 3, completion: { main: 0 } });
+  expect(await scanGame('previous-build')).toMatchObject({ status: 'Vaulted', previousInstallerParts: 3, completion: { main: 0 } });
+  expect(filesFor('previous-build').every(file => !file.verified)).toBe(true);
+  const archived = join(root, gameById('previous-build')!.folder);
+  await writeFile(join(archived, 'setup_beyond_two_souls_1.0_(67183)-2.bin'), Buffer.alloc(76, 3));
+  expect(await scanGame('previous-build')).toMatchObject({ status: 'Not Downloaded', previousInstallerParts: 0, completion: { main: 0 } });
+});
+
+test('an official checksum can verify an imported installer despite a smaller manifest placeholder', async () => {
+  const root = join(directory, 'official-size-vault');
+  const source = join(directory, 'official-size-source');
+  await mkdir(root);
+  await mkdir(source);
+  const bytes = Buffer.from('offline installer');
+  await writeFile(join(source, 'setup_official.exe'), bytes);
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'official-size-game', title: 'Official Size Game' });
+  replaceFiles('official-size-game', [{ key: 'official-size', gameId: 'official-size-game', name: 'Official installer',
+    category: 'main', platform: 'windows', language: 'English', version: '1', size: 14,
+    downlink: 'https://api.gog.com/products/official-size-game/downlink', selected: true, verified: false }]);
+  const originalFetch = globalThis.fetch;
+  const md5 = new Bun.CryptoHasher('md5').update(bytes).digest('hex');
+  globalThis.fetch = Object.assign(async () => new Response(`<file md5="${md5}" total_size="${bytes.length}"/>`), { preconnect: originalFetch.preconnect });
+  try {
+    const preview = (await importPreview(source))[0]!;
+    await importGame(preview.source, 'official-size-game', preview.signature, 'copy');
+    expect(gameById('official-size-game')).toMatchObject({ status: 'Vaulted', completion: { main: 100 } });
+    expect(filesFor('official-size-game')[0]).toMatchObject({ verified: true, verificationSource: 'gog-checksum', verifiedSize: bytes.length });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Full Verify clears its lock after completion and failure', async () => {
+  const root = join(directory, 'verify-jobs-vault');
+  await mkdir(root);
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'verify-jobs', title: 'Verify Jobs' });
+  mapVaultGame('verify-jobs', 'Verify Jobs');
+  await mkdir(join(root, 'Verify Jobs'));
+  const finished = async (id: string) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const job = verificationJobs().find(item => item.id === id);
+      if (job && ['complete', 'failed', 'cancelled'].includes(job.state)) return job;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error('Verification job did not finish');
+  };
+  const first = enqueueVerification('verify-jobs');
+  expect(() => enqueueVerification('verify-jobs')).toThrow('Verification already running');
+  expect(hasActiveVerification()).toBe(true);
+  expect((await finished(first.id)).state).toBe('complete');
+  expect(hasActiveVerification()).toBe(false);
+  await rm(root, { recursive: true });
+  const failed = enqueueVerification('verify-jobs');
+  expect((await finished(failed.id)).state).toBe('failed');
+  expect(hasActiveVerification()).toBe(false);
+  expect(gameById('verify-jobs')?.folder).toBe('Verify Jobs');
+  await mkdir(join(root, 'Verify Jobs'), { recursive: true });
+  expect((await finished(enqueueVerification('verify-jobs').id)).state).toBe('complete');
+  upsertGame({ id: 'verify-jobs-second', title: 'Second Verify' });
+  mapVaultGame('verify-jobs-second', 'Second Verify');
+  await mkdir(join(root, 'Second Verify'));
+  const running = enqueueVerification('verify-jobs');
+  const waiting = enqueueVerification('verify-jobs-second');
+  expect(waiting.state).toBe('queued');
+  cancelVerification(waiting.id);
+  expect((await finished(waiting.id)).state).toBe('cancelled');
+  expect((await finished(running.id)).state).toBe('complete');
+  expect((await finished(enqueueVerification('verify-jobs-second').id)).state).toBe('complete');
+});
+
+test('Windows vault display paths keep native separators for UNC, drives and nested folders', () => {
+  expect(win32.join('\\\\server\\share\\Games\\GOG Vault', 'Agony')).toBe('\\\\server\\share\\Games\\GOG Vault\\Agony');
+  expect(win32.join('D:\\Vault', 'Agony')).toBe('D:\\Vault\\Agony');
+  expect(win32.join('D:\\Vault', 'Agony', 'Previous Versions')).toBe('D:\\Vault\\Agony\\Previous Versions');
+  expect('Agony/Previous Versions').toBe('Agony/Previous Versions');
+});
+
+test('refresh replaces stale card and tiny logo while retaining the banner hero and icon', () => {
+  upsertGame({ id: '303', title: 'Agony media roles', slug: 'agony-media' });
+  const banner = 'https://images.gog-statics.com/banner.jpg';
+  const cardLogo = 'https://images.gog-statics.com/full-size.png';
+  const icon = 'https://images.gog-statics.com/icon.png';
+  const asset = (key: string, role: 'card' | 'hero' | 'logo' | 'icon', url: string) => ({ key, gameId: '303', role, url, poster: '', localPath: '', size: 0, selected: false, external: false });
+  replaceMedia('303', [asset('old-card', 'card', banner), asset('hero', 'hero', banner), asset('tiny-logo', 'logo', 'https://images.gog-statics.com/tiny.png'), asset('icon', 'icon', icon)]);
+  replaceMedia('303', [asset('full-card', 'card', cardLogo), asset('hero', 'hero', banner), asset('full-logo', 'logo', cardLogo), asset('icon', 'icon', icon)]);
+  expect(mediaFor('303').map(({ role, url }) => [role, url])).toEqual([
+    ['card', cardLogo], ['hero', banner], ['icon', icon], ['logo', cardLogo]
+  ]);
+  expect(uniqueMedia(mediaFor('303')).map(({ roles, url }) => [roles, url])).toEqual([
+    [['card', 'logo'], cardLogo], [['hero'], banner], [['icon'], icon]
+  ]);
 });

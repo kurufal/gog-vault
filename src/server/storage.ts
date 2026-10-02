@@ -5,7 +5,7 @@ import { imageSize } from 'image-size';
 import { desiredFingerprint, normalizeTitle, safeName, type Game } from '../shared/domain';
 import { withinRoot } from './paths';
 import { scoreFolder } from './matching';
-import { activity, configDir, db, filesFor, gameById, games, jobsFor, mediaFor, now, settings } from './db';
+import { activeVault, activity, configDir, db, filesFor, gameById, games, jobsFor, localGameRow, mapVaultGame, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
 import { secureLink, trustedGogUrl } from './gog/products';
 import { localSha256, verifyFile } from './transfer';
 
@@ -46,12 +46,12 @@ async function statfsInfo(path: string) {
       total = Number(capacity); free = Number(unallocated); available = Number(accessible);
     }
   } catch {}
-  const indexedBytes = (db.query('SELECT COALESCE(SUM(local_size),0) AS bytes FROM games WHERE folder != ?').get('') as { bytes: number }).bytes;
+  const indexedBytes = (db.query("SELECT COALESCE(SUM(local_size),0) AS bytes FROM vault_games WHERE vault_id=? AND folder!=''").get(activeVault()?.id || -1) as { bytes: number }).bytes;
   return { writable, online: true, total, free, available, indexedBytes, appDataPath: resolve(configDir) };
 }
 export function folderName(game: Game): string {
   const preferred = safeName(game.title);
-  const occupied = db.query('SELECT id FROM games WHERE folder=? AND id!=?').get(preferred, game.id);
+  const occupied = db.query('SELECT game_id FROM vault_games WHERE vault_id=? AND folder=? COLLATE NOCASE AND game_id!=?').get(activeVault()?.id || -1, preferred, game.id);
   return game.folder || (occupied ? `${preferred.slice(0, 140)} [${game.id}]` : preferred);
 }
 export async function gameFolder(game: Game, create = false, destination = folderName(game)): Promise<string> {
@@ -63,7 +63,7 @@ export async function gameFolder(game: Game, create = false, destination = folde
   if (create) {
     if (!game.folder && await lstat(target).then(() => true).catch(() => false)) throw new Error('Existing game folder must be scanned or linked first');
     await mkdir(target, { recursive: true });
-    db.query('UPDATE games SET folder=? WHERE id=?').run(folder, game.id);
+    mapVaultGame(game.id, folder);
   }
   const real = await realpath(target);
   if (!real.startsWith(base + sep)) throw new Error('Game folder escapes vault');
@@ -76,10 +76,10 @@ export async function mapFolder(gameId: string, folder: string) {
   const real = await realpath(isAbsolute(folder) ? folder : withinRoot(base, folder));
   const name = relative(base, real);
   if (!name || name.startsWith('.') || name.includes('/') || name.includes('\\') || !(await stat(real)).isDirectory()) throw new Error('Select a direct child of the vault');
-  const existing = db.query('SELECT id FROM games WHERE folder=? AND id!=?').get(name, gameId);
+  const existing = db.query('SELECT game_id FROM vault_games WHERE vault_id=? AND folder=? COLLATE NOCASE AND game_id!=?').get(activeVault()?.id || -1, name, gameId);
   if (existing) throw new Error('Folder already linked to another game');
-  db.query('UPDATE games SET folder=? WHERE id=?').run(name, gameId);
-  db.query('DELETE FROM unlinked_folders WHERE vault_path=? AND folder=?').run(base, name);
+  mapVaultGame(gameId, name);
+  db.query('DELETE FROM unlinked_folders WHERE vault_id=? AND folder=?').run(activeVault()?.id || -1, name);
   activity(`${game.title} linked to a local folder`);
 }
 export async function linkAndScan(gameId: string, folder: string) {
@@ -91,10 +91,10 @@ export async function linkAndScan(gameId: string, folder: string) {
     scanState.unlinked = scanState.unlinked.filter(item => item !== game.folder);
     return game;
   } catch (error) {
-    db.query('UPDATE games SET folder=? WHERE id=?').run(previous, gameId);
+    mapVaultGame(gameId, previous);
     const base = await vaultPath();
     const mapped = gameById(gameId)?.folder;
-    if (!mapped) db.query('INSERT OR IGNORE INTO unlinked_folders(vault_path,folder,discovered_at) VALUES (?,?,?)').run(base, folder, now());
+    if (!mapped) db.query('INSERT OR IGNORE INTO unlinked_folders(vault_path,folder,discovered_at,vault_id) VALUES (?,?,?,?)').run(base, folder, now(), activeVault()?.id || -1);
     throw error;
   }
 }
@@ -151,7 +151,7 @@ export async function organizeGame(id: string) {
   if (await lstat(proposal.proposed).then(() => true).catch(() => false) && !await sameDirectory(source, proposal.proposed)) throw new Error('Destination folder already exists');
   await moveFolder(source, proposal.proposed);
   try {
-    const result = db.query('UPDATE games SET folder=? WHERE id=? AND folder=?').run(proposal.target, id, game.folder);
+    const result = db.query('UPDATE vault_games SET folder=? WHERE vault_id=? AND game_id=? AND folder=?').run(proposal.target, activeVault()?.id || -1, id, game.folder);
     if (!result.changes) throw new Error('Game folder mapping changed during rename');
   }
   catch (error) {
@@ -162,8 +162,8 @@ export async function organizeGame(id: string) {
   activity(`${game.title} folder organized`);
   return scanGame(id);
 }
-type ImportEntry = { name: string; size: number; mtimeMs: number };
-async function inspectImport(source: string) {
+export type ImportEntry = { name: string; size: number; mtimeMs: number };
+export async function inspectImport(source: string) {
   if (!isAbsolute(source) || source.includes('\0') || (await lstat(source)).isSymbolicLink()) throw new Error('Select a regular external folder');
   const origin = await realpath(source);
   const vault = await vaultPath();
@@ -200,9 +200,10 @@ export async function importPreview(root: string) {
   return Promise.all(sources.map(async source => {
     try {
       const plan = await inspectImport(source);
-      const candidates = games().filter(game => !game.folder).map(game => scoreFolder(source.split(/[\\/]/).pop() || '', game,
+      const candidates = games().filter(game => !game.folder || plan.metadataId === game.id).map(game => scoreFolder(source.split(/[\\/]/).pop() || '', game,
         { metadataId: plan.metadataId, localFiles: plan.entries.filter(entry => !entry.name.includes('/')), expectedFiles: filesFor(game.id).filter(file => file.category === 'main') }))
-        .filter((item): item is NonNullable<typeof item> => !!item).sort((left, right) => right.confidence - left.confidence).slice(0, 5);
+        .filter((item): item is NonNullable<typeof item> => !!item).map(item => ({ ...item, existingFolder: !!gameById(item.id)?.folder }))
+        .sort((left, right) => right.confidence - left.confidence).slice(0, 5);
       return { source: plan.origin, files: plan.entries.length, bytes: plan.bytes, signature: plan.signature, metadataId: plan.metadataId, candidates, error: '' };
     } catch (error) { return { source, files: 0, bytes: 0, signature: '', metadataId: '', candidates: [], error: error instanceof Error ? error.message : 'Cannot inspect folder' }; }
   }));
@@ -237,19 +238,7 @@ export async function importGame(source: string, id: string, signature: string, 
     if (await lstat(destination).then(() => true).catch(() => false) || gameById(id)?.folder) throw new Error('Import destination changed during copy');
     await rename(staged, destination);
     committed = true;
-    await linkAndScan(id, folder);
-    db.transaction(() => {
-      for (const entry of copied) {
-        db.query('UPDATE local_files SET sha256=?,verified_at=? WHERE game_id=? AND relative_path=?')
-          .run(entry.sha256, now(), id, entry.name);
-        db.query("UPDATE remote_files SET verified=1,verification_source='local-sha256',verified_size=? WHERE game_id=? AND name=? AND matched=1")
-          .run(plan.entries.find(item => item.name === entry.name)!.size, id, entry.name);
-      }
-      const selected = filesFor(id).filter(file => file.selected);
-      if (selected.some(file => file.category === 'main') && selected.every(file => file.verified || copied.some(entry => entry.name === file.name && file.matched)))
-        db.query('UPDATE games SET archived_hash=manifest_hash,archived_selected_hash=? WHERE id=?').run(desiredFingerprint(filesFor(id)), id);
-    })();
-    await writeOfflineMetadata(id);
+    await finalizeImportedGame(id, folder, copied.map(entry => ({ ...entry, size: plan.entries.find(item => item.name === entry.name)!.size })));
     if (mode === 'move') {
       for (const entry of copied) if (await localSha256(withinRoot(plan.origin, entry.name)) !== entry.sha256) throw new Error('Import complete, but source changed; source retained for manual cleanup');
       for (const entry of copied) await unlink(withinRoot(plan.origin, entry.name));
@@ -260,6 +249,23 @@ export async function importGame(source: string, id: string, signature: string, 
     activity(`${game.title} imported by verified ${mode}`);
     return { game: gameById(id), files: copied.length, bytes: plan.bytes, mode };
   } finally { if (!committed) await rm(staged, { recursive: true, force: true }); }
+}
+export async function finalizeImportedGame(id: string, folder: string, copied: { name: string; size: number; sha256: string }[]) {
+  await mapFolder(id, folder);
+  const root = await gameFolder(gameById(id)!);
+  const verified = await Promise.all(copied.map(async entry => ({ ...entry, mtimeMs: Math.round((await lstat(withinRoot(root, entry.name))).mtimeMs) })));
+  db.transaction(() => {
+    for (const entry of verified) {
+      db.query(`INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(vault_id,game_id,relative_path) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,sha256=excluded.sha256,verified_at=excluded.verified_at`)
+        .run(activeVault()?.id || -1, id, entry.name, entry.size, entry.mtimeMs, entry.sha256, now());
+    }
+    for (const file of filesFor(id)) {
+      const exact = verified.find(entry => entry.name === file.name && entry.size === file.size);
+      if (exact) saveFileState(id, file.key, { ...file, matched: true, verified: true, verificationSource: 'local-sha256', verifiedSize: exact.size });
+    }
+  })();
+  return scanGame(id, false, undefined, new Set(verified.map(entry => entry.name)));
 }
 export async function findGameFolder(base: string, game: Pick<Game, 'id' | 'title' | 'slug'>, linked: Set<string>): Promise<string | null> {
   const dirs = (await readdir(base, { withFileTypes: true })).filter(entry => entry.isDirectory() && !linked.has(entry.name));
@@ -272,7 +278,7 @@ export async function findGameFolder(base: string, game: Pick<Game, 'id' | 'titl
   return matches.length === 1 ? matches[0]! : null;
 }
 const internalFolder = (name: string) => name.toLowerCase() === '.gog-vault' || name.toLowerCase() === 'previous versions' || name.startsWith('.__gogvault_');
-const ignoredFolder = (base: string, folder: string) => !!db.query('SELECT 1 FROM ignored_folders WHERE vault_path=? AND folder=?').get(base, folder);
+const ignoredFolder = (_base: string, folder: string) => !!db.query('SELECT 1 FROM ignored_folders WHERE vault_id=? AND folder=?').get(activeVault()?.id || -1, folder);
 async function folderEvidence(base: string, folder: string) {
   const path = withinRoot(base, folder);
   const resolved = await realpath(path);
@@ -290,7 +296,7 @@ async function folderEvidence(base: string, folder: string) {
 export async function matchingReview() {
   const base = await vaultPath();
   const available = games().filter(game => !game.folder);
-  const unresolved = (db.query('SELECT folder FROM unlinked_folders WHERE vault_path=? ORDER BY folder').all(base) as { folder: string }[]).map(row => row.folder);
+  const unresolved = (db.query('SELECT folder FROM unlinked_folders WHERE vault_id=? ORDER BY folder').all(activeVault()?.id || -1) as { folder: string }[]).map(row => row.folder);
   const folders = (await Promise.all(unresolved.map(async folder => {
     const localPath = withinRoot(base, folder);
     const evidence = await folderEvidence(base, folder).catch(() => null);
@@ -299,29 +305,40 @@ export async function matchingReview() {
       .filter((item): item is NonNullable<typeof item> => !!item).sort((left, right) => right.confidence - left.confidence).slice(0, 5);
     return { folder, localPath, candidates };
   }))).filter((item): item is NonNullable<typeof item> => !!item);
-  return { folders, ignored: (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_path=?').get(base) as { total: number }).total };
+  return { folders, ignored: (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_id=?').get(activeVault()?.id || -1) as { total: number }).total };
 }
 export async function ignoreFolder(folder: string) {
   const base = await vaultPath();
-  if (!db.query('SELECT 1 FROM unlinked_folders WHERE vault_path=? AND folder=?').get(base, folder)) throw new Error('Folder is not awaiting a match');
-  db.query('INSERT OR IGNORE INTO ignored_folders(vault_path,folder,ignored_at) VALUES (?,?,?)').run(base, folder, now());
-  db.query('DELETE FROM unlinked_folders WHERE vault_path=? AND folder=?').run(base, folder);
+  if (!db.query('SELECT 1 FROM unlinked_folders WHERE vault_id=? AND folder=?').get(activeVault()?.id || -1, folder)) throw new Error('Folder is not awaiting a match');
+  db.query('INSERT OR IGNORE INTO ignored_folders(vault_path,folder,ignored_at,vault_id) VALUES (?,?,?,?)').run(base, folder, now(), activeVault()?.id || -1);
+  db.query('DELETE FROM unlinked_folders WHERE vault_id=? AND folder=?').run(activeVault()?.id || -1, folder);
   scanState.unlinked = scanState.unlinked.filter(item => item !== folder);
   scanState.ignored++;
   return { ignored: true };
 }
-export async function scanGame(id: string, fullVerify = false, knownFolder?: string | null) {
+export async function scanGame(id: string, fullVerify = false, knownFolder?: string | null, imported = new Set<string>(),
+  progress?: (done: number, total: number, name: string, bytes: number) => void, signal?: AbortSignal) {
   const game = gameById(id);
   if (!game) throw new Error('Game not found');
   if (!game.folder) {
     const base = await vaultPath();
-    const linked = new Set((db.query("SELECT folder FROM games WHERE folder != ''").all() as { folder: string }[]).map(row => row.folder));
-    const match = knownFolder === undefined ? await findGameFolder(base, game, linked) : knownFolder;
+    const match = knownFolder === undefined ? null : knownFolder;
     if (match) await mapFolder(id, match);
   }
   const current = gameById(id)!;
   if (!current.folder) return current;
-  const path = await gameFolder(current);
+  await vaultPath();
+  let path: string;
+  try { path = await gameFolder(current); }
+  catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+    db.transaction(() => {
+      db.query('DELETE FROM vault_file_state WHERE vault_id=? AND game_id=?').run(activeVault()?.id || -1, id);
+      db.query('DELETE FROM vault_local_files WHERE vault_id=? AND game_id=?').run(activeVault()?.id || -1, id);
+      saveLocalGame(id, { folder: '', localSize: 0, scannedAt: now(), archivedHash: '', archivedSelectedHash: '' });
+    })();
+    return gameById(id)!;
+  }
   let localSize = 0;
   const local = new Map<string, { size: number; mtimeMs: number }>();
   const directories = [''];
@@ -337,49 +354,70 @@ export async function scanGame(id: string, fullVerify = false, knownFolder?: str
       }
     }
   }
-  const previous = new Map((db.query('SELECT relative_path,size,mtime_ms,sha256,verified_at FROM local_files WHERE game_id=?').all(id) as
+  const previous = new Map((db.query('SELECT relative_path,size,mtime_ms,sha256,verified_at FROM vault_local_files WHERE vault_id=? AND game_id=?').all(activeVault()?.id || -1, id) as
     { relative_path: string; size: number; mtime_ms: number; sha256: string; verified_at: string }[]).map(row => [row.relative_path, row]));
-  const saveLocal = db.query('INSERT INTO local_files(game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?) ON CONFLICT(game_id,relative_path) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,sha256=excluded.sha256,verified_at=excluded.verified_at');
+  const saveLocal = db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(vault_id,game_id,relative_path) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,sha256=excluded.sha256,verified_at=excluded.verified_at');
   db.transaction(() => {
-    db.query('DELETE FROM local_files WHERE game_id=?').run(id);
+    db.query('DELETE FROM vault_local_files WHERE vault_id=? AND game_id=?').run(activeVault()?.id || -1, id);
     for (const [name, info] of local) {
       const cached = previous.get(name);
       const unchanged = cached?.size === info.size && cached.mtime_ms === info.mtimeMs;
-      saveLocal.run(id, name, info.size, info.mtimeMs, unchanged ? cached.sha256 : '', unchanged ? cached.verified_at : '');
+      saveLocal.run(activeVault()?.id || -1, id, name, info.size, info.mtimeMs, unchanged ? cached.sha256 : '', unchanged ? cached.verified_at : '');
     }
   })();
-  for (const file of filesFor(id)) {
+  const manifest = filesFor(id).filter(file => !fullVerify || file.selected);
+  let done = 0;
+  let bytes = 0;
+  for (const file of manifest) {
+    if (signal?.aborted) throw new Error('Verification cancelled');
+    progress?.(done, manifest.length, file.name, bytes);
     let match = local.has(file.name) ? file.name : '';
     let checksum = file.checksumUrl || '';
-    if ((!match || fullVerify) && (local.has(file.name) || [...local.values()].some(info => info.size === (file.verifiedSize || file.size)))) {
+    let signedName = false;
+    if ((!match || fullVerify || file.verificationSource === 'import-identified') && (local.has(file.name) || [...local].some(([name, info]) =>
+      info.size === (file.verifiedSize || file.size) || file.selected && !!previous.get(name)?.sha256 && /\.(exe|bin|dmg|pkg|zip|sh)$/i.test(name)))) {
       try {
         const link = await secureLink(file);
-        if (local.has(link.filename)) match = link.filename;
+        if (local.has(link.filename)) { match = link.filename; signedName = true; }
         checksum = link.checksum || '';
-        if (match) db.query('UPDATE remote_files SET name=?,checksum_url=? WHERE game_id=? AND key=?').run(match, checksum, id, file.key);
+        if (match) saveFileState(id, file.key, { ...file, name: match, checksumUrl: checksum });
       } catch {}
     }
+    let identified = file.verificationSource === 'import-identified';
+    if (!match && file.selected && file.size) {
+      const candidates = [...local].filter(([name, info]) => !name.includes('/') && /\.(exe|bin|dmg|pkg|zip|sh)$/i.test(name) && info.size === file.size && !!previous.get(name)?.sha256);
+      const competing = filesFor(id).filter(other => other.key !== file.key && other.selected && other.size === file.size);
+      if (candidates.length === 1 && !competing.length) { match = candidates[0]![0]; identified = true; }
+    }
     const info = local.get(match);
-    const matched = !!info && safeName(match) === match && info.size === (file.verifiedSize || file.size);
+    const candidate = !!info && safeName(match) === match;
+    const sizeMatched = candidate && (!file.size || info.size === (file.verifiedSize || file.size));
     const cached = previous.get(match);
     const unchanged = !!info && cached?.size === info.size && cached.mtime_ms === info.mtimeMs;
-    const official = matched && !!checksum && (fullVerify || !unchanged || !file.verified || file.verificationSource !== 'gog-checksum' || !cached?.verified_at
-      ? await verifyFile(join(path, match), file.size, checksum, true) : true);
-    const localVerified = !official && matched && file.verificationSource === 'local-sha256' && !!cached?.sha256 && (fullVerify || !unchanged
-      ? await localSha256(join(path, match)) === cached.sha256 : true);
+    const official = candidate && !!checksum && (fullVerify || !unchanged || !file.verified || file.verificationSource !== 'gog-checksum' || !cached?.verified_at
+      ? await verifyFile(join(path, match), file.size, checksum, true, signal) : true);
+    const matched = sizeMatched || official;
+    const localVerified = !official && !checksum && matched && (file.verificationSource === 'local-sha256' || signedName && (imported.has(match) || identified)) && !!cached?.sha256 && (fullVerify || !unchanged
+      ? await localSha256(join(path, match), signal) === cached.sha256 : true);
     const verified = official || localVerified;
-    if (verified) db.query('UPDATE local_files SET verified_at=? WHERE game_id=? AND relative_path=?').run(now(), id, match);
-    db.query('UPDATE remote_files SET verified=?,matched=?,verification_source=? WHERE game_id=? AND key=?').run(Number(verified), Number(matched), official ? 'gog-checksum' : localVerified ? 'local-sha256' : '', id, file.key);
+    if (verified) db.query('UPDATE vault_local_files SET verified_at=? WHERE vault_id=? AND game_id=? AND relative_path=?').run(now(), activeVault()?.id || -1, id, match);
+    saveFileState(id, file.key, { ...file, name: match || file.name, checksumUrl: checksum, verified, matched, verifiedSize: verified ? info!.size : file.verifiedSize,
+      verificationSource: official ? 'gog-checksum' : localVerified ? 'local-sha256' : identified && matched ? 'import-identified' : '' });
+    done++;
+    bytes += info?.size || 0;
+    progress?.(done, manifest.length, match || file.name, bytes);
   }
-  db.query('UPDATE games SET scanned_at=?,local_size=? WHERE id=?').run(now(), localSize, id);
+  if (signal?.aborted) throw new Error('Verification cancelled');
+  progress?.(done, manifest.length, '', bytes);
+  saveLocalGame(id, { scannedAt: now(), localSize });
   const all = filesFor(id);
   const required = all.filter(file => file.selected);
   if (required.some(file => file.category === 'main') && required.every(file => file.verified || file.matched)) {
     const fingerprint = desiredFingerprint(all);
     if (required.every(file => file.verified) && !current.archivedHash) {
-      db.query('UPDATE games SET archived_hash=manifest_hash,archived_selected_hash=? WHERE id=?').run(fingerprint, id);
-    } else if (!current.archivedHash && !(db.query('SELECT archived_selected_hash AS hash FROM games WHERE id=?').get(id) as { hash: string }).hash) {
-      db.query('UPDATE games SET archived_selected_hash=? WHERE id=?').run(fingerprint, id);
+      saveLocalGame(id, { archivedHash: current.manifestHash, archivedSelectedHash: fingerprint });
+    } else if (!current.archivedHash && !localGameRow(id)?.archived_selected_hash) {
+      saveLocalGame(id, { archivedSelectedHash: fingerprint });
     }
   }
   activity(`${current.title} scanned`);
@@ -387,11 +425,11 @@ export async function scanGame(id: string, fullVerify = false, knownFolder?: str
   return gameById(id)!;
 }
 export const scanState = { running: false, done: 0, total: 0, error: '', phase: '', current: '', startedAt: '',
-  unlinked: (db.query('SELECT folder FROM unlinked_folders WHERE vault_path=? ORDER BY folder').all(settings().vaultPath) as { folder: string }[]).map(row => row.folder),
-  ignored: (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_path=?').get(settings().vaultPath) as { total: number }).total, cancelled: false };
+  unlinked: (db.query('SELECT folder FROM unlinked_folders WHERE vault_id=? ORDER BY folder').all(activeVault()?.id || -1) as { folder: string }[]).map(row => row.folder),
+  ignored: (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_id=?').get(activeVault()?.id || -1) as { total: number }).total, cancelled: false };
 export function loadScanFolders(base: string) {
-  scanState.unlinked = (db.query('SELECT folder FROM unlinked_folders WHERE vault_path=? ORDER BY folder').all(base) as { folder: string }[]).map(row => row.folder);
-  scanState.ignored = (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_path=?').get(base) as { total: number }).total;
+  scanState.unlinked = (db.query('SELECT folder FROM unlinked_folders WHERE vault_id=? ORDER BY folder').all(activeVault()?.id || -1) as { folder: string }[]).map(row => row.folder);
+  scanState.ignored = (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_id=?').get(activeVault()?.id || -1) as { total: number }).total;
 }
 export function cancelScan() { if (scanState.running) scanState.cancelled = true; }
 export async function scanVault() {
@@ -409,8 +447,7 @@ export async function scanVault() {
     }))).filter((item): item is NonNullable<typeof item> => !!item);
     const proposals = new Map<string, string>();
     for (const game of all.filter(item => !item.folder)) {
-      const expectedFiles = filesFor(game.id).filter(file => file.category === 'main');
-      const matches = folderData.filter(item => scoreFolder(item.name, game, { ...item.evidence, expectedFiles })?.autoLink);
+      const matches = folderData.filter(item => item.evidence.metadataId === game.id);
       if (matches.length === 1) proposals.set(game.id, matches[0]!.name);
     }
     const counts = new Map<string, number>();
@@ -426,15 +463,16 @@ export async function scanVault() {
     }
     if (!scanState.cancelled) {
       scanState.phase = 'Checking unlinked folders'; scanState.current = '';
-      const linked = new Set((db.query("SELECT folder FROM games WHERE folder != ''").all() as { folder: string }[]).map(row => row.folder.toLowerCase()));
+      const linked = new Set((db.query("SELECT folder FROM vault_games WHERE vault_id=? AND folder!=''").all(activeVault()?.id || -1) as { folder: string }[]).map(row => row.folder.toLowerCase()));
       const folders = (await readdir(base, { withFileTypes: true })).filter(entry => entry.isDirectory() && !linked.has(entry.name.toLowerCase()) && !internalFolder(entry.name) && !ignoredFolder(base, entry.name)).map(entry => entry.name);
       db.transaction(() => {
-        db.query('DELETE FROM unlinked_folders WHERE vault_path=?').run(base);
-        const insert = db.query('INSERT INTO unlinked_folders(vault_path,folder,discovered_at) VALUES (?,?,?)');
-        for (const folder of folders) insert.run(base, folder, now());
+        db.query('DELETE FROM unlinked_folders WHERE vault_id=?').run(activeVault()?.id || -1);
+        const insert = db.query('INSERT INTO unlinked_folders(vault_path,folder,discovered_at,vault_id) VALUES (?,?,?,?)');
+        for (const folder of folders) insert.run(base, folder, now(), activeVault()?.id || -1);
       })();
       scanState.unlinked = folders;
-      scanState.ignored = (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_path=?').get(base) as { total: number }).total;
+      scanState.ignored = (db.query('SELECT COUNT(*) AS total FROM ignored_folders WHERE vault_id=?').get(activeVault()?.id || -1) as { total: number }).total;
+      db.query('UPDATE vaults SET last_scanned_at=? WHERE id=?').run(now(), activeVault()?.id || -1);
     }
   } catch (error) { scanState.error = error instanceof Error ? error.message : 'Scan failed'; }
   finally { scanState.running = false; scanState.phase = scanState.cancelled ? 'Cancelled' : 'Complete'; scanState.current = ''; }

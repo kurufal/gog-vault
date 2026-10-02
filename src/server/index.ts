@@ -1,14 +1,16 @@
 import { Elysia, t } from 'elysia';
 import { randomUUID } from 'node:crypto';
 import { join, sep } from 'node:path';
-import { access, constants } from 'node:fs/promises';
+import { access, constants, readFile } from 'node:fs/promises';
 import { withinRoot } from './paths';
 import { startupConfig, validSession } from './startup';
 import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
 import { refreshLibrary, refreshState } from './gog/library';
-import { activity, configDir, db, filesFor, gameById, games, jobsFor, mediaFor, replaceFiles, replaceMedia, saveSettings, settings, upsertGame } from './db';
-import { cancelScan, ignoreFolder, importGame, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
+import { activity, configDir, db, filesFor, gameById, games, jobsFor, mediaFor, replaceFiles, replaceMedia, saveSettings, setHiddenGames, settings, upsertGame } from './db';
+import { cancelScan, ignoreFolder, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
+import { enqueueImports, importCommand, importJobs, shutdownImports, startImports, subscribeImports } from './imports';
+import { cancelVerification, enqueueVerification, hasActiveVerification, removeVerification, verificationJobs } from './verification';
 import { archiveMedia, selectMedia } from './media';
 import { broadcast, command, enqueue, schedule, shutdownQueue, startQueue, subscribe } from './queue';
 
@@ -39,7 +41,8 @@ const app = new Elysia()
   .onError(({ error, code, set }) => {
     const message = code === 'VALIDATION' ? 'Invalid request' : error instanceof Error ? error.message : 'Request failed';
     set.status = code === 'VALIDATION' ? 400 : /not found/i.test(message) ? 404 : /invalid|unsafe|escapes|select|cannot|already|missing|no |stop /i.test(message) ? 400 : 500;
-    console.error(`API error: ${code} (HTTP ${set.status})`);
+    console.error(JSON.stringify({ event: 'api_error', at: new Date().toISOString(), code, status: set.status, message,
+      stack: error instanceof Error ? error.stack : undefined }));
     return { error: message };
   })
   .get('/api/health', async ({ set }) => {
@@ -63,6 +66,8 @@ const app = new Elysia()
   .get('/api/storage', () => storageInfo())
   .post('/api/storage/select', async ({ body }) => {
     const path = await selectVault(body.path);
+    if (scanState.running) throw new Error('Finish the current vault scan before switching vaults');
+    if (hasActiveVerification()) throw new Error('Finish or cancel verification before switching vaults');
     const config = saveSettings({ vaultPath: path });
     loadScanFolders(path);
     return config;
@@ -73,6 +78,7 @@ const app = new Elysia()
   .get('/api/gog/library', () => refreshState)
   .post('/api/gog/library', () => { void refreshLibrary(); return { started: true }; })
   .get('/api/games', () => games())
+  .patch('/api/games/visibility', ({ body }) => setHiddenGames(body.ids, body.hidden), { body: t.Object({ ids: t.Array(t.String()), hidden: t.Boolean() }) })
   .get('/api/library/download-preview', () => games().flatMap(game => {
     const missing = filesFor(game.id).filter(file => file.selected && !file.matched && !file.verified);
     return missing.length && !jobsFor(game.id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))
@@ -107,7 +113,10 @@ const app = new Elysia()
   .post('/api/games/:id/media/archive', async ({ params }) => archiveMedia(params.id))
   .post('/api/games/:id/link', async ({ params, body }) => linkAndScan(params.id, body.folder), { body: t.Object({ folder: t.String() }) })
   .post('/api/games/:id/scan', async ({ params }) => scanGame(params.id))
-  .post('/api/games/:id/verify', async ({ params }) => scanGame(params.id, true))
+  .post('/api/games/:id/verify', ({ params }) => enqueueVerification(params.id))
+  .get('/api/verifications', () => verificationJobs())
+  .post('/api/verifications/:id/cancel', ({ params }) => { cancelVerification(params.id); return { ok: true }; })
+  .post('/api/verifications/:id/remove', ({ params }) => { removeVerification(params.id); return { ok: true }; })
   .post('/api/storage/scan', () => { void scanVault(); return { started: true }; })
   .get('/api/storage/scan', () => scanState)
   .get('/api/storage/matches', async () => matchingReview())
@@ -116,7 +125,13 @@ const app = new Elysia()
   .get('/api/storage/organize', async () => organizePreview())
   .post('/api/storage/organize/:id', async ({ params }) => organizeGame(params.id))
   .post('/api/storage/import/preview', async ({ body }) => importPreview(body.path), { body: t.Object({ path: t.String() }) })
-  .post('/api/storage/import', async ({ body }) => importGame(body.source, body.id, body.signature, body.mode), { body: t.Object({ source: t.String(), id: t.String(), signature: t.String(), mode: t.Union([t.Literal('copy'), t.Literal('move')]) }) })
+  .post('/api/imports', ({ body }) => enqueueImports(body.entries, body.mode), { body: t.Object({ entries: t.Array(t.Object({ source: t.String(), id: t.String(), signature: t.String() })), mode: t.Union([t.Literal('copy'), t.Literal('move')]) }) })
+  .get('/api/imports', () => importJobs())
+  .post('/api/imports/:id/:action', ({ params }) => {
+    if (params.action !== 'cancel' && params.action !== 'retry' && params.action !== 'remove') throw new Error('Invalid import command');
+    importCommand(params.id, params.action);
+    return { ok: true };
+  })
   .post('/api/games/:id/queue', ({ params }) => ({ id: enqueue(params.id) }))
   .get('/api/queue', () => jobsFor())
   .post('/api/queue/:id/:action', ({ params }) => {
@@ -138,6 +153,11 @@ const app = new Elysia()
     const game = gameById(params.id);
     if (!game?.folder) throw new Error('Artwork not found');
     const dir = join(await vaultPath(), game.folder, '.gog-vault');
+    if (params.kind === 'cover' || params.kind === 'logo') {
+      const metadata = await readFile(join(dir, 'metadata.json'), 'utf8').then(JSON.parse).catch(() => ({}));
+      const source = params.kind === 'cover' ? game.cover : game.logo;
+      if (metadata.artworkSources?.[params.kind] && metadata.artworkSources[params.kind] !== source) throw new Error('Artwork not found');
+    }
     const { realpath, lstat } = await import('node:fs/promises');
     if (await realpath(dir) !== dir) throw new Error('Artwork not found');
     for (const folder of [join(dir, 'artwork'), dir]) {
@@ -184,11 +204,18 @@ const app = new Elysia()
       'Content-Range': `bytes ${start}-${end}/${file.size}`, 'Content-Length': String(end - start + 1) } });
   })
   .ws('/ws/queue', {
-    open(ws) { const unsubscribe = subscribe(jobs => ws.send(JSON.stringify({ type: 'queue', jobs }))); (ws.data as any).unsubscribe = unsubscribe; ws.send(JSON.stringify({ type: 'queue', jobs: jobsFor() })); },
+    open(ws) { const unsubscribe = subscribe(jobs => ws.send(JSON.stringify({ type: 'queue', jobs })));
+      const unsubscribeImports = subscribeImports(jobs => ws.send(JSON.stringify({ type: 'imports', jobs })));
+      (ws.data as any).unsubscribe = () => { unsubscribe(); unsubscribeImports(); };
+      ws.send(JSON.stringify({ type: 'queue', jobs: jobsFor() })); ws.send(JSON.stringify({ type: 'imports', jobs: importJobs() })); },
     close(ws) { (ws.data as any).unsubscribe?.(); }
   });
 
 startQueue();
+startImports();
+process.on('uncaughtExceptionMonitor', (error, origin) => {
+  console.error(JSON.stringify({ event: 'backend_crash', at: new Date().toISOString(), origin, message: error.message, stack: error.stack }));
+});
 app.listen({ hostname: host, port });
 playbackPort = app.server?.port || port;
 console.log(JSON.stringify({ ready: true, port: app.server?.port }));
@@ -197,6 +224,7 @@ async function stopServer() {
   if (stopping) return;
   stopping = true;
   await shutdownQueue();
+  await shutdownImports();
   db.close();
   setTimeout(() => process.exit(0), 50).unref();
 }

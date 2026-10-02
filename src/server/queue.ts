@@ -1,9 +1,9 @@
-import { db, activity, changeJob, filesFor, gameById, jobsFor, now, settings } from './db';
-import { readdir, lstat } from 'node:fs/promises';
+import { activeVault, db, activity, changeJob, filesFor, gameById, jobsFor, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
+import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { desiredFingerprint, transition, type DownloadFailure, type Job, type JobState, type RemoteFile } from '../shared/domain';
 import { downloadFile, type DownloadVerification } from './transfer';
-import { folderName, gameFolder, vaultPath, writeOfflineMetadata } from './storage';
+import { folderName, gameFolder, scanGame, vaultPath } from './storage';
 import { archiveMedia } from './media';
 
 const running = new Map<number, AbortController>();
@@ -23,6 +23,7 @@ let timer: ReturnType<typeof setInterval> | undefined;
 export function subscribe(listener: (jobs: Job[]) => void) { listeners.add(listener); return () => listeners.delete(listener); }
 export function broadcast() { const jobs = jobsFor(); for (const listener of listeners) listener(jobs); }
 export function startQueue() {
+  db.query("UPDATE download_jobs SET state='error',error='Legacy download has no known destination vault; inspect before retrying' WHERE vault_id IS NULL AND state NOT IN ('complete','error','cancelled')").run();
   db.query("UPDATE download_jobs SET state='queued',updated_at=? WHERE state IN ('downloading','verifying')").run(now());
   db.query("UPDATE download_files SET state='queued' WHERE state IN ('downloading','verifying')").run();
   schedule();
@@ -42,6 +43,7 @@ export async function shutdownQueue() {
 export function enqueue(gameId: string) {
   if (stopping) throw new Error('Queue is stopping');
   if (!settings().vaultPath) throw new Error('Select a vault directory first');
+  const vaultId = activeVault()!.id;
   const game = gameById(gameId);
   if (!game) throw new Error('Game not found');
   const files = filesFor(gameId).filter(file => file.selected && !file.verified && !file.matched);
@@ -49,8 +51,8 @@ export function enqueue(gameId: string) {
   if (jobsFor(gameId).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) throw new Error('Game already in queue');
   const destination = folderName(game);
   const job = db.transaction(() => {
-    const created = db.query('INSERT INTO download_jobs(game_id,state,created_at,updated_at,total,desired_hash) VALUES (?, ?, ?, ?, ?, ?) RETURNING id')
-      .get(gameId, 'queued', now(), now(), files.reduce((sum, file) => sum + file.size, 0), desiredFingerprint(filesFor(gameId))) as { id: number };
+    const created = db.query('INSERT INTO download_jobs(game_id,state,created_at,updated_at,total,desired_hash,vault_id) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
+      .get(gameId, 'queued', now(), now(), files.reduce((sum, file) => sum + file.size, 0), desiredFingerprint(filesFor(gameId)), vaultId) as { id: number };
     const insert = db.query('INSERT INTO download_files(job_id,file_key,snapshot,destination) VALUES (?,?,?,?)');
     for (const file of files) insert.run(created.id, file.key, JSON.stringify(file), destination);
     return created;
@@ -67,8 +69,23 @@ export function command(id: number, action: 'pause' | 'resume' | 'cancel' | 'rem
   } else {
     const next: JobState = action === 'resume' ? 'queued' : action === 'pause' ? 'paused' : 'cancelled';
     if (!transition(job.state, next)) throw new Error(`Cannot ${action} a ${job.state} job`);
-    changeJob(id, next);
-    if (action === 'resume') db.query("UPDATE download_jobs SET error='',error_details='' WHERE id=?").run(id);
+    if (action === 'resume') {
+      const selected = new Map(filesFor(job.gameId).map(file => [file.key, file.selected]));
+      const obsolete = (db.query("SELECT file_key FROM download_files WHERE job_id=? AND state!='complete'").all(id) as { file_key: string }[])
+        .filter(file => selected.get(file.file_key) === false);
+      db.transaction(() => {
+        for (const file of obsolete) db.query('DELETE FROM download_files WHERE job_id=? AND file_key=?').run(id, file.file_key);
+        if (obsolete.length) {
+          const remaining = db.query('SELECT state,bytes,snapshot FROM download_files WHERE job_id=?').all(id) as { state: string; bytes: number; snapshot: string }[];
+          const completed = remaining.filter(file => file.state === 'complete').reduce((total, file) => total + file.bytes, 0);
+          const total = completed + remaining.filter(file => file.state !== 'complete').reduce((sum, file) => sum + (JSON.parse(file.snapshot) as RemoteFile).size, 0);
+          db.query('UPDATE download_jobs SET bytes=?,total=?,speed=0,current_file=?,desired_hash=? WHERE id=?')
+            .run(completed, total, '', desiredFingerprint(filesFor(job.gameId)), id);
+        }
+        changeJob(id, next);
+        db.query("UPDATE download_jobs SET error='',error_details='' WHERE id=?").run(id);
+      })();
+    } else changeJob(id, next);
     if (action !== 'resume') running.get(id)?.abort();
     if (action === 'resume') schedule();
   }
@@ -84,6 +101,7 @@ export function schedule() {
     const slots = Math.max(1, settings().concurrency) - running.size;
     for (const job of jobsFor().filter(entry => entry.state === 'queued').slice(0, Math.max(0, slots))) {
       const controller = new AbortController();
+      if ((db.query('SELECT vault_id FROM download_jobs WHERE id=?').get(job.id) as { vault_id: number } | null)?.vault_id !== activeVault()?.id) continue;
       running.set(job.id, controller);
       const task = run(job, controller).finally(() => { running.delete(job.id); inFlight.delete(task); broadcast(); schedule(); });
       inFlight.add(task);
@@ -91,6 +109,8 @@ export function schedule() {
   }).catch(() => { scheduling = false; });
 }
 async function run(job: Job, controller: AbortController) {
+  const jobVaultId = (db.query('SELECT vault_id FROM download_jobs WHERE id=?').get(job.id) as { vault_id: number }).vault_id;
+  if (!jobVaultId || jobVaultId !== activeVault()?.id) return;
   const game = gameById(job.gameId);
   if (!game) return;
   let lastWrite = 0; let lastBytes = 0; let lastTime = Date.now();
@@ -99,8 +119,13 @@ async function run(job: Job, controller: AbortController) {
     changeJob(job.id, 'downloading'); broadcast();
     const pending = db.query('SELECT file_key,bytes,snapshot,destination FROM download_files WHERE job_id=? AND state!=?').all(job.id, 'complete') as { file_key: string; bytes: number; snapshot: string; destination: string }[];
     pending.sort((left, right) => {
-      const leftPart = partNumber((JSON.parse(left.snapshot || '{}') as RemoteFile).name || '');
-      const rightPart = partNumber((JSON.parse(right.snapshot || '{}') as RemoteFile).name || '');
+      const first = JSON.parse(left.snapshot || '{}') as RemoteFile;
+      const second = JSON.parse(right.snapshot || '{}') as RemoteFile;
+      const order: RemoteFile['category'][] = ['main', 'dlc', 'patches', 'languagePacks', 'extras', 'other'];
+      const categoryOrder = order.indexOf(first.category) - order.indexOf(second.category);
+      if (categoryOrder) return categoryOrder;
+      const leftPart = partNumber(first.name || '');
+      const rightPart = partNumber(second.name || '');
       return leftPart !== null && rightPart !== null ? leftPart - rightPart : 0;
     });
     const destination = (pending[0]?.destination || folderName(game));
@@ -142,27 +167,23 @@ async function run(job: Job, controller: AbortController) {
       stage = 'advance_part';
       const info = verification ? await lstat(join(folder, filename)) : null;
       db.transaction(() => {
-        db.query('UPDATE remote_files SET verified=1,name=?,verification_source=?,verified_size=?,checksum_url=? WHERE game_id=? AND key=? AND size=? AND version=? AND downlink=?')
-          .run(filename, verification?.source || 'gog-checksum', verification?.size || file.size, verification?.checksumUrl || '', job.gameId, file.key, file.size, file.version, file.downlink);
+        saveFileState(job.gameId, file.key, { ...file, name: filename, matched: true, verified: true,
+          verificationSource: verification?.source || 'gog-checksum', verifiedSize: verification?.size || file.size,
+          checksumUrl: verification?.checksumUrl || '' }, jobVaultId);
         db.query("UPDATE download_files SET state='complete',bytes=? WHERE job_id=? AND file_key=?").run(verification?.size || file.size, job.id, file.key);
         if (verification) db.query('UPDATE download_jobs SET total=total+? WHERE id=?').run(verification.size - file.size, job.id);
-        if (verification && info) db.query('INSERT INTO local_files(game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?) ON CONFLICT(game_id,relative_path) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,sha256=excluded.sha256,verified_at=excluded.verified_at')
-          .run(game.id, filename, verification.size, Math.round(info.mtimeMs), verification.sha256, now());
+        if (verification && info) db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(vault_id,game_id,relative_path) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,sha256=excluded.sha256,verified_at=excluded.verified_at')
+          .run(jobVaultId, game.id, filename, verification.size, Math.round(info.mtimeMs), verification.sha256, now());
       })();
       changeJob(job.id, 'downloading');
     }
     if (controller.signal.aborted) return;
     changeJob(job.id, 'verifying'); broadcast();
-    let localSize = 0;
-    for (const entry of await readdir(folder)) {
-      const info = await lstat(join(folder, entry));
-      if (info.isFile() && !entry.endsWith('.part')) localSize += info.size;
-    }
+    stage = 'indexing';
+    await scanGame(job.gameId);
     const snapshot = db.query('SELECT desired_hash FROM download_jobs WHERE id=?').get(job.id) as { desired_hash: string };
-    db.query('UPDATE games SET archived_hash=manifest_hash,archived_selected_hash=?,scanned_at=?,local_size=? WHERE id=?').run(snapshot.desired_hash || desiredFingerprint(filesFor(job.gameId)), now(), localSize, job.gameId);
-    stage = 'write_metadata';
-    await writeOfflineMetadata(job.gameId);
-    if (db.query("SELECT 1 FROM media_assets WHERE game_id=? AND selected=1 AND external=0 AND local_path='' LIMIT 1").get(job.gameId)) {
+    saveLocalGame(job.gameId, { archivedHash: game.manifestHash, archivedSelectedHash: snapshot.desired_hash || desiredFingerprint(filesFor(job.gameId)) }, jobVaultId);
+    if (mediaFor(job.gameId).some(asset => asset.selected && !asset.external && !asset.localPath)) {
       try { await archiveMedia(job.gameId); }
       catch (error) { activity(`${game.title} media archive incomplete: ${safeError(error)}`); }
     }

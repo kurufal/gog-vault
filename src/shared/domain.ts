@@ -6,7 +6,7 @@ export interface RemoteFile {
   key: string; gameId: string; name: string; category: Category; platform: Platform;
   language: string; version: string; size: number; downlink: string; checksumUrl?: string;
   dlc?: string; selected: boolean; verified: boolean; matched?: boolean;
-  verificationSource?: 'gog-checksum' | 'local-sha256' | ''; verifiedSize?: number;
+  verificationSource?: 'gog-checksum' | 'local-sha256' | 'import-identified' | ''; verifiedSize?: number;
 }
 export interface DownloadFailure {
   stage: string; productId: string; fileId: string; filename: string; partNumber: number | null;
@@ -15,10 +15,22 @@ export interface DownloadFailure {
 }
 export interface Game {
   id: string; title: string; slug: string; cover: string; background: string; logo?: string;
+  folderPath?: string;
+  hiddenFromLibrary?: boolean;
   releaseDate: string; platforms: Platform[]; languages: string[]; firstSeen: string;
   refreshedAt: string; scannedAt: string; folder: string; localSize: number;
   remoteSize: number; status: VaultStatus; manifestHash: string; archivedHash: string;
+  platformState?: Partial<Record<Platform, 'available' | 'selected' | 'vaulted'>>;
   completion: Record<Category, number | null>;
+  archive?: LocalGameState;
+  previousInstallerParts?: number;
+}
+export interface LocalGameState {
+  vaultId: number; productId: string; main: number | null; dlc: number | null; extras: number | null;
+  selectedCompletion: number | null; availableContentCoverage: number | null;
+  verificationState: 'verified' | 'identified' | 'missing';
+  updateState: 'manifest_changed' | 'unknown' | 'unchanged'; overallStatus: VaultStatus;
+  localBytes: number; remoteSelectedBytes: number;
 }
 export interface Job {
   id: number; gameId: string; state: JobState; createdAt: string; updatedAt: string;
@@ -30,6 +42,11 @@ export const defaults = {
   platforms: ['windows'] as Platform[], languages: ['English'], dlc: true, extras: false, patches: false, languagePacks: false,
   storeImages: false, storeVideos: false, autoRefresh: false, autoScan: false, retries: 3, timeout: 60, view: 'tiles', reducedMotion: false
 };
+export function committedNumber(draft: string, minimum: number, maximum: number, fallback: number) {
+  if (!draft.trim()) return fallback;
+  const parsed = Number(draft);
+  return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.round(parsed))) : fallback;
+}
 export type Settings = typeof defaults;
 
 export function usedCapacity(total: number | null, free: number | null): number | null {
@@ -60,17 +77,22 @@ export function manifestFingerprint(files: RemoteFile[]): string {
 export function desiredFingerprint(files: RemoteFile[]): string {
   return manifestFingerprint(files.filter(file => file.selected));
 }
-export function statusFor(files: RemoteFile[], jobs: Job[], changed: boolean, hasFolder: boolean): VaultStatus {
+export function statusFor(files: RemoteFile[], jobs: Job[], changed: boolean, hasFolder: boolean, previousInstallerParts = 0): VaultStatus {
   const active = jobs.find(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state));
   if (active) return ({ queued: 'Queued', downloading: 'Downloading', paused: 'Paused', verifying: 'Verifying' } as const)[active.state as 'queued'];
   if (jobs[0]?.state === 'error') return 'Error';
   const main = completion(files, 'main');
   const selected = files.filter(file => file.selected);
-  if (changed && hasFolder) return 'Update Available';
-  if (main === 100 && selected.every(file => file.verified)) return 'Vaulted';
-  if (main === 100 && selected.every(file => file.verified || file.matched)) return 'Needs Verification';
-  if (hasFolder || files.some(file => file.verified)) return 'Incomplete';
-  return 'Not Downloaded';
+  if (!hasFolder || !selected.some(file => file.verified || file.matched) && !previousInstallerParts) return 'Not Downloaded';
+  if (previousInstallerParts && !selected.some(file => file.category === 'main' && file.verified)) {
+    const other = selected.filter(file => file.category !== 'main');
+    if (other.every(file => file.verified)) return 'Vaulted';
+    return other.every(file => file.verified || file.matched) ? 'Needs Verification' : 'Incomplete';
+  }
+  if (selected.some(file => !file.verified && !file.matched)) return 'Incomplete';
+  if (main === 100 && selected.length && selected.every(file => file.verified)) return 'Vaulted';
+  if (main === 100 && selected.length && selected.every(file => file.verified || file.matched)) return 'Needs Verification';
+  return 'Incomplete';
 }
 export function transition(from: JobState, to: JobState): boolean {
   const allowed: Record<JobState, JobState[]> = {
@@ -92,4 +114,48 @@ export interface MediaAsset {
 
 export function removeUnresolvedFolder(folders: string[], folder: string): string[] {
   return folders.filter(item => item !== folder);
+}
+export function visibilityMatches(game: Pick<Game, 'title' | 'hiddenFromLibrary'>, visibility: 'Visible' | 'Hidden' | 'All', search: string) {
+  return (visibility === 'All' || !!game.hiddenFromLibrary === (visibility === 'Hidden')) &&
+    game.title.toLowerCase().includes(search.toLowerCase());
+}
+export const bulkDownloadWarningBytes = 100 * 1024 ** 3;
+export function scopedDownloadPreview<T extends { id: string; bytes: number }>(items: readonly T[], visibleSelectedIds: ReadonlySet<string>, updateIds: ReadonlySet<string>, includeUpdates: boolean): T[] {
+  return items.filter(item => visibleSelectedIds.has(item.id) && (includeUpdates || !updateIds.has(item.id)));
+}
+export function platformStates(files: RemoteFile[], platforms: Platform[], hasFolder: boolean, previousInstallerParts = 0): Game['platformState'] {
+  return Object.fromEntries(platforms.flatMap(platform => {
+    const available = files.filter(file => file.platform === platform && file.category === 'main');
+    if (!available.length) return [];
+    const selected = available.filter(file => file.selected);
+    return [[platform, !selected.length ? 'available' : hasFolder && (selected.every(file => file.verified) ||
+      previousInstallerParts > 0 && selected.length === previousInstallerParts && selected.every(file => file.category === 'main') && !selected.some(file => file.verified)) ? 'vaulted' : 'selected']];
+  })) as Game['platformState'];
+}
+export function previousInstallerSet(files: RemoteFile[], local: { name: string; size: number; sha256: string; verifiedAt?: string }[]): number {
+  const main = files.filter(file => file.selected && file.category === 'main');
+  if (main.length < 2 || main.some(file => file.verified)) return 0;
+  const installers = local.filter(file => file.verifiedAt && /^[a-f0-9]{64}$/i.test(file.sha256) && !file.name.includes('/') && /\.(exe|bin)$/i.test(file.name));
+  if (installers.length !== main.length) return 0;
+  const executable = installers.filter(file => /^setup_.+\.exe$/i.test(file.name));
+  if (executable.length !== 1) return 0;
+  const stem = executable[0]!.name.slice(0, -4);
+  const parts = installers.filter(file => file.name.startsWith(`${stem}-`) && /-\d+\.bin$/i.test(file.name))
+    .map(file => Number(file.name.slice(stem.length + 1, -4)));
+  return parts.length === main.length - 1 && parts.sort((a, b) => a - b).every((part, index) => part === index + 1) ? main.length : 0;
+}
+export function reconcileLocalGameState(vaultId: number, productId: string, files: RemoteFile[], jobs: Job[],
+  changed: boolean, hasFolder: boolean, previousInstallerParts: number, localBytes: number): LocalGameState {
+  const selected = files.filter(file => file.selected);
+  const progress = (entries: RemoteFile[]) => entries.length ? Math.round(100 * entries.reduce((sum, file) =>
+    sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) /
+    entries.reduce((sum, file) => sum + Math.max(1, file.size), 0)) : null;
+  const verified = selected.length > 0 && selected.every(file => file.verified) ||
+    previousInstallerParts > 0 && selected.filter(file => file.category !== 'main').every(file => file.verified);
+  return { vaultId, productId, main: completion(files, 'main'), dlc: completion(files, 'dlc'), extras: completion(files, 'extras'),
+    selectedCompletion: progress(selected), availableContentCoverage: progress(files),
+    verificationState: verified ? 'verified' : selected.some(file => file.matched) ? 'identified' : 'missing',
+    updateState: changed ? 'manifest_changed' : previousInstallerParts ? 'unknown' : 'unchanged',
+    overallStatus: statusFor(files, jobs, changed, hasFolder, previousInstallerParts), localBytes,
+    remoteSelectedBytes: selected.reduce((sum, file) => sum + file.size, 0) };
 }

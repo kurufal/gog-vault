@@ -107,6 +107,8 @@ describe('GOG response adapters', () => {
   });
   test('prefers a product card image and never promotes a small icon over the hero', () => {
     const images = { icon: '//images.gog.com/icon.png', logo: '//images.gog.com/logo.png', background: '//images.gog.com/hero.jpg' };
+    expect(parseProduct({ ...response, coverHorizontal: 'https://images.gog-statics.com/landscape.jpg', images: { ...images, cover: '//images.gog.com/portrait.jpg' } }).cover)
+      .toBe('https://images.gog-statics.com/landscape.jpg');
     expect(parseProduct({ ...response, image: '//images.gog.com/card.jpg', images }).cover).toBe('https://images.gog.com/card.jpg');
     expect(parseProduct({ ...response, image: '//images.gog.com/thumb.jpg', images: { ...images, cover: '//images.gog.com/card.jpg' } }).cover).toBe('https://images.gog.com/card.jpg');
     const fallback = parseProduct({ ...response, images });
@@ -131,6 +133,9 @@ describe('GOG response adapters', () => {
     expect(media.find(asset => asset.role === 'logo')?.url).toBe('https://images.gog.com/logo.jpg');
     expect(media.find(asset => asset.role === 'screenshot')?.url).toBe('https://images.gog-statics.com/full.jpg');
     expect(media.find(asset => asset.role === 'video')?.url).toBe('https://www.youtube.com/watch?v=abcdefghijk');
+    const resolved = parseMedia({ coverHorizontal: 'https://images.gog-statics.com/full-size.png', images: { cover: 'https://images.gog-statics.com/full-size.png', background: '//images.gog.com/hero.jpg', logo2x: '//images.gog.com/small-logo.png' } }, '42');
+    expect(resolved.find(asset => asset.role === 'card')?.url).toBe('https://images.gog-statics.com/full-size.png');
+    expect(resolved.find(asset => asset.role === 'logo')?.url).toBe('https://images.gog.com/small-logo.png');
   });
   test('classifies Agony-shaped YouTube entries and direct media without enabling video archives', () => {
     const media = parseMedia({ videos: [
@@ -152,6 +157,16 @@ describe('GOG response adapters', () => {
     expect(files.filter(file => file.selected)).toHaveLength(2);
     expect(files.find(file => file.platform === 'mac')).toBeDefined();
     expect(files.find(file => file.category === 'extras')?.selected).toBe(false);
+  });
+  test('unowned expanded DLC stays available but is not selected for download', () => {
+    const soundtrack = { downloads: { bonus_content: [{ id: '90287', name: 'soundtrack (WAV)', os: 'windows', files: [
+      { id: '90287', size: 912261120, downlink: 'https://api.gog.com/products/1438925691/downlink/product_bonus/90287' }
+    ] }] } };
+    const config = { ...defaults, extras: true };
+    expect(parseDownloads(soundtrack, '2028023186', 'Agony Soundtrack', '1438925691', config, false)).toMatchObject([
+      { gameId: '2028023186', category: 'extras', selected: false }
+    ]);
+    expect(parseDownloads(soundtrack, '2028023186', 'Agony Soundtrack', '1438925691', config, true)[0]?.selected).toBe(true);
   });
   test('selects the intersection of multiple systems, English, and enabled categories', () => {
     const config = { ...defaults, platforms: ['windows', 'linux'] as (typeof defaults.platforms), languages: ['English'], extras: false };

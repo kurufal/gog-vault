@@ -17,25 +17,33 @@ export function session(): Promise<Session> {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     throw new Error('The GOG Vault backend did not start');
-  })();
+  })().catch(error => { pending = undefined; throw error; });
   return pending;
 }
 
 export async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const { port, token } = await session();
-  const response = await fetch(`http://127.0.0.1:${port}/api${path}`, {
-    method,
-    headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  let response: Response;
+  try {
+    response = await fetch(`http://127.0.0.1:${port}/api${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+  } catch {
+    pending = undefined;
+    throw new Error('GOG Vault backend disconnected. Could not communicate with the local backend.');
+  }
+  const data = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(typeof data?.error === 'string' ? data.error : `GOG Vault backend returned HTTP ${response.status}`);
   return data as T;
 }
 
 export async function queueSocket(): Promise<WebSocket> {
   const { port, token } = await session();
-  return new WebSocket(`ws://127.0.0.1:${port}/ws/queue?session=${token}`);
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/queue?session=${token}`);
+  socket.addEventListener('close', () => { pending = undefined; });
+  return socket;
 }
 
 export async function localArtwork(gameId: string, type: 'cover' | 'background' | 'logo' | 'icon' | 'videoPoster'): Promise<string> {

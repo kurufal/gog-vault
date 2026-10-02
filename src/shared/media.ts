@@ -1,4 +1,4 @@
-import type { MediaAsset, MediaRole } from './domain';
+import type { Game, MediaAsset, MediaRole } from './domain';
 
 export type GalleryAsset = MediaAsset & { roles: MediaRole[] };
 
@@ -28,4 +28,30 @@ export function uniqueMedia(assets: MediaAsset[]): GalleryAsset[] {
     } else gallery.push({ ...asset, roles: [asset.role] });
   }
   return gallery;
+}
+
+export function resolveLibraryLandscapeArtwork(game: Pick<Game, 'cover' | 'background' | 'logo'>): string {
+  if (game.cover && game.cover !== game.background) return game.cover;
+  const logo = game.logo || '';
+  try {
+    const url = new URL(logo);
+    const family = /^\/([a-f0-9]{64})_glx_logo_2x\.(?:jpg|png)$/i.exec(url.pathname);
+    if (url.protocol === 'https:' && /(^|\.)gog-statics\.com$/.test(url.hostname) && family)
+      return `https://images.gog-statics.com/${family[1]}.png`;
+  } catch {}
+  return game.cover || game.background;
+}
+
+export function isLibraryLandscape(width: number, height: number): boolean {
+  return width >= 400 && height >= 200 && width / height >= 1.35 && width / height <= 2.7;
+}
+
+export function progressColor(percent: number | null): string {
+  if (percent === null || percent <= 0) return '#415059';
+  const stops = [[235, 13, 249], [130, 53, 248], [80, 149, 249]];
+  const position = Math.min(100, percent) / 50;
+  const start = stops[Math.min(2, Math.floor(position))];
+  const end = stops[Math.min(2, Math.floor(position) + 1)];
+  const blend = position - Math.floor(position);
+  return `rgb(${start.map((channel, index) => Math.round(channel + (end[index] - channel) * blend)).join(', ')})`;
 }

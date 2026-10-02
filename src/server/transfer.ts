@@ -47,12 +47,12 @@ async function verifyDownloaded(path: string, size: number, checksumUrl?: string
     }
     return true;
 }
-export async function verifyFile(path: string, size: number, checksumUrl?: string, useOfficialSize = false): Promise<boolean> {
+export async function verifyFile(path: string, size: number, checksumUrl?: string, useOfficialSize = false, signal?: AbortSignal): Promise<boolean> {
   if (!checksumUrl) return false;
   try {
-    const checksum = await checksumData(checksumUrl);
-    return await verifyDownloaded(path, useOfficialSize && checksum?.size ? checksum.size : size, checksumUrl, undefined, checksum);
-  } catch { return false; }
+    const checksum = await checksumData(checksumUrl, signal);
+    return await verifyDownloaded(path, useOfficialSize && checksum?.size ? checksum.size : size, checksumUrl, signal, checksum);
+  } catch { if (signal?.aborted) throw new Error('Verification cancelled'); return false; }
 }
 export async function localSha256(path: string, signal?: AbortSignal) {
   return hashFile(path, 0, undefined, signal, 'sha256');

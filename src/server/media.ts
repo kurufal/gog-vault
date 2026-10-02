@@ -2,7 +2,7 @@ import { mkdir, open, realpath, lstat, rename, unlink, readFile } from 'node:fs/
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { imageSize } from 'image-size';
-import { db, gameById, mediaFor } from './db';
+import { activeVault, db, gameById, mediaFor } from './db';
 import { trustedGogUrl } from './gog/products';
 import { gameFolder, writeOfflineMetadata } from './storage';
 
@@ -55,7 +55,9 @@ export async function archiveMedia(gameId: string) {
       const dimensions = kind === 'screenshots' ? imageSize(await readFile(partial)) : null;
       if (await lstat(destination).then(() => true).catch(() => false)) throw new Error('Media destination already exists');
       await rename(partial, destination);
-      db.query('UPDATE media_assets SET local_path=?,size=?,width=?,height=?,mime_type=?,sha256=? WHERE game_id=? AND key=?').run(`.gog-vault/${kind}/${filename}`, bytes,
+      db.query('INSERT INTO vault_media(vault_id,game_id,media_key,local_path) VALUES (?,?,?,?) ON CONFLICT(vault_id,game_id,media_key) DO UPDATE SET local_path=excluded.local_path')
+        .run(activeVault()?.id || -1, gameId, asset.key, `.gog-vault/${kind}/${filename}`);
+      db.query('UPDATE media_assets SET size=?,width=?,height=?,mime_type=?,sha256=? WHERE game_id=? AND key=?').run(bytes,
         dimensions?.width || 0, dimensions?.height || 0, contentType.split(';')[0], hash.digest('hex'), gameId, asset.key);
       if (process.env.GOG_VAULT_DEBUG_MEDIA === '1') console.log(JSON.stringify({ role: asset.role, url: new URL(asset.url).origin + new URL(asset.url).pathname, width: dimensions?.width || 0, height: dimensions?.height || 0, mimeType: contentType.split(';')[0] }));
       downloaded++;

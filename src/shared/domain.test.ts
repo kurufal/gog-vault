@@ -1,9 +1,18 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
-import { completion, desiredFingerprint, manifestFingerprint, normalizeTitle, removeUnresolvedFolder, safeName, statusFor, transition, usedCapacity, type RemoteFile } from './domain';
+import { bulkDownloadWarningBytes, committedNumber, completion, desiredFingerprint, manifestFingerprint, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
 import { withinRoot } from '../server/paths';
 import { scoreFolder } from '../server/matching';
-import { playableVideoSource, uniqueMedia } from './media';
+import { isLibraryLandscape, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from './media';
+
+test('numeric settings commit only valid values after allowing an empty draft', () => {
+  expect(committedNumber('', 1, 8, 2)).toBe(2);
+  expect(committedNumber('4', 1, 8, 2)).toBe(4);
+  expect(committedNumber('99', 1, 8, 2)).toBe(8);
+  expect(committedNumber('-2', 0, 10, 3)).toBe(0);
+  expect(committedNumber('bad', 0, 10, 3)).toBe(3);
+  expect(committedNumber('NaN', 0, 10, 3)).toBe(3);
+});
 
 test('gallery keeps both roles while deduplicating URLs and downloaded bytes', () => {
   const asset = { key: 'card', gameId: '42', role: 'card' as const, url: 'https://images-1.gog-statics.com/' + 'a'.repeat(64) + '.jpg?size=small', poster: '', localPath: '', size: 0, selected: false, external: false };
@@ -61,11 +70,31 @@ describe('archive state', () => {
     expect(completion([identified], 'main')).toBe(100);
     expect(statusFor([identified], [], false, true)).toBe('Needs Verification');
   });
+  test('identifies only a complete hashed older multipart set', () => {
+    const files = [file(), file({ key: 'part-one' }), file({ key: 'part-two' })];
+    const hash = 'a'.repeat(64);
+    const local = [
+      { name: 'setup_game_1.0_(42).exe', size: 35, sha256: hash, verifiedAt: '2026-10-01' },
+      { name: 'setup_game_1.0_(42)-1.bin', size: 55, sha256: hash, verifiedAt: '2026-10-01' },
+      { name: 'setup_game_1.0_(42)-2.bin', size: 75, sha256: hash, verifiedAt: '2026-10-01' }
+    ];
+    expect(previousInstallerSet(files, local)).toBe(3);
+    expect(statusFor(files, [], false, true, 3)).toBe('Vaulted');
+    expect(statusFor(files, [], true, true, 3)).toBe('Vaulted');
+    expect(previousInstallerSet(files, local.slice(0, -1))).toBe(0);
+    expect(previousInstallerSet(files, local.map(item => ({ ...item, sha256: '' })))).toBe(0);
+    expect(previousInstallerSet(files, local.map(item => ({ ...item, verifiedAt: '' })))).toBe(0);
+    expect(previousInstallerSet(files, local.map(item => ({ ...item, name: `Previous Versions/${item.name}` })))).toBe(0);
+  });
   test('detects manifest changes using file IDs, sizes and versions', () => {
     expect(manifestFingerprint([file()])).not.toBe(manifestFingerprint([file({ size: 101 })]));
     expect(manifestFingerprint([file()])).not.toBe(manifestFingerprint([file({ key: 'next' })]));
     expect(manifestFingerprint([file()])).toBe(manifestFingerprint([file({ name: 'resolved-filename.exe' })]));
-    expect(statusFor([file()], [], true, true)).toBe('Update Available');
+    expect(statusFor([file({ verified: true })], [], true, true)).toBe('Vaulted');
+    expect(statusFor([file({ verified: true }), file({ key: 'extra', category: 'extras', verified: false })], [], false, true)).toBe('Incomplete');
+    expect(statusFor([file({ verified: true }), file({ key: 'extra', category: 'extras', selected: false })], [], false, true)).toBe('Vaulted');
+    expect(statusFor([file({ verified: true }), file({ key: 'dlc', category: 'dlc', verified: false })], [], false, true)).toBe('Incomplete');
+    expect(statusFor([file()], [], true, true)).toBe('Not Downloaded');
   });
   test('ignores remote changes to unselected platforms and extras', () => {
     const before = [file({ verified: true }), file({ key: 'linux', platform: 'linux', selected: false }), file({ key: 'extra', category: 'extras', selected: false })];
@@ -79,6 +108,17 @@ describe('archive state', () => {
     expect(statusFor([file({ verified: true }), file({ key: 'dlc', category: 'dlc' })], [], false, true)).toBe('Incomplete');
     expect(statusFor([file({ verified: true }), file({ key: 'extra', category: 'extras', selected: true })], [], false, true)).toBe('Incomplete');
     expect(statusFor([file({ verified: true }), file({ key: 'patch', category: 'other', selected: true })], [], false, true)).toBe('Incomplete');
+  });
+  test('reconciles one vault-scoped archive state for Main, selected Extras and version uncertainty', () => {
+    const main = file({ verified: true, size: 100 });
+    const extra = file({ key: 'extra', category: 'extras', size: 50 });
+    const incomplete = reconcileLocalGameState(7, 'agony', [main, extra], [], false, true, 0, 100);
+    expect(incomplete).toMatchObject({ vaultId: 7, productId: 'agony', main: 100, extras: 0,
+      selectedCompletion: 67, availableContentCoverage: 67, verificationState: 'missing', overallStatus: 'Incomplete' });
+    const optional = reconcileLocalGameState(7, 'agony', [main, { ...extra, selected: false }], [], false, true, 0, 100);
+    expect(optional).toMatchObject({ selectedCompletion: 100, availableContentCoverage: 67, overallStatus: 'Vaulted' });
+    const changed = reconcileLocalGameState(7, 'agony', [main], [], true, true, 0, 100);
+    expect(changed).toMatchObject({ overallStatus: 'Vaulted', updateState: 'manifest_changed' });
   });
   test('enforces queue transitions', () => {
     expect(transition('downloading', 'paused')).toBe(true);
@@ -101,4 +141,48 @@ test('review count drops immediately after linking or ignoring a folder', () => 
   expect(removeUnresolvedFolder(unresolved, 'Agony')).toHaveLength(3);
   expect(removeUnresolvedFolder(removeUnresolvedFolder(unresolved, 'Agony'), 'MODS')).toHaveLength(2);
   expect(unresolved).toHaveLength(4);
+});
+test('Library visibility scopes search without changing owned game counts', () => {
+  const owned = [{ title: 'Agony', hiddenFromLibrary: true }, { title: 'Doom', hiddenFromLibrary: false }];
+  expect(owned).toHaveLength(2);
+  expect(owned.filter(game => visibilityMatches(game, 'Visible', ''))).toEqual([owned[1]]);
+  expect(owned.filter(game => visibilityMatches(game, 'Hidden', 'ago'))).toEqual([owned[0]]);
+  expect(owned.filter(game => visibilityMatches(game, 'Visible', 'ago'))).toEqual([]);
+  expect(owned.filter(game => visibilityMatches(game, 'All', 'ago'))).toEqual([owned[0]]);
+});
+test('platform icons distinguish available, selected and vaulted independently', () => {
+  const files = (['windows', 'linux', 'mac'] as const).map((platform, index) => ({
+    platform, category: 'main' as const, selected: index !== 2, verified: index === 0
+  })) as RemoteFile[];
+  expect(platformStates(files, ['windows', 'linux', 'mac'], true)).toEqual({ windows: 'vaulted', linux: 'selected', mac: 'available' });
+  expect(platformStates(files, ['windows', 'linux', 'mac'], false)).toEqual({ windows: 'selected', linux: 'selected', mac: 'available' });
+  expect(platformStates(files, ['windows', 'linux'], true)).toEqual({ windows: 'vaulted', linux: 'selected' });
+  const previous = [file(), file({ key: 'second' })];
+  expect(platformStates(previous, ['windows'], true, 2)).toEqual({ windows: 'vaulted' });
+});
+test('Agony resolves library landscape from its GOG image family instead of a stale hero', () => {
+  const hero = 'https://images-1.gog-statics.com/bd52ee1e45c606335611cab8e9bcafe545ca7d0d567fded8e966a391d08dfd79.jpg';
+  const logo = 'https://images-1.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9_glx_logo_2x.jpg';
+  const card = 'https://images.gog-statics.com/5d2b24aa458b27ee85913f4cfdfd6c3368ff28df6d7f525e38296204eaec98c9.png';
+  expect(resolveLibraryLandscapeArtwork({ cover: hero, background: hero, logo })).toBe(card);
+  expect(resolveLibraryLandscapeArtwork({ cover: card, background: hero, logo })).toBe(card);
+  expect(resolveLibraryLandscapeArtwork({ cover: hero, background: hero, logo: '' })).toBe(hero);
+  expect(isLibraryLandscape(1600, 740)).toBe(true);
+  expect(isLibraryLandscape(2560, 655)).toBe(false);
+  expect(isLibraryLandscape(200, 120)).toBe(false);
+  expect(progressColor(0)).toBe('#415059');
+  expect(progressColor(null)).toBe('#415059');
+  expect(progressColor(50)).toBe('rgb(130, 53, 248)');
+  expect(progressColor(100)).toBe('rgb(80, 149, 249)');
+});
+
+test('bulk download scopes to visible selections and asks above 100 GB', () => {
+  const proposals = [{ id: 'visible', bytes: bulkDownloadWarningBytes }, { id: 'update', bytes: 1 }, { id: 'filtered-out', bytes: 50 }];
+  const visibleIds = new Set(['visible', 'update']);
+  const updates = new Set(['update']);
+  expect(scopedDownloadPreview(proposals, visibleIds, updates, false).map(item => item.id)).toEqual(['visible']);
+  const withUpdates = scopedDownloadPreview(proposals, visibleIds, updates, true);
+  expect(withUpdates.map(item => item.id)).toEqual(['visible', 'update']);
+  expect(withUpdates.reduce((bytes, item) => bytes + item.bytes, 0)).toBeGreaterThan(bulkDownloadWarningBytes);
+  expect(scopedDownloadPreview(proposals, new Set(['filtered-out']), updates, true).map(item => item.id)).toEqual(['filtered-out']);
 });
