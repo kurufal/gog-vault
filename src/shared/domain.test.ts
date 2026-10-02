@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
-import { bulkDownloadWarningBytes, committedNumber, completion, desiredFingerprint, manifestFingerprint, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
+import { bulkDownloadWarningBytes, committedNumber, completion, contentAvailability, desiredFingerprint, manifestFingerprint, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, selectedChildCompletion, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
 import { withinRoot } from '../server/paths';
 import { scoreFolder } from '../server/matching';
 import { isLibraryLandscape, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from './media';
@@ -185,4 +185,18 @@ test('bulk download scopes to visible selections and asks above 100 GB', () => {
   expect(withUpdates.map(item => item.id)).toEqual(['visible', 'update']);
   expect(withUpdates.reduce((bytes, item) => bytes + item.bytes, 0)).toBeGreaterThan(bulkDownloadWarningBytes);
   expect(scopedDownloadPreview(proposals, new Set(['filtered-out']), updates, true).map(item => item.id)).toEqual(['filtered-out']);
+});
+test('selected owned DLC uses only selected children and distinguishes OFF from N/A', () => {
+  const children = [
+    { selected: true, files: [file({ gameId: 'A', verified: true })] },
+    { selected: true, files: [file({ gameId: 'B' })] },
+    { selected: false, files: [file({ gameId: 'C' })] },
+    { selected: true, files: [file({ gameId: 'D', verified: true })] }
+  ];
+  expect(selectedChildCompletion(children)).toBe(67);
+  expect(selectedChildCompletion(children.map(child => ({ ...child, selected: false })))).toBeNull();
+  expect(selectedChildCompletion([{ selected: true, files: [file({ verified: false })] }])).toBe(0);
+  expect(contentAvailability([], 'extras')).toBe('none');
+  expect(contentAvailability([file({ category: 'extras', selected: false })], 'extras')).toBe('off');
+  expect(contentAvailability([file({ category: 'extras', selected: true })], 'extras')).toBe('selected');
 });

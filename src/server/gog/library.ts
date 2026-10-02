@@ -1,4 +1,4 @@
-import { activity, db, replaceFiles, replaceMedia, upsertGame } from '../db';
+import { activity, linkDlcProducts, replaceFiles, replaceMedia, upsertGame } from '../db';
 import { endpoints, gogRequest } from './client';
 import { product, parseProduct } from './products';
 
@@ -19,8 +19,9 @@ export async function refreshLibrary() {
     }
     for (const id of ids) {
       try {
-        const { info, files, media } = await product(id);
+        const { info, files, media, childIds } = await product(id);
         upsertGame(info);
+        linkDlcProducts(id, childIds);
         replaceFiles(id, files);
         replaceMedia(id, media);
       } catch (error) {

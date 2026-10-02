@@ -1,4 +1,5 @@
 export type Category = 'main' | 'dlc' | 'extras' | 'patches' | 'languagePacks' | 'other';
+export type ProductType = 'game' | 'dlc' | 'bundle' | 'standalone_expansion' | 'bonus_content';
 export type Platform = 'windows' | 'linux' | 'mac';
 export type JobState = 'queued' | 'downloading' | 'paused' | 'verifying' | 'complete' | 'error' | 'cancelled';
 export type VaultStatus = 'Not Downloaded' | 'Queued' | 'Downloading' | 'Paused' | 'Verifying' | 'Vaulted' | 'Update Available' | 'Needs Verification' | 'Incomplete' | 'Error';
@@ -15,7 +16,13 @@ export interface DownloadFailure {
 }
 export interface Game {
   id: string; title: string; slug: string; cover: string; background: string; logo?: string;
+  productType?: ProductType;
+  parentProduct?: { id: string; title: string };
+  dlcChildren?: { id: string; title: string; selected: boolean; files: number; bytes: number; completion: number | null;
+    status: VaultStatus; cover: string; platform: Platform[]; updateAvailable: boolean }[];
+  availability?: Partial<Record<Category, 'none' | 'off' | 'selected'>>;
   folderPath?: string;
+  linkedFiles?: boolean;
   hiddenFromLibrary?: boolean;
   releaseDate: string; platforms: Platform[]; languages: string[]; firstSeen: string;
   refreshedAt: string; scannedAt: string; folder: string; localSize: number;
@@ -158,4 +165,14 @@ export function reconcileLocalGameState(vaultId: number, productId: string, file
     updateState: changed ? 'manifest_changed' : previousInstallerParts ? 'unknown' : 'unchanged',
     overallStatus: statusFor(files, jobs, changed, hasFolder, previousInstallerParts), localBytes,
     remoteSelectedBytes: selected.reduce((sum, file) => sum + file.size, 0) };
+}
+export function contentAvailability(files: RemoteFile[], category: Category): 'none' | 'off' | 'selected' {
+  const available = files.filter(file => file.category === category);
+  return !available.length ? 'none' : available.some(file => file.selected) ? 'selected' : 'off';
+}
+export function selectedChildCompletion(children: { selected: boolean; files: RemoteFile[] }[]): number | null {
+  const selected = children.filter(child => child.selected).flatMap(child => child.files.filter(file => file.category === 'main' && file.selected));
+  if (!selected.length) return null;
+  const total = selected.reduce((sum, file) => sum + Math.max(1, file.size), 0);
+  return Math.round(100 * selected.reduce((sum, file) => sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) / total);
 }

@@ -61,7 +61,8 @@ export function parseProduct(raw: unknown): Partial<Game> & { id: string; title:
   const product = record.parse(raw);
   const images = obj(product.images);
   const compatibility = obj(product.content_system_compatibility);
-  return { id: String(product.id), title: product.title, slug: String(product.slug || ''),
+  const productType = product.type === 'dlc' || product.product_type === 'dlc' || product.is_dlc === true ? 'dlc' : 'game';
+  return { id: String(product.id), title: product.title, slug: String(product.slug || ''), productType,
     cover: (trustedGogUrl(image(product.coverHorizontal), true) ? image(product.coverHorizontal) : '') || image(images.cover) || image(product.image) || image(images.background), background: image(images.background),
     releaseDate: typeof product.release_date === 'string' ? product.release_date : '',
     platforms: (['windows', 'linux', 'osx'] as const).filter(os => compatibility[os]).map(platform),
@@ -99,25 +100,24 @@ export function parseDownloads(raw: unknown, gameId: string, dlcName = '', dlcId
   }
   return result;
 }
+export function productManifest(raw: unknown, id: string, config: Settings, dlcProduct: boolean) {
+  return { files: parseDownloads(raw, id, '', '', config, !dlcProduct || config.dlc),
+    childIds: array(obj(raw).expanded_dlcs).map(dlc => String(obj(dlc).id || '')).filter(dlcId => /^\d+$/.test(dlcId)) };
+}
 export async function product(id: string) {
   const raw = await gogRequest<unknown>(`${endpoints.api}/products/${encodeURIComponent(id)}?expand=downloads,expanded_dlcs,description,screenshots,videos,related_products,changelog`);
   if (!obj(raw).downloads || typeof obj(raw).downloads !== 'object') throw new Error(`GOG product ${id} has no download manifest`);
   const info = parseProduct(raw);
   const previous = gameById(id);
+  if (previous?.productType === 'dlc') info.productType = 'dlc';
   if (info.cover === info.background) {
     info.cover = await productCard(id, info.title) || resolveLibraryLandscapeArtwork({ cover: previous?.cover || info.cover || '', background: info.background || '', logo: previous?.logo });
   }
   if (!info.cover) info.cover = info.background;
   const logoArtwork = resolveLibraryLandscapeArtwork({ cover: info.background || '', background: info.background || '', logo: previous?.logo });
   const logoIsCard = info.cover !== info.background && (previous?.logo === info.cover || logoArtwork === info.cover);
-  let files = parseDownloads(raw, id);
-  for (const dlc of array(obj(raw).expanded_dlcs)) {
-    const dlcId = String(obj(dlc).id || '');
-    if (!/^\d+$/.test(dlcId)) continue;
-    const detail = obj(dlc).downloads ? dlc : await gogRequest<unknown>(`${endpoints.api}/products/${dlcId}?expand=downloads`);
-    files = files.concat(parseDownloads(detail, id, String(obj(dlc).title || dlcId), dlcId, settings(), !!gameById(dlcId)));
-  }
-  return { info, files, media: parseMedia({ ...obj(raw), coverHorizontal: info.cover, images: { ...obj(obj(raw).images), cover: info.cover, ...(logoIsCard ? { logo2x: info.cover } : {}) }, image: info.cover }, id) };
+  const { files, childIds } = productManifest(raw, id, settings(), info.productType === 'dlc');
+  return { info, files, childIds, media: parseMedia({ ...obj(raw), coverHorizontal: info.cover, images: { ...obj(obj(raw).images), cover: info.cover, ...(logoIsCard ? { logo2x: info.cover } : {}) }, image: info.cover }, id) };
 }
 export async function secureLink(file: RemoteFile): Promise<{ url: string; checksum?: string; filename: string }> {
   const data = await gogRequest<Record<string, unknown>>(file.downlink);

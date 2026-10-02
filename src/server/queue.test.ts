@@ -27,8 +27,8 @@ test('a queued download uses its saved manifest after refresh', async () => {
     downloaded.push(file);
     return file.name;
   } }));
-  const { db, filesFor, upsertGame, replaceFiles, saveSettings } = await import('./db');
-  const { command, enqueue, shutdownQueue } = await import('./queue');
+  const { activeVault, db, filesFor, upsertGame, replaceFiles, saveSettings, linkDlcProducts } = await import('./db');
+  const { command, enqueue, enqueueWithChildren, shutdownQueue } = await import('./queue');
   try {
     saveSettings({ vaultPath: dir });
     upsertGame({ id: '42', title: 'Game' });
@@ -96,6 +96,31 @@ test('a queued download uses its saved manifest after refresh', async () => {
     expect(db.query('SELECT bytes,total FROM download_jobs WHERE id=?').get(bonusJob)).toEqual({ bytes: 12, total: 12 });
     expect(db.query('SELECT desired_hash FROM download_jobs WHERE id=?').get(bonusJob)).toEqual({ desired_hash: desiredFingerprint(filesFor('45')) });
     expect(downloaded.filter(file => file.gameId === '45').map(file => file.key)).toEqual(['45:main']);
+    upsertGame({ id: '50', title: 'Blades of Time' });
+    upsertGame({ id: '51', title: 'Blades of Time - Dismal Swamp DLC' });
+    replaceFiles('50', [{ ...original, gameId: '50', key: '50:main' }]);
+    replaceFiles('51', [{ ...original, gameId: '51', key: '51:installer' }]);
+    linkDlcProducts('50', ['51']);
+    const dlcJobs = enqueueWithChildren('50');
+    expect(dlcJobs).toHaveLength(2);
+    expect(db.query('SELECT game_id FROM download_jobs WHERE id IN (?,?) ORDER BY id').all(...dlcJobs)).toEqual([{ game_id: '50' }, { game_id: '51' }]);
+    expect(db.query('SELECT file_key FROM download_files WHERE job_id=?').get(dlcJobs[1])).toEqual({ file_key: '51:installer' });
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Child download did not finish')), 5000);
+      const poll = setInterval(() => {
+        if (dlcJobs.every(job => (db.query('SELECT state FROM download_jobs WHERE id=?').get(job) as { state: string }).state === 'complete')) {
+          clearInterval(poll); clearTimeout(timeout); resolve();
+        }
+      }, 10);
+    });
+    expect(downloaded.filter(file => file.gameId === '51')).toHaveLength(1);
+    upsertGame({ id: '60', title: 'Legacy base game' });
+    upsertGame({ id: '61', title: 'Legacy queued DLC' });
+    replaceFiles('61', [{ ...original, gameId: '61', key: '61:installer' }]);
+    const legacy = db.query("INSERT INTO download_jobs(game_id,state,created_at,updated_at,vault_id) VALUES ('60','error','now','now',?) RETURNING id")
+      .get(activeVault()!.id) as { id: number };
+    db.query('INSERT INTO download_files(job_id,file_key) VALUES (?,?)').run(legacy.id, '61:installer');
+    expect(() => enqueue('61')).toThrow('legacy parent download');
     upsertGame({ id: '43', title: 'Second Game' });
     replaceFiles('43', [{ ...original, gameId: '43', key: '43:installer' }]);
     const interrupted = enqueue('43');

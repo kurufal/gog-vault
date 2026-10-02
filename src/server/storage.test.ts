@@ -2,6 +2,7 @@ import { afterAll, expect, mock, test } from 'bun:test';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
+import { createHash } from 'node:crypto';
 import { uniqueMedia } from '../shared/media';
 
 const directory = await mkdtemp(join(tmpdir(), 'gog-vault-adoption-'));
@@ -22,7 +23,7 @@ mock.module('./gog/products', () => ({
       checksum: file.key === 'official-size' ? 'https://cdn.gog.com/official.xml' : undefined };
   }
 }));
-const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, activeVault } = await import('./db');
+const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, saveLocalGame, activeVault, linkDlcProducts, selectDlcProduct } = await import('./db');
 const { scanGame, scanVault, findGameFolder, linkAndScan, organizePreview, organizeGame, importPreview, importGame, scanState, matchingReview, ignoreFolder, writeOfflineMetadata } = await import('./storage');
 const { enqueueVerification, cancelVerification, verificationJobs, hasActiveVerification } = await import('./verification');
 const { archiveMedia } = await import('./media');
@@ -647,4 +648,104 @@ test('refresh replaces stale card and tiny logo while retaining the banner hero 
   expect(uniqueMedia(mediaFor('303')).map(({ roles, url }) => [roles, url])).toEqual([
     [['card', 'logo'], cardLogo], [['hero'], banner], [['icon'], icon]
   ]);
+});
+test('Blades DLC remains its own card while the parent references one existing installer', async () => {
+  const root = join(directory, 'blades-vault');
+  const parentFolder = join(root, 'Blades of Time');
+  await mkdir(parentFolder, { recursive: true });
+  const filename = 'setup_blades_of_time_-_dismal_swamp_1.0_(39944).exe';
+  const content = Buffer.from('Dismal Swamp fixture');
+  await writeFile(join(parentFolder, filename), content);
+  await writeFile(join(parentFolder, 'parent.exe'), 'abc');
+  const info = await import('node:fs/promises').then(fs => fs.lstat(join(parentFolder, filename)));
+  const mainInfo = await import('node:fs/promises').then(fs => fs.lstat(join(parentFolder, 'parent.exe')));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'blades-base', title: 'Blades of Time', platforms: ['windows'] });
+  upsertGame({ id: 'blades-child', title: 'Blades of Time - Dismal Swamp DLC', platforms: ['windows'] });
+  const insert = db.query(`INSERT INTO remote_files(game_id,key,name,category,platform,language,version,size,downlink,selected)
+    VALUES (?,?,?,?,?,'English','1',?,'https://api.gog.com/child',1)`);
+  insert.run('blades-base', 'blades-main', 'parent.exe', 'main', 'windows', 3);
+  insert.run('blades-base', 'blades-child:installers:1:1', filename, 'dlc', 'windows', content.length);
+  insert.run('blades-child', 'blades-child:installers:1:1', filename, 'main', 'windows', content.length);
+  mapVaultGame('blades-base', 'Blades of Time');
+  saveLocalGame('blades-base', { localSize: content.length + 3 });
+  saveFileState('blades-base', 'blades-main', { matched: true, verified: true, name: 'parent.exe', verifiedSize: 3, verificationSource: 'local-sha256' });
+  saveFileState('blades-base', 'blades-child:installers:1:1', { matched: true, verified: true, name: filename, verifiedSize: content.length });
+  db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?)')
+    .run(activeVault()!.id, 'blades-base', filename, content.length, Math.round(info.mtimeMs), createHash('sha256').update(content).digest('hex'), 'now');
+  db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?)')
+    .run(activeVault()!.id, 'blades-base', 'parent.exe', 3, Math.round(mainInfo.mtimeMs), createHash('sha256').update('abc').digest('hex'), 'now');
+  linkDlcProducts('blades-base', ['blades-child']);
+  replaceFiles('blades-child', filesFor('blades-child'));
+  expect(gameById('blades-child')).toMatchObject({ productType: 'dlc', parentProduct: { id: 'blades-base' }, status: 'Vaulted', completion: { main: 100 }, localSize: content.length });
+  expect(gameById('blades-base')).toMatchObject({ status: 'Vaulted', completion: { dlc: 100 }, localSize: 3 });
+  expect(filesFor('blades-base').map(file => file.key)).toEqual(['blades-main']);
+  expect(db.query('SELECT COUNT(*) AS count FROM vault_local_files WHERE relative_path=?').get(filename)).toEqual({ count: 1 });
+  const duplicateSource = join(directory, 'blades-duplicate-source');
+  await mkdir(join(duplicateSource, '.gog-vault'), { recursive: true });
+  await writeFile(join(duplicateSource, '.gog-vault', 'metadata.json'), JSON.stringify({ id: 'blades-child' }));
+  await writeFile(join(duplicateSource, filename), content);
+  const duplicatePreview = (await importPreview(duplicateSource))[0]!;
+  expect(duplicatePreview.candidates.find(candidate => candidate.id === 'blades-child')?.existingFolder).toBe(true);
+  await expect(importGame(duplicatePreview.source, 'blades-child', duplicatePreview.signature, 'copy')).rejects.toThrow('existing folder');
+  selectDlcProduct('blades-base', 'blades-child', false);
+  expect(gameById('blades-base')).toMatchObject({ status: 'Vaulted', availability: { dlc: 'off' }, completion: { dlc: null } });
+  expect(gameById('blades-child')?.status).toBe('Vaulted');
+  selectDlcProduct('blades-base', 'blades-child', true);
+  expect(gameById('blades-base')?.completion.dlc).toBe(100);
+  setHiddenGames(['blades-child'], true);
+  expect(gameById('blades-base')?.hiddenFromLibrary).toBe(false);
+  expect(gameById('blades-child')?.hiddenFromLibrary).toBe(true);
+  expect(await scanGame('blades-base')).toMatchObject({ completion: { dlc: 100 } });
+  expect(await scanGame('blades-child', true)).toMatchObject({ completion: { main: 100 } });
+  const parentVerify = enqueueVerification('blades-base');
+  const childVerify = verificationJobs().find(job => job.gameId === 'blades-child' && job.state === 'queued');
+  expect(childVerify).toBeDefined();
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('DLC verification timed out')), 5000);
+    const poll = setInterval(() => {
+      if ([parentVerify.id, childVerify!.id].every(id => verificationJobs().find(job => job.id === id)?.state === 'complete')) {
+        clearInterval(poll); clearTimeout(timeout); resolve();
+      }
+    }, 10);
+  });
+  expect(db.query('SELECT COUNT(*) AS count FROM vault_local_files WHERE vault_id=? AND relative_path=?').get(activeVault()!.id, filename))
+    .toEqual({ count: 1 });
+  replaceFiles('blades-child', [{ key: 'blades-child:installers:1:1', gameId: 'blades-child', name: filename,
+    category: 'main', platform: 'windows', language: 'English', version: '2', size: content.length,
+    downlink: 'https://api.gog.com/child', selected: true, verified: false }]);
+  expect(gameById('blades-child')).toMatchObject({ status: 'Vaulted', completion: { main: 100 }, archive: { updateState: 'manifest_changed' } });
+  expect(gameById('blades-base')).toMatchObject({ status: 'Vaulted', completion: { dlc: 100 }, archive: { updateState: 'manifest_changed' } });
+  await scanGame('blades-child', true);
+  expect(filesFor('blades-child')[0]?.verified).toBe(false);
+  expect(gameById('blades-base')).toMatchObject({ status: 'Vaulted', archive: { updateState: 'manifest_changed' } });
+  const secondVault = join(directory, 'blades-other-vault');
+  await mkdir(secondVault);
+  saveSettings({ vaultPath: secondVault });
+  expect(gameById('blades-child')).toMatchObject({ status: 'Not Downloaded', completion: { main: 0 } });
+  expect(gameById('blades-base')).toMatchObject({ completion: { dlc: 0 } });
+  saveSettings({ vaultPath: root });
+  expect(gameById('blades-base')?.completion.dlc).toBe(100);
+});
+test('importing a child DLC updates its parent without a second local installer', async () => {
+  const root = join(directory, 'dlc-import-vault');
+  const source = join(directory, 'dlc-import-source', 'Imported DLC');
+  await mkdir(root);
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, 'installer.bin'), 'child installer');
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'import-dlc-parent', title: 'Import Parent' });
+  upsertGame({ id: 'import-dlc-child', title: 'Imported DLC' });
+  replaceFiles('import-dlc-parent', [{ key: 'parent', gameId: 'import-dlc-parent', name: 'parent.exe', category: 'main', platform: 'windows', language: 'English', version: '1', size: 3, downlink: 'https://api.gog.com/parent', selected: true, verified: true }]);
+  replaceFiles('import-dlc-child', [{ key: 'child', gameId: 'import-dlc-child', name: 'installer.bin', category: 'main', platform: 'windows', language: 'English', version: '1', size: 15, downlink: 'https://api.gog.com/child', selected: true, verified: false }]);
+  mapVaultGame('import-dlc-parent', 'Import Parent');
+  saveFileState('import-dlc-parent', 'parent', { name: 'parent.exe', matched: true, verified: true });
+  linkDlcProducts('import-dlc-parent', ['import-dlc-child']);
+  expect(gameById('import-dlc-parent')).toMatchObject({ completion: { dlc: 0 }, status: 'Incomplete' });
+  const preview = (await importPreview(source))[0]!;
+  await importGame(preview.source, 'import-dlc-child', preview.signature, 'copy');
+  expect(gameById('import-dlc-child')).toMatchObject({ status: 'Vaulted', completion: { main: 100 } });
+  expect(gameById('import-dlc-parent')).toMatchObject({ status: 'Vaulted', completion: { dlc: 100 } });
+  expect(db.query('SELECT game_id,COUNT(*) AS count FROM vault_local_files WHERE vault_id=? AND relative_path=? GROUP BY game_id').all(activeVault()!.id, 'installer.bin'))
+    .toEqual([{ game_id: 'import-dlc-child', count: 1 }]);
 });

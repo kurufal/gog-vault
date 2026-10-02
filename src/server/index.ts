@@ -7,12 +7,12 @@ import { startupConfig, validSession } from './startup';
 import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
 import { refreshLibrary, refreshState } from './gog/library';
-import { activity, configDir, db, filesFor, gameById, games, jobsFor, mediaFor, replaceFiles, replaceMedia, saveSettings, setHiddenGames, settings, upsertGame } from './db';
+import { activity, configDir, db, filesFor, gameById, games, jobsFor, linkDlcProducts, mediaFor, replaceFiles, replaceMedia, saveSettings, selectDlcProduct, setHiddenGames, settings, upsertGame } from './db';
 import { cancelScan, ignoreFolder, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
 import { enqueueImports, importCommand, importJobs, shutdownImports, startImports, subscribeImports } from './imports';
 import { cancelVerification, enqueueVerification, hasActiveVerification, removeVerification, verificationJobs } from './verification';
 import { archiveMedia, selectMedia } from './media';
-import { broadcast, command, enqueue, schedule, shutdownQueue, startQueue, subscribe } from './queue';
+import { broadcast, command, enqueueWithChildren, schedule, shutdownQueue, startQueue, subscribe } from './queue';
 
 const { token, host, port } = startupConfig();
 let playbackPort = port;
@@ -80,23 +80,28 @@ const app = new Elysia()
   .get('/api/games', () => games())
   .patch('/api/games/visibility', ({ body }) => setHiddenGames(body.ids, body.hidden), { body: t.Object({ ids: t.Array(t.String()), hidden: t.Boolean() }) })
   .get('/api/library/download-preview', () => games().flatMap(game => {
-    const missing = filesFor(game.id).filter(file => file.selected && !file.matched && !file.verified);
-    return missing.length && !jobsFor(game.id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))
-      ? [{ id: game.id, title: game.title, files: missing.length, bytes: missing.reduce((sum, file) => sum + file.size, 0) }] : [];
+    const ids = [game.id, ...(game.dlcChildren || []).filter(child => child.selected).map(child => child.id)];
+    const missing = [...new Set(ids)].flatMap(id => jobsFor(id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))
+      ? [] : filesFor(id).filter(file => file.selected && !file.matched && !file.verified));
+    return missing.length ? [{ id: game.id, title: game.title, files: missing.length, bytes: missing.reduce((sum, file) => sum + file.size, 0) }] : [];
   }))
   .post('/api/library/download-missing', ({ body }) => {
     const started: { id: string; job: number }[] = []; const skipped: { id: string; reason: string }[] = [];
     for (const id of new Set(body.ids)) {
-      try { started.push({ id, job: enqueue(id) }); }
+      try { started.push({ id, job: enqueueWithChildren(id)[0]! }); }
       catch (error) { skipped.push({ id, reason: error instanceof Error ? error.message : 'Could not queue' }); }
     }
     return { started, skipped };
   }, { body: t.Object({ ids: t.Array(t.String()) }) })
   .get('/api/games/:id', ({ params }) => { const game = gameById(params.id); if (!game) throw new Error('Game not found'); return { game, files: filesFor(params.id), media: mediaFor(params.id) }; })
+  .patch('/api/games/:id/dlc/:childId', ({ params, body }) => {
+    const game = selectDlcProduct(params.id, params.childId, body.selected);
+    return { game, files: filesFor(params.id), media: mediaFor(params.id) };
+  }, { body: t.Object({ selected: t.Boolean() }) })
   .post('/api/games/:id/downloads', async ({ params }) => {
     if (!gameById(params.id)) throw new Error('Game not found');
-    const { info, files, media } = await product(params.id);
-    upsertGame(info); replaceFiles(params.id, files); replaceMedia(params.id, media);
+    const { info, files, media, childIds } = await product(params.id);
+    upsertGame(info); linkDlcProducts(params.id, childIds); replaceFiles(params.id, files); replaceMedia(params.id, media);
     return { game: gameById(params.id), files: filesFor(params.id), media: mediaFor(params.id) };
   })
   .patch('/api/games/:id/selections', ({ params, body }) => {
@@ -132,7 +137,7 @@ const app = new Elysia()
     importCommand(params.id, params.action);
     return { ok: true };
   })
-  .post('/api/games/:id/queue', ({ params }) => ({ id: enqueue(params.id) }))
+  .post('/api/games/:id/queue', ({ params }) => ({ id: enqueueWithChildren(params.id)[0] }))
   .get('/api/queue', () => jobsFor())
   .post('/api/queue/:id/:action', ({ params }) => {
     if (!['pause', 'resume', 'cancel', 'remove'].includes(params.action)) throw new Error('Invalid queue action');
@@ -144,7 +149,7 @@ const app = new Elysia()
     const disk = await storageInfo().catch(() => ({ available: null }));
     return { counts: { owned: all.length, vaulted: all.filter(g => g.status === 'Vaulted').length,
       missing: all.filter(g => g.status === 'Not Downloaded').length, incomplete: all.filter(g => g.status === 'Incomplete').length,
-      updates: all.filter(g => g.status === 'Update Available').length, downloading: queue.filter(j => j.state === 'downloading').length,
+      updates: all.filter(g => g.status === 'Update Available' || g.archive?.updateState === 'manifest_changed').length, downloading: queue.filter(j => j.state === 'downloading').length,
       errors: all.filter(g => g.status === 'Error').length, size: all.reduce((sum, g) => sum + g.localSize, 0), free: disk.available },
       activity: db.query('SELECT at,message FROM activity ORDER BY id DESC LIMIT 12').all() };
   })

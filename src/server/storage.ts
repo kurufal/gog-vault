@@ -5,7 +5,7 @@ import { imageSize } from 'image-size';
 import { desiredFingerprint, normalizeTitle, safeName, type Game } from '../shared/domain';
 import { withinRoot } from './paths';
 import { scoreFolder } from './matching';
-import { activeVault, activity, configDir, db, filesFor, gameById, games, jobsFor, localGameRow, mapVaultGame, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
+import { activeVault, activity, configDir, db, filesFor, gameById, games, hasIndexedLinkedFile, jobsFor, localGameRow, mapVaultGame, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
 import { secureLink, trustedGogUrl } from './gog/products';
 import { localSha256, verifyFile } from './transfer';
 
@@ -202,7 +202,7 @@ export async function importPreview(root: string) {
       const plan = await inspectImport(source);
       const candidates = games().filter(game => !game.folder || plan.metadataId === game.id).map(game => scoreFolder(source.split(/[\\/]/).pop() || '', game,
         { metadataId: plan.metadataId, localFiles: plan.entries.filter(entry => !entry.name.includes('/')), expectedFiles: filesFor(game.id).filter(file => file.category === 'main') }))
-        .filter((item): item is NonNullable<typeof item> => !!item).map(item => ({ ...item, existingFolder: !!gameById(item.id)?.folder }))
+        .filter((item): item is NonNullable<typeof item> => !!item).map(item => ({ ...item, existingFolder: !!gameById(item.id)?.folder || hasIndexedLinkedFile(item.id) }))
         .sort((left, right) => right.confidence - left.confidence).slice(0, 5);
       return { source: plan.origin, files: plan.entries.length, bytes: plan.bytes, signature: plan.signature, metadataId: plan.metadataId, candidates, error: '' };
     } catch (error) { return { source, files: 0, bytes: 0, signature: '', metadataId: '', candidates: [], error: error instanceof Error ? error.message : 'Cannot inspect folder' }; }
@@ -213,7 +213,7 @@ export async function importGame(source: string, id: string, signature: string, 
   const plan = await inspectImport(source);
   if (!plan.entries.length || plan.signature !== signature) throw new Error('Import source changed since preview; review it again');
   const game = gameById(id);
-  if (!game || game.folder || plan.metadataId && plan.metadataId !== id) throw new Error('Product mapping conflicts with local metadata or existing folder');
+  if (!game || game.folder || hasIndexedLinkedFile(id) || plan.metadataId && plan.metadataId !== id) throw new Error('Product mapping conflicts with local metadata or existing folder');
   if (jobsFor(id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))) throw new Error('Finish this game download before importing');
   const base = await vaultPath();
   const folder = folderName(game);
@@ -235,7 +235,7 @@ export async function importGame(source: string, id: string, signature: string, 
       if (await localSha256(original) !== sha256 || await localSha256(target) !== sha256) throw new Error('Import copy failed SHA-256 verification; source retained');
       copied.push({ name: entry.name, sha256 });
     }
-    if (await lstat(destination).then(() => true).catch(() => false) || gameById(id)?.folder) throw new Error('Import destination changed during copy');
+    if (await lstat(destination).then(() => true).catch(() => false) || gameById(id)?.folder || hasIndexedLinkedFile(id)) throw new Error('Import destination changed during copy');
     await rename(staged, destination);
     committed = true;
     await finalizeImportedGame(id, folder, copied.map(entry => ({ ...entry, size: plan.entries.find(item => item.name === entry.name)!.size })));
@@ -326,7 +326,43 @@ export async function scanGame(id: string, fullVerify = false, knownFolder?: str
     if (match) await mapFolder(id, match);
   }
   const current = gameById(id)!;
-  if (!current.folder) return current;
+  if (!current.folder) {
+    if (fullVerify) {
+      const linked = db.query(`SELECT location.file_key,location.storage_game_id,location.relative_path,physical.size,physical.sha256,storage.folder
+        FROM vault_child_file_locations location JOIN vault_local_files physical ON physical.vault_id=location.vault_id
+          AND physical.game_id=location.storage_game_id AND physical.relative_path=location.relative_path
+        JOIN vault_games storage ON storage.vault_id=location.vault_id AND storage.game_id=location.storage_game_id
+        WHERE location.vault_id=? AND location.child_product_id=? AND storage.folder!=''`)
+        .all(activeVault()?.id || -1, id) as { file_key: string; storage_game_id: string; relative_path: string; size: number; sha256: string; folder: string }[];
+      const selected = filesFor(id).filter(file => file.selected);
+      let done = 0;
+      for (const file of selected) {
+        if (signal?.aborted) throw new Error('Verification cancelled');
+        const location = linked.find(item => item.file_key === file.key);
+        if (!location) continue;
+        const storageGame = gameById(location.storage_game_id);
+        if (!storageGame?.folder) continue;
+        const path = withinRoot(await gameFolder(storageGame), location.relative_path);
+        const physical = await lstat(path).catch(() => null);
+        const matched = !!physical?.isFile() && physical.size === location.size &&
+          (!file.verifiedSize || physical.size === file.verifiedSize);
+        let checksum = file.checksumUrl || '';
+        if (!checksum) try { checksum = (await secureLink(file)).checksum || ''; } catch {}
+        const verified = matched && (checksum ? await verifyFile(path, file.size, checksum, true, signal)
+          : (!current.archivedHash || current.archivedHash === current.manifestHash) && !!location.sha256 &&
+            await localSha256(path, signal) === location.sha256);
+        saveFileState(id, file.key, { ...file, matched, verified, verifiedSize: verified ? physical!.size : 0 });
+        if (verified) db.query('UPDATE vault_local_files SET verified_at=? WHERE vault_id=? AND game_id=? AND relative_path=?')
+          .run(now(), activeVault()?.id || -1, location.storage_game_id, location.relative_path);
+        done++;
+        progress?.(done, selected.length, file.name, physical?.size || 0);
+      }
+      if (selected.length && selected.every(file => filesFor(id).find(current => current.key === file.key)?.verified))
+        saveLocalGame(id, { archivedHash: current.manifestHash, archivedSelectedHash: desiredFingerprint(filesFor(id)), scannedAt: now() });
+      progress?.(selected.length, selected.length, '', 0);
+    }
+    return gameById(id)!;
+  }
   await vaultPath();
   let path: string;
   try { path = await gameFolder(current); }

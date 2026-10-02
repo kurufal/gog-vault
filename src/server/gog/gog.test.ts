@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCode } from './auth';
 import { createCredentialStore } from './credentials';
-import { catalogCover, parseDownloads, parseMedia, parseProduct, trustedGogUrl } from './products';
+import { catalogCover, parseDownloads, parseMedia, parseProduct, productManifest, trustedGogUrl } from './products';
 import { defaults } from '../../shared/domain';
 
 describe('GOG auth callback', () => {
@@ -167,6 +167,21 @@ describe('GOG response adapters', () => {
       { gameId: '2028023186', category: 'extras', selected: false }
     ]);
     expect(parseDownloads(soundtrack, '2028023186', 'Agony Soundtrack', '1438925691', config, true)[0]?.selected).toBe(true);
+  });
+  test('owned expanded DLC is a relationship, not a second parent-owned installer', () => {
+    const child = { id: '1613811126', title: 'Blades of Time - Dismal Swamp DLC', type: 'dlc', downloads: {
+      installers: [{ id: 'installer_windows_en', name: 'Dismal Swamp DLC', os: 'windows', language_full: 'English', files: [
+        { id: 'part1', size: 273561600, downlink: 'https://api.gog.com/products/1613811126/downlink/installer/part1' }
+      ] }] } };
+    const parent = { id: '1164193173', title: 'Blades of Time', downloads: response.downloads, expanded_dlcs: [child] };
+    expect(parseProduct(child).productType).toBe('dlc');
+    const parentManifest = productManifest(parent, '1164193173', defaults, false);
+    expect(parentManifest.childIds).toEqual(['1613811126']);
+    expect(parentManifest.files.every(file => file.gameId === '1164193173' && !file.key.startsWith('1613811126:'))).toBe(true);
+    expect(productManifest(child, '1613811126', defaults, true).files).toMatchObject([
+      { gameId: '1613811126', category: 'main', selected: true }
+    ]);
+    expect(productManifest(child, '1613811126', { ...defaults, dlc: false }, true).files[0]?.selected).toBe(false);
   });
   test('selects the intersection of multiple systems, English, and enabled categories', () => {
     const config = { ...defaults, platforms: ['windows', 'linux'] as (typeof defaults.platforms), languages: ['English'], extras: false };

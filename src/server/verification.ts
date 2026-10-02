@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { activeVault, filesFor, gameById } from './db';
+import { activeVault, db, filesFor, gameById } from './db';
 import { scanGame } from './storage';
 
 export type VerificationJob = {
@@ -20,7 +20,8 @@ export function hasActiveVerification() {
 export function enqueueVerification(gameId: string): VerificationJob {
   const game = gameById(gameId);
   const vaultId = activeVault()?.id;
-  if (!game?.folder || !vaultId) throw new Error('Link a game folder before verifying');
+  if (!game || !vaultId || !game.folder && !db.query('SELECT 1 FROM vault_child_file_locations WHERE vault_id=? AND child_product_id=?').get(vaultId, gameId))
+    throw new Error('Link a game folder before verifying');
   if (jobs.some(job => job.gameId === gameId && job.vaultId === vaultId && ['queued', 'verifying', 'reconciling'].includes(job.state)))
     throw new Error('Verification already running for this game');
   const selected = filesFor(gameId).filter(file => file.selected);
@@ -28,6 +29,13 @@ export function enqueueVerification(gameId: string): VerificationJob {
     totalBytes: selected.reduce((sum, file) => sum + file.size, 0), currentFile: '', error: '' };
   jobs.unshift(job);
   if (jobs.length > 100) jobs.pop();
+  for (const child of game.dlcChildren || []) if (child.selected && (gameById(child.id)?.folder ||
+    db.query('SELECT 1 FROM vault_child_file_locations WHERE vault_id=? AND child_product_id=?').get(vaultId, child.id)) &&
+    !jobs.some(item => item.gameId === child.id && item.vaultId === vaultId && ['queued', 'verifying', 'reconciling'].includes(item.state))) {
+    const selectedFiles = filesFor(child.id).filter(file => file.selected);
+    jobs.push({ id: randomUUID(), gameId: child.id, vaultId, state: 'queued', done: 0, total: selectedFiles.length, bytes: 0,
+      totalBytes: selectedFiles.reduce((sum, file) => sum + file.size, 0), currentFile: '', error: '' });
+  }
   void runNext();
   return { ...job };
 }

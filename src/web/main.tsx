@@ -90,8 +90,13 @@ function columnValue(game: Game, label: string): string | number {
   if (label === "Status") return game.status;
   return game.title;
 }
+function contentLabel(game: Game, category: Category): string {
+  if (game.availability?.[category] === 'off') return 'OFF';
+  return game.completion[category] === null ? 'N/A' : `${game.completion[category]}%`;
+}
 function statusHint(game: Game): string {
   if (game.previousInstallerParts) return `${game.previousInstallerParts} installer parts have stored SHA-256 verification. The current GOG build has not been confirmed.`;
+  if (game.dlcChildren?.some(child => child.selected && child.updateAvailable)) return 'A selected DLC has a newer GOG manifest. The archived version remains available.';
   if (game.archive?.updateState === 'manifest_changed' && game.status === 'Vaulted') return 'Archived content is verified. The selected GOG manifest changed, but a newer build has not been established.';
   if (game.status === 'Needs Verification') return 'Installed files were identified, but their current integrity is not established.';
   if (game.status === 'Update Available') return 'The archived installers are verified, but the selected GOG manifest has changed.';
@@ -119,12 +124,12 @@ function Platforms({ platforms, states }: { platforms: Platform[]; states?: Game
     </span>
   );
 }
-function Meter({ value, label }: { value: number | null; label: string }) {
+function Meter({ value, label, off = false }: { value: number | null; label: string; off?: boolean }) {
   return (
     <div className="meter">
       <div className="meter-label">
         <span>{label}</span>
-        <strong>{value === null ? "N/A" : `${value}%`}</strong>
+        <strong>{off ? 'OFF' : value === null ? "N/A" : `${value}%`}</strong>
       </div>
       <div className={`meter-track ${value === null ? 'progress-na' : 'progress-available'}`}>
         {value !== null && value > 0 && <span style={{ clipPath: `inset(0 ${100 - Math.min(100, value)}% 0 0)`, backgroundColor: progressColor(value) }} />}
@@ -557,7 +562,7 @@ function App() {
             : filter === "Missing"
               ? g.status === "Not Downloaded"
               : filter === "Updates"
-                ? g.status === "Update Available"
+                ? g.status === "Update Available" || g.archive?.updateState === 'manifest_changed'
                 : filter === "Downloading"
                   ? ["Queued", "Downloading", "Paused", "Verifying"].includes(
                       g.status,
@@ -585,7 +590,10 @@ function App() {
     });
   const selectedVisible = visible.filter(game => selectedIds.has(game.id));
   const previewHasUpdates = downloadMode === 'download' && !!downloadPreview?.some(item => games.find(game => game.id === item.id)?.status === 'Update Available');
-  const downloadablePreview = scopedDownloadPreview(downloadPreview || [], new Set(selectedVisible.map(game => game.id)), new Set(games.filter(game => game.status === 'Update Available').map(game => game.id)), includeUpdates === true);
+  const selectedVisibleIds = new Set(selectedVisible.map(game => game.id));
+  const downloadablePreview = scopedDownloadPreview(downloadPreview || [], selectedVisibleIds,
+    new Set(games.filter(game => game.status === 'Update Available' || game.archive?.updateState === 'manifest_changed').map(game => game.id)), includeUpdates === true)
+    .filter(item => !games.find(game => game.id === item.id)?.parentProduct || !selectedVisibleIds.has(games.find(game => game.id === item.id)!.parentProduct!.id));
   const downloadBytes = downloadablePreview.reduce((sum, item) => sum + item.bytes, 0);
   const toggleSelection = (id: string) => setSelectedIds(current => {
     const next = new Set(current);
@@ -887,9 +895,9 @@ function App() {
                     {visible.map(game => <div className={`list-row list-game ${selectionEnabled && selectedIds.has(game.id) ? 'is-selected' : ''}`} key={game.id} role={selectionEnabled ? undefined : 'button'} tabIndex={selectionEnabled ? -1 : 0}
                       onClick={() => selectionEnabled ? toggleSelection(game.id) : void openGame(game.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectionEnabled ? toggleSelection(game.id) : void openGame(game.id); } }}>
                       {selectionEnabled && <input className="list-select" type="checkbox" aria-label={`Select ${game.title}`} checked={selectedIds.has(game.id)} onChange={() => toggleSelection(game.id)} onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()} />}
-                      <div className="list-title"><div className="list-art"><Artwork game={game} vaultIdentity={settings?.vaultPath} /></div><div className="list-name">{game.title}{game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}{games.some(other => other.id !== game.id && other.title === game.title) && <small className="product-disambiguation">Product {game.id}</small>}</div></div>
+                      <div className="list-title"><div className="list-art"><Artwork game={game} vaultIdentity={settings?.vaultPath} /></div><div className="list-name">{game.title}{game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}{game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}{game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}{games.some(other => other.id !== game.id && other.title === game.title) && <small className="product-disambiguation">Product {game.id}</small>}</div></div>
                       <div className="list-cell-1"><Platforms platforms={game.platforms} /></div>
-                      {(['main', 'dlc', 'extras'] as const).map((key, index) => <div className={`list-cell-${index + 2}`} key={key}>{game.completion[key] === null ? 'N/A' : `${game.completion[key]}%`}</div>)}
+                      {(['main', 'dlc', 'extras'] as const).map((key, index) => <div className={`list-cell-${index + 2}`} key={key} title={game.productType === 'dlc' && key === 'main' ? 'Content' : key}>{contentLabel(game, key)}</div>)}
                       <div className="list-cell-5"><span className={`status ${game.status.toLowerCase().replaceAll(' ', '-')}`} title={statusHint(game)} aria-label={`${game.status}. ${statusHint(game)}`}>{game.status}{(game.previousInstallerParts || game.archive?.updateState === 'manifest_changed' || ['Needs Verification', 'Update Available', 'Incomplete'].includes(game.status)) && <CircleAlert size={12} aria-hidden="true" />}</span></div>
                       <div className="list-cell-6">{fmt(game.localSize)}</div><div className="list-cell-7">{fmt(game.remoteSize)}</div>
                       <div className="list-cell-8">{game.refreshedAt ? new Date(game.refreshedAt).toLocaleDateString() : '-'}</div>
@@ -908,22 +916,22 @@ function App() {
                         <div className="game-art">
                           <Artwork game={game} vaultIdentity={settings?.vaultPath} />
                           {selectionEnabled && <input className="card-select" type="checkbox" aria-label={`Select ${game.title}`} checked={selectedIds.has(game.id)} onChange={() => toggleSelection(game.id)} onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()} />}
-                          {game.status === "Update Available" && (
+                          {(game.status === "Update Available" || game.archive?.updateState === 'manifest_changed' && game.status === 'Vaulted') && (
                             <span className="update-tag">UPDATE</span>
                           )}
                         </div>
                         <div className="game-info">
                           <h3>{game.title}</h3>
+                          {game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}
                           {game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}
+                          {game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}
                           {games.some(other => other.id !== game.id && other.title === game.title) && <small className="product-disambiguation">GOG product {game.id}</small>}
                           <div className="compact-meters">
                             {(["main", "dlc", "extras"] as const).map((key) => (
                               <div key={key}>
-                                <span>{key.toUpperCase()}</span>
+                                <span>{game.productType === 'dlc' && key === 'main' ? 'CONTENT' : key.toUpperCase()}</span>
                                 <strong>
-                                  {game.completion[key] === null
-                                    ? "N/A"
-                                    : `${game.completion[key]}%`}
+                                  {contentLabel(game, key)}
                                 </strong>
                                 {game.completion[key] !== null && game.completion[key]! > 0 && <i style={{ clipPath: `inset(0 ${100 - Math.min(100, game.completion[key]!)}% 0 0)`, backgroundColor: progressColor(game.completion[key]) }} />}
                               </div>
@@ -931,7 +939,7 @@ function App() {
                           </div>
                           <div className="game-sub">
                             <Platforms platforms={game.platforms} states={game.platformState} />
-                            <span className={`status ${game.status.toLowerCase().replaceAll(" ", "-")}`} title={statusHint(game)} aria-label={`${game.status}. ${statusHint(game)}`} tabIndex={0}>{game.status}{(game.previousInstallerParts || ['Needs Verification', 'Update Available', 'Incomplete'].includes(game.status)) && <CircleAlert size={12} aria-hidden="true" />}</span>
+                            <span className={`status ${game.status.toLowerCase().replaceAll(" ", "-")}`} title={statusHint(game)} aria-label={`${game.status}. ${statusHint(game)}`} tabIndex={0}>{game.status}{(game.previousInstallerParts || game.archive?.updateState === 'manifest_changed' || ['Needs Verification', 'Update Available', 'Incomplete'].includes(game.status)) && <CircleAlert size={12} aria-hidden="true" />}</span>
                           </div>
                         </div>
                       </div>
@@ -1348,6 +1356,7 @@ function App() {
           defaults={settings}
           busy={!!busy}
           close={() => setDetail(null)}
+          onOpenGame={id => void openGame(id)}
           update={updateDetail}
           verification={verifications.find(job => job.gameId === detail.game.id && ['queued', 'verifying', 'reconciling'].includes(job.state))}
           onVerify={() => { if (!verificationAvailable) { setError('Restart GOG Vault to enable background verification.'); return; } void notify(async () => {
@@ -1385,6 +1394,7 @@ function GameModal({
   detail,
   defaults: defaultSettings,
   close,
+  onOpenGame,
   update,
   verification,
   onVerify,
@@ -1398,6 +1408,7 @@ function GameModal({
   detail: Detail;
   defaults: Settings | null;
   close: () => void;
+  onOpenGame: (id: string) => void;
   update: (path: string, method?: string, body?: unknown) => void;
   verification?: VerificationJob;
   onVerify: () => void;
@@ -1461,7 +1472,7 @@ function GameModal({
       (language === "All languages" || file.language === language),
   );
   const groups: [Category, string][] = [
-    ["main", "MAIN / OFFLINE INSTALLERS"],
+    ["main", game.productType === 'dlc' ? "OFFLINE INSTALLERS" : "MAIN / OFFLINE INSTALLERS"],
     ["dlc", "DLC"],
     ["extras", "EXTRAS"],
     ["patches", "PATCHES"],
@@ -1498,6 +1509,8 @@ function GameModal({
             <div>
               <div className="eyebrow">PRODUCT / {game.id}</div>
               <h2>{game.title}</h2>
+              {game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}
+              {game.parentProduct && <button className="dlc-parent-link" onClick={() => onOpenGame(game.parentProduct!.id)}>DLC FOR {game.parentProduct.title} <ArrowRight size={13} /></button>}
               <div className="identity-meta">
                 {game.hiddenFromLibrary && <span className="hidden-badge">HIDDEN</span>}
                 <span
@@ -1566,7 +1579,7 @@ function GameModal({
             </button>
             <button
               className="secondary-button"
-              disabled={busy || !game.folder || !!verification}
+              disabled={busy || !game.folder && !game.linkedFiles || !!verification}
               onClick={onVerify}
             >
               <ShieldCheck size={16} />
@@ -1602,7 +1615,7 @@ function GameModal({
               <button
                 className="primary-button"
                 disabled={
-                  !files.some((file) => file.selected && !file.verified && !file.matched) || busy
+                  !files.some((file) => file.selected && !file.verified && !file.matched) && !game.dlcChildren?.some(child => child.selected && child.completion !== 100) || busy
                 }
                 onClick={() => update(`/games/${game.id}/queue`)}
               >
@@ -1619,10 +1632,10 @@ function GameModal({
           </div>}
           <div className="detail-summary">
             <div className="detail-meters">
-              <Meter label="MAIN" value={game.completion.main} />
+              <Meter label={game.productType === 'dlc' ? 'CONTENT' : 'MAIN'} value={game.completion.main} />
               {!!game.previousInstallerParts && <small className="previous-parts">Verified local installer set: {game.previousInstallerParts} parts; current GOG build not confirmed.</small>}
-              <Meter label="DLC" value={game.completion.dlc} />
-              <Meter label="EXTRAS" value={game.completion.extras} />
+              <Meter label="DLC" value={game.completion.dlc} off={game.availability?.dlc === 'off'} />
+              <Meter label="EXTRAS" value={game.completion.extras} off={game.availability?.extras === 'off'} />
             </div>
             {game.folder && (
               <p className="field-help">
@@ -1719,9 +1732,16 @@ function GameModal({
               <h4>
                 {label}
                 <span>
-                  {shown.filter((file) => file.category === category).length}
+                  {shown.filter((file) => file.category === category).length + (category === 'dlc' ? game.dlcChildren?.length || 0 : 0)}
                 </span>
               </h4>
+              {category === 'dlc' && game.dlcChildren?.map(child => <div className="dlc-child-row" key={child.id}>
+                {child.cover && <img src={child.cover} alt="" loading="lazy" />}
+                <input type="checkbox" aria-label={`Archive ${child.title}`} checked={child.selected} disabled={busy}
+                  onChange={event => update(`/games/${game.id}/dlc/${child.id}`, 'PATCH', { selected: event.target.checked })} />
+                <span><strong>{child.title}</strong><small>{child.platform.join(', ')} · {child.files} {child.files === 1 ? 'file' : 'files'} · {fmt(child.bytes)} · {child.status}{child.updateAvailable ? ' · Update available' : ''}</small></span>
+                <button className="text-button" onClick={() => onOpenGame(child.id)}>View DLC <ArrowRight size={13} /></button>
+              </div>)}
               {shown
                 .filter((file) => file.category === category)
                 .map((file) => (

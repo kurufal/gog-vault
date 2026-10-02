@@ -75,6 +75,15 @@
 .import-source { overflow-wrap: anywhere; color: var(--muted); font-size: 11px; }
 .import-actions { display: flex; gap: 8px; }
 .hidden-badge { display: inline-block; margin-left: 5px; font-size: 10px; color: var(--muted); border: 1px solid var(--line); padding: 2px 5px; }
+.dlc-badge { display: inline-block; margin-left: 6px; padding: 2px 5px; border: 1px solid #66988b; color: #b8dfd1; font-size: 10px; font-weight: 700; vertical-align: middle; }
+.dlc-parent-link { display: flex; align-items: center; gap: 4px; max-width: 100%; margin-top: 5px; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 10px; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.dlc-parent-link:hover, .dlc-parent-link:focus-visible { color: var(--cyan); }
+.dlc-child-row { display: grid; grid-template-columns: 64px 16px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-top: 1px solid var(--line); padding: 10px 0; }
+.dlc-child-row img { width: 64px; height: 36px; object-fit: cover; }
+.dlc-child-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.dlc-child-row small { color: var(--muted); }
+.dlc-child-row .text-button { white-space: nowrap; }
+@media (max-width: 620px) { .dlc-child-row { grid-template-columns: 48px 16px minmax(0, 1fr); } .dlc-child-row img { width: 48px; height: 30px; } .dlc-child-row .text-button { grid-column: 3; justify-self: start; } }
 .detail-more { position: relative; order: 10; }
 .detail-more summary { list-style: none; cursor: pointer; padding: 8px; border: 1px solid var(--line); }
 .detail-more summary::-webkit-details-marker { display: none; }

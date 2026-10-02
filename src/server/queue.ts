@@ -48,6 +48,9 @@ export function enqueue(gameId: string) {
   if (!game) throw new Error('Game not found');
   const files = filesFor(gameId).filter(file => file.selected && !file.verified && !file.matched);
   if (!files.length) throw new Error('No missing selected files to download');
+  for (const file of files) if (db.query(`SELECT 1 FROM download_files snapshot JOIN download_jobs job ON job.id=snapshot.job_id
+    WHERE job.vault_id=? AND job.game_id!=? AND snapshot.file_key=? AND job.state IN ('queued','downloading','verifying','paused','error') LIMIT 1`)
+    .get(vaultId, gameId, file.key)) throw new Error('DLC is still in a legacy parent download; finish or cancel that job first');
   if (jobsFor(gameId).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) throw new Error('Game already in queue');
   const destination = folderName(game);
   const job = db.transaction(() => {
@@ -59,6 +62,20 @@ export function enqueue(gameId: string) {
   })();
   activity(`${game.title} queued`); broadcast(); schedule();
   return job.id;
+}
+export function enqueueWithChildren(gameId: string) {
+  if (!settings().vaultPath) throw new Error('Select a vault directory first');
+  const game = gameById(gameId);
+  if (!game) throw new Error('Game not found');
+  const ids = [gameId, ...(game.dlcChildren || []).filter(child => child.selected).map(child => child.id)];
+  const started: number[] = [];
+  for (const id of new Set(ids)) {
+    if (!filesFor(id).some(file => file.selected && !file.verified && !file.matched) ||
+      jobsFor(id).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) continue;
+    started.push(enqueue(id));
+  }
+  if (!started.length) throw new Error('No missing selected files to download');
+  return started;
 }
 export function command(id: number, action: 'pause' | 'resume' | 'cancel' | 'remove') {
   const job = jobsFor().find(entry => entry.id === id);

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, open, lstat, realpath, readdir, rename, rm, unlink, rmdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, sep } from 'node:path';
-import { activeVault, db, gameById, jobsFor, now, activity } from './db';
+import { activeVault, db, gameById, hasIndexedLinkedFile, jobsFor, now, activity } from './db';
 import { folderName, finalizeImportedGame, inspectImport, vaultPath } from './storage';
 import { withinRoot } from './paths';
 import { localSha256 } from './transfer';
@@ -51,7 +51,7 @@ export function enqueueImports(entries: { source: string; id: string; signature:
     for (const entry of entries) {
       if (!isAbsolute(entry.source) || entry.source.includes('\0') || !/^[a-f0-9]{64}$/.test(entry.signature)) throw new Error('Invalid import source or preview signature');
       const game = gameById(entry.id);
-      if (!game || game.folder) throw new Error('Product already has a vault folder or is not in the library');
+      if (!game || game.folder || hasIndexedLinkedFile(entry.id, vaultId)) throw new Error('Product already has archived files or is not in the library');
       if (jobsFor(entry.id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))) throw new Error('Finish this game download before importing');
       if (db.query("SELECT 1 FROM import_jobs WHERE vault_id=? AND game_id=? AND state NOT IN ('completed','cancelled') LIMIT 1").get(vaultId, entry.id)) throw new Error('An import job already exists for this game in this vault');
       db.query('INSERT INTO import_jobs(id,batch_id,game_id,source,signature,mode,destination,created_at,vault_id) VALUES (?,?,?,?,?,?,?,?,?)')
@@ -143,6 +143,7 @@ async function runImport(job: Row, signal: AbortSignal) {
     if (!plan.entries.length || plan.signature !== job.signature) throw new Error('Import source changed since preview; review it again');
     const game = gameById(job.game_id);
     if (!game) throw new Error('Game is not in the library');
+    if (hasIndexedLinkedFile(job.game_id, job.vault_id || undefined)) throw new Error('DLC already has indexed archive bytes; avoid importing a second copy');
     const base = await vaultPath();
     const recorded = db.query('SELECT root_path FROM vaults WHERE id=?').get(job.vault_id) as { root_path: string } | null;
     if (!recorded || recorded.root_path !== base) throw new Error('Import destination root changed');
@@ -244,6 +245,7 @@ async function runImport(job: Row, signal: AbortSignal) {
       if (await lstat(markerPath).then(() => true).catch(() => false)) throw new Error('Import marker collision in source folder');
       await writeFile(markerPath, JSON.stringify({ id: job.id, gameId: job.game_id }));
       if (await lstat(destination).then(() => true).catch(() => false)) throw new Error('Destination already exists; no files were overwritten');
+      if (hasIndexedLinkedFile(job.game_id, job.vault_id || undefined)) throw new Error('DLC already has indexed archive bytes; avoid importing a second copy');
       await rename(staged, destination);
       staged = destination;
       db.query('UPDATE import_jobs SET staged_path=? WHERE id=?').run(destination, job.id);
