@@ -61,7 +61,9 @@ export function parseProduct(raw: unknown): Partial<Game> & { id: string; title:
   const product = record.parse(raw);
   const images = obj(product.images);
   const compatibility = obj(product.content_system_compatibility);
-  const productType = product.type === 'dlc' || product.product_type === 'dlc' || product.is_dlc === true ? 'dlc' : 'game';
+  const productType = product.type === 'dlc' || product.product_type === 'dlc' || product.is_dlc === true ? 'dlc'
+    : product.type === 'bundle' || product.product_type === 'bundle' || product.is_bundle === true ||
+      /(?:^|[_-])bundle$/i.test(String(product.slug || '')) && array(product.expanded_dlcs).length > 0 ? 'bundle' : 'game';
   return { id: String(product.id), title: product.title, slug: String(product.slug || ''), productType,
     cover: (trustedGogUrl(image(product.coverHorizontal), true) ? image(product.coverHorizontal) : '') || image(images.cover) || image(product.image) || image(images.background), background: image(images.background),
     releaseDate: typeof product.release_date === 'string' ? product.release_date : '',
@@ -81,7 +83,7 @@ async function productCard(id: string, title: string): Promise<string> {
     return catalogCover(await response.json(), id);
   } catch { return ''; }
 }
-export function parseDownloads(raw: unknown, gameId: string, dlcName = '', dlcId = '', config: Settings = settings(), owned = true): RemoteFile[] {
+export function parseDownloads(raw: unknown, gameId: string, dlcName = '', dlcId = '', config: Settings = settings(), selectByDefault = true): RemoteFile[] {
   const downloads = obj(obj(raw).downloads);
   const result: RemoteFile[] = [];
   for (const [section, category] of [['installers', dlcName ? 'dlc' : 'main'], ['patches', 'patches'], ['language_packs', 'languagePacks'], ['bonus_content', 'extras']] as [string, Category][]) {
@@ -91,20 +93,25 @@ export function parseDownloads(raw: unknown, gameId: string, dlcName = '', dlcId
       for (const [index, part] of array(group.files).entries()) {
         if (typeof part.downlink !== 'string' || !part.downlink.startsWith(`${endpoints.api}/products/`)) continue;
         const key = `${dlcId || gameId}:${section}:${String(group.id || '')}:${String(part.id || index)}`;
-        result.push({ key, gameId, name: `${String(group.name || section)}${array(group.files).length > 1 ? ` (Part ${index + 1} of ${group.files.length})` : ''}`,
+        const artifact = [part.filename, part.name].find(value => typeof value === 'string' && /\.[a-z0-9]{1,12}$/i.test(value));
+        result.push({ key, gameId, name: category === 'extras' && artifact || `${String(group.name || section)}${array(group.files).length > 1 ? ` (Part ${index + 1} of ${group.files.length})` : ''}`,
           category: dlcName && category === 'main' ? 'dlc' : category, platform: os, language,
           version: String(group.version || ''), size: Number(part.size) || 0, downlink: part.downlink,
-          dlc: dlcName, selected: owned && (category === 'main' || category === 'dlc' && config.dlc || category === 'extras' && config.extras || category === 'patches' && config.patches || category === 'languagePacks' && config.languagePacks) && config.platforms.includes(os) && (config.languages.some(selected => language.toLowerCase() === selected.toLowerCase()) || language === 'Neutral'), verified: false });
+          provenance: { sourceProductId: String(dlcId || gameId), ...(dlcId ? { parentProductId: gameId } : {}),
+            ...(section === 'bonus_content' ? { bonusContentId: String(group.id || ''), bonusType: String(group.type || ''),
+              bonusTotalSize: Number(group.total_size) || 0, fileId: String(part.id || index) } : {}) },
+          dlc: dlcName, selected: selectByDefault && (category === 'main' || category === 'dlc' && config.dlc || category === 'extras' && config.extras || category === 'patches' && config.patches || category === 'languagePacks' && config.languagePacks) && config.platforms.includes(os) && (config.languages.some(selected => language.toLowerCase() === selected.toLowerCase()) || language === 'Neutral'), verified: false });
       }
     }
   }
   return result;
 }
-export function productManifest(raw: unknown, id: string, config: Settings, dlcProduct: boolean) {
+export function productManifest(raw: unknown, id: string, config: Settings, dlcProduct: boolean, ownedProductIds: ReadonlySet<string>) {
   return { files: parseDownloads(raw, id, '', '', config, !dlcProduct || config.dlc),
-    childIds: array(obj(raw).expanded_dlcs).map(dlc => String(obj(dlc).id || '')).filter(dlcId => /^\d+$/.test(dlcId)) };
+    childIds: array(obj(raw).expanded_dlcs).map(dlc => String(obj(dlc).id || '')).filter(dlcId => /^\d+$/.test(dlcId) && ownedProductIds.has(dlcId)) };
 }
-export async function product(id: string) {
+export async function product(id: string, ownedProductIds: ReadonlySet<string>) {
+  if (!ownedProductIds.has(id)) throw new Error('Product is not owned by this GOG account');
   const raw = await gogRequest<unknown>(`${endpoints.api}/products/${encodeURIComponent(id)}?expand=downloads,expanded_dlcs,description,screenshots,videos,related_products,changelog`);
   if (!obj(raw).downloads || typeof obj(raw).downloads !== 'object') throw new Error(`GOG product ${id} has no download manifest`);
   const info = parseProduct(raw);
@@ -116,16 +123,18 @@ export async function product(id: string) {
   if (!info.cover) info.cover = info.background;
   const logoArtwork = resolveLibraryLandscapeArtwork({ cover: info.background || '', background: info.background || '', logo: previous?.logo });
   const logoIsCard = info.cover !== info.background && (previous?.logo === info.cover || logoArtwork === info.cover);
-  const { files, childIds } = productManifest(raw, id, settings(), info.productType === 'dlc');
+  const { files, childIds } = productManifest(raw, id, settings(), info.productType === 'dlc', ownedProductIds);
   return { info, files, childIds, media: parseMedia({ ...obj(raw), coverHorizontal: info.cover, images: { ...obj(obj(raw).images), cover: info.cover, ...(logoIsCard ? { logo2x: info.cover } : {}) }, image: info.cover }, id) };
 }
-export async function secureLink(file: RemoteFile): Promise<{ url: string; checksum?: string; filename: string }> {
+export async function secureLink(file: RemoteFile): Promise<{ url: string; checksum?: string; filename: string; fromMetadata?: boolean }> {
   const data = await gogRequest<Record<string, unknown>>(file.downlink);
   if (typeof data.downlink !== 'string') throw new Error('Missing secure download link');
   const url = new URL(data.downlink);
   if (!trustedGogUrl(url.href)) throw new Error('Untrusted download host');
-  const filename = decodeURIComponent(url.pathname.split('/').pop() || '');
+  const fromMetadata = typeof data.filename === 'string' && /\.[a-z0-9]{1,12}$/i.test(data.filename) ? data.filename :
+    file.category === 'extras' && /\.[a-z0-9]{1,12}$/i.test(file.name) ? file.name : '';
+  const filename = fromMetadata || decodeURIComponent(url.pathname.split('/').pop() || '');
   if (data.checksum && (typeof data.checksum !== 'string' || !trustedGogUrl(data.checksum))) throw new Error('Untrusted checksum URL');
   const checksum = typeof data.checksum === 'string' ? data.checksum : undefined;
-  return { url: url.href, checksum, filename };
+  return { url: url.href, checksum, filename, ...(fromMetadata ? { fromMetadata: true } : {}) };
 }

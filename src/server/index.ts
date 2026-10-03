@@ -6,7 +6,7 @@ import { withinRoot } from './paths';
 import { startupConfig, validSession } from './startup';
 import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
-import { refreshLibrary, refreshState } from './gog/library';
+import { refreshLibrary, refreshOwnedProducts, refreshState, saveProductManifest } from './gog/library';
 import { activity, configDir, db, filesFor, gameById, games, jobsFor, linkDlcProducts, mediaFor, replaceFiles, replaceMedia, saveSettings, selectDlcProduct, setHiddenGames, settings, upsertGame } from './db';
 import { cancelScan, ignoreFolder, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
 import { enqueueImports, importCommand, importJobs, shutdownImports, startImports, subscribeImports } from './imports';
@@ -100,8 +100,9 @@ const app = new Elysia()
   }, { body: t.Object({ selected: t.Boolean() }) })
   .post('/api/games/:id/downloads', async ({ params }) => {
     if (!gameById(params.id)) throw new Error('Game not found');
-    const { info, files, media, childIds } = await product(params.id);
-    upsertGame(info); linkDlcProducts(params.id, childIds); replaceFiles(params.id, files); replaceMedia(params.id, media);
+    const ownedIds = await refreshOwnedProducts();
+    const { info, files, media, childIds } = await product(params.id, ownedIds);
+    upsertGame(info); saveProductManifest(params.id, files, childIds); replaceMedia(params.id, media);
     return { game: gameById(params.id), files: filesFor(params.id), media: mediaFor(params.id) };
   })
   .patch('/api/games/:id/selections', ({ params, body }) => {

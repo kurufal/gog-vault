@@ -7,7 +7,7 @@ import { withinRoot } from './paths';
 import { scoreFolder } from './matching';
 import { activeVault, activity, configDir, db, filesFor, gameById, games, hasIndexedLinkedFile, jobsFor, localGameRow, mapVaultGame, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
 import { secureLink, trustedGogUrl } from './gog/products';
-import { localSha256, verifyFile } from './transfer';
+import { localSha256, verifyFile, verifyFileStatus } from './transfer';
 
 export async function vaultPath(relativePath = ''): Promise<string> {
   const selected = settings().vaultPath;
@@ -430,14 +430,17 @@ export async function scanGame(id: string, fullVerify = false, knownFolder?: str
     const sizeMatched = candidate && (!file.size || info.size === (file.verifiedSize || file.size));
     const cached = previous.get(match);
     const unchanged = !!info && cached?.size === info.size && cached.mtime_ms === info.mtimeMs;
-    const official = candidate && !!checksum && (fullVerify || !unchanged || !file.verified || file.verificationSource !== 'gog-checksum' || !cached?.verified_at
-      ? await verifyFile(join(path, match), file.size, checksum, true, signal) : true);
+    const check = candidate && !!checksum && (fullVerify || !unchanged || !file.verified || file.verificationSource !== 'gog-checksum' || !cached?.verified_at
+      ? file.category === 'extras' ? await verifyFileStatus(join(path, match), file.size, checksum, true, signal) :
+        await verifyFile(join(path, match), file.size, checksum, true, signal) ? 'verified' : 'invalid' : 'verified');
+    const official = check === 'verified';
+    const checksumMissing = file.category === 'extras' && check === 'missing';
     const matched = sizeMatched || official;
-    const localVerified = !official && !checksum && matched && (file.verificationSource === 'local-sha256' || signedName && (imported.has(match) || identified)) && !!cached?.sha256 && (fullVerify || !unchanged
+    const localVerified = !official && (!checksum || checksumMissing) && matched && (file.verificationSource === 'local-sha256' || signedName && (imported.has(match) || identified)) && !!cached?.sha256 && (fullVerify || !unchanged
       ? await localSha256(join(path, match), signal) === cached.sha256 : true);
     const verified = official || localVerified;
     if (verified) db.query('UPDATE vault_local_files SET verified_at=? WHERE vault_id=? AND game_id=? AND relative_path=?').run(now(), activeVault()?.id || -1, id, match);
-    saveFileState(id, file.key, { ...file, name: match || file.name, checksumUrl: checksum, verified, matched, verifiedSize: verified ? info!.size : file.verifiedSize,
+    saveFileState(id, file.key, { ...file, name: match || file.name, checksumUrl: checksumMissing ? '' : checksum, verified, matched, verifiedSize: verified ? info!.size : file.verifiedSize,
       verificationSource: official ? 'gog-checksum' : localVerified ? 'local-sha256' : identified && matched ? 'import-identified' : '' });
     done++;
     bytes += info?.size || 0;

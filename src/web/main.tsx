@@ -5,6 +5,7 @@ import {
   Activity,
   ArrowDownToLine,
   ArrowRight,
+  ArrowUpRight,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -35,7 +36,7 @@ import "@fontsource/inter/400.css";
 import "@fontsource/inter/500.css";
 import "@fontsource/inter/600.css";
 import "@fontsource/inter/700.css";
-import { bulkDownloadWarningBytes, committedNumber, defaults, removeUnresolvedFolder, scopedDownloadPreview, usedCapacity, visibilityMatches, type
+import { bulkDownloadWarningBytes, committedNumber, defaults, isNeutralLanguage, matchesManifestFilters, removeUnresolvedFolder, scopedDownloadPreview, usedCapacity, visibilityMatches, type
   Game,
   Job,
   MediaAsset,
@@ -102,6 +103,13 @@ function statusHint(game: Game): string {
   if (game.status === 'Update Available') return 'The archived installers are verified, but the selected GOG manifest has changed.';
   if (game.status === 'Incomplete') return 'Some selected archive content is missing from this vault.';
   return game.status;
+}
+function gogStoreUrl(game: Game): string {
+  return /^[a-z0-9_-]+$/i.test(game.slug) ? `https://www.gog.com/game/${game.slug}` : '';
+}
+function bundleHint(game: Game): string {
+  const count = game.dlcChildren?.length || 0;
+  return count ? `Bundle containing ${count} DLC ${count === 1 ? 'product' : 'products'}` : 'GOG bundle';
 }
 function archiveResult(game?: Game): string {
   if (!game) return 'Selected archive N/A';
@@ -235,6 +243,22 @@ function trackActivityPointer(event: React.PointerEvent<HTMLDivElement>) {
 }
 function App() {
   const [page, setPage] = useState<Page>("dashboard");
+  const [topbarVisible, setTopbarVisible] = useState(true);
+  useEffect(() => {
+    let previousY = window.scrollY;
+    let movement = 0;
+    const onScroll = () => {
+      const currentY = window.scrollY;
+      const delta = currentY - previousY;
+      previousY = currentY;
+      movement = Math.sign(delta) === Math.sign(movement) ? movement + delta : delta;
+      if (currentY < 72) { setTopbarVisible(true); movement = 0; }
+      else if (movement > 8) { setTopbarVisible(false); movement = 0; }
+      else if (movement < -8) { setTopbarVisible(true); movement = 0; }
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
   const [games, setGames] = useState<Game[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [importJobs, setImportJobs] = useState<ImportJob[]>([]);
@@ -247,6 +271,17 @@ function App() {
   const detailId = useRef<string | null>(null);
   detailId.current = detail?.game.id || null;
   const [queueOpen, setQueueOpen] = useState(false);
+  const [cardMenu, setCardMenu] = useState<{ game: Game; x: number; y: number; origin: HTMLElement } | null>(null);
+  useEffect(() => {
+    if (!cardMenu) return;
+    document.querySelector<HTMLButtonElement>('.card-context-menu button')?.focus();
+    const dismiss = () => setCardMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') { dismiss(); cardMenu.origin.focus(); } };
+    window.addEventListener('pointerdown', dismiss);
+    window.addEventListener('scroll', dismiss, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => { window.removeEventListener('pointerdown', dismiss); window.removeEventListener('scroll', dismiss, true); window.removeEventListener('keydown', onKeyDown); };
+  }, [cardMenu]);
   const [activityHover, setActivityHover] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
@@ -656,7 +691,7 @@ function App() {
         </div>
       </aside>
       <main className="main">
-        <header className="topbar">
+        <header className={`topbar ${topbarVisible ? '' : 'topbar-hidden'}`}>
           <h1 className="topbar-title">{page === 'dashboard' ? 'Dashboard' : page === 'library' ? 'Library' : 'Settings'}</h1>
           <div className="top-actions">
             <span className="top-status">
@@ -895,7 +930,7 @@ function App() {
                     {visible.map(game => <div className={`list-row list-game ${selectionEnabled && selectedIds.has(game.id) ? 'is-selected' : ''}`} key={game.id} role={selectionEnabled ? undefined : 'button'} tabIndex={selectionEnabled ? -1 : 0}
                       onClick={() => selectionEnabled ? toggleSelection(game.id) : void openGame(game.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectionEnabled ? toggleSelection(game.id) : void openGame(game.id); } }}>
                       {selectionEnabled && <input className="list-select" type="checkbox" aria-label={`Select ${game.title}`} checked={selectedIds.has(game.id)} onChange={() => toggleSelection(game.id)} onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()} />}
-                      <div className="list-title"><div className="list-art"><Artwork game={game} vaultIdentity={settings?.vaultPath} /></div><div className="list-name">{game.title}{game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}{game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}{game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}{games.some(other => other.id !== game.id && other.title === game.title) && <small className="product-disambiguation">Product {game.id}</small>}</div></div>
+                      <div className="list-title"><div className="list-art"><Artwork game={game} vaultIdentity={settings?.vaultPath} /></div><div className="list-name">{game.title}{game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}{game.productType === 'bundle' && <small className="dlc-badge bundle-badge" title={bundleHint(game)}>BUNDLE</small>}{game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}{game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}</div></div>
                       <div className="list-cell-1"><Platforms platforms={game.platforms} /></div>
                       {(['main', 'dlc', 'extras'] as const).map((key, index) => <div className={`list-cell-${index + 2}`} key={key} title={game.productType === 'dlc' && key === 'main' ? 'Content' : key}>{contentLabel(game, key)}</div>)}
                       <div className="list-cell-5"><span className={`status ${game.status.toLowerCase().replaceAll(' ', '-')}`} title={statusHint(game)} aria-label={`${game.status}. ${statusHint(game)}`}>{game.status}{(game.previousInstallerParts || game.archive?.updateState === 'manifest_changed' || ['Needs Verification', 'Update Available', 'Incomplete'].includes(game.status)) && <CircleAlert size={12} aria-hidden="true" />}</span></div>
@@ -911,21 +946,21 @@ function App() {
                         key={game.id}
                         role={selectionEnabled ? undefined : 'button'} tabIndex={selectionEnabled ? -1 : 0}
                         onClick={() => selectionEnabled ? toggleSelection(game.id) : void openGame(game.id)}
-                        onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectionEnabled ? toggleSelection(game.id) : void openGame(game.id); } }}
+                        onContextMenu={event => { event.preventDefault(); setCardMenu({ game, x: Math.min(event.clientX, window.innerWidth - 170), y: Math.min(event.clientY, window.innerHeight - 88), origin: event.currentTarget }); }}
+                        onKeyDown={event => { if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') { event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); setCardMenu({ game, x: Math.min(rect.right - 170, window.innerWidth - 170), y: Math.min(rect.top + 32, window.innerHeight - 88), origin: event.currentTarget }); } else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectionEnabled ? toggleSelection(game.id) : void openGame(game.id); } }}
                       >
                         <div className="game-art">
                           <Artwork game={game} vaultIdentity={settings?.vaultPath} />
                           {selectionEnabled && <input className="card-select" type="checkbox" aria-label={`Select ${game.title}`} checked={selectedIds.has(game.id)} onChange={() => toggleSelection(game.id)} onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()} />}
+                          {game.productType === 'dlc' && <small className="dlc-badge dlc-card-badge" title={`DLC${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}
+                          {game.productType === 'bundle' && <small className="dlc-badge dlc-card-badge bundle-badge" title={bundleHint(game)}>BUNDLE</small>}
                           {(game.status === "Update Available" || game.archive?.updateState === 'manifest_changed' && game.status === 'Vaulted') && (
                             <span className="update-tag">UPDATE</span>
                           )}
                         </div>
                         <div className="game-info">
                           <h3>{game.title}</h3>
-                          {game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}
                           {game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}
-                          {game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}
-                          {games.some(other => other.id !== game.id && other.title === game.title) && <small className="product-disambiguation">GOG product {game.id}</small>}
                           <div className="compact-meters">
                             {(["main", "dlc", "extras"] as const).map((key) => (
                               <div key={key}>
@@ -1265,10 +1300,10 @@ function App() {
               </div></div>
               <span className="activity-stage">FULL VERIFY · {job.state.toUpperCase()}</span>
               {job.currentFile && <span className="activity-filename">Current: {job.currentFile}</span>}
-              <div className="queue-progress"><span style={{ width: `${job.total ? job.done / job.total * 100 : 0}%` }} /></div>
               <div className="queue-data"><strong>{job.done} / {job.total} files</strong><span>{fmt(job.bytes)} read</span></div>
               {job.error && <div className="queue-failure" role="alert">{job.error}</div>}
               {['complete', 'failed', 'cancelled'].includes(job.state) && <div className="queue-data"><span>{archiveResult(game)}</span><span>{game?.status}</span></div>}
+              <div className="queue-progress"><span style={{ width: `${job.total ? job.done / job.total * 100 : 0}%` }} /></div>
             </div>; })}
           {importJobs.map(job => { const game = games.find(item => item.id === job.gameId);
             const remaining = job.speed > 0 && job.total > job.bytes ? Math.ceil((job.total - job.bytes) / job.speed) : 0;
@@ -1281,10 +1316,10 @@ function App() {
                     {['completed', 'failed', 'cancelled'].includes(job.state) && <button title="Remove from activity history" onClick={() => void notify(() => api(`/imports/${job.id}/remove`, 'POST'), 'Removing history')}><X size={16} /></button>}</div></div>
               <span className="activity-stage">{job.mode.toUpperCase()} · {job.state.replaceAll('_', ' ').toUpperCase()}</span>
                   <span className="activity-filename">{job.state === 'completed' ? `${fmt(job.bytes)} · ${job.filesTotal} files` : job.currentFile || job.destination}</span>
-                  {job.state !== 'completed' && <><div className="queue-progress"><span style={{ width: `${job.total ? Math.min(100, job.bytes / job.total * 100) : 0}%` }} /></div>
-                  <div className="queue-data"><strong>Transfer {job.total ? Math.floor(job.bytes / job.total * 100) : 0}%</strong><span>{fmt(job.bytes)} / {fmt(job.total)} · {job.filesDone} / {job.filesTotal} files</span></div></>}
+                  {job.state !== 'completed' && <div className="queue-data"><strong>Transfer {job.total ? Math.floor(job.bytes / job.total * 100) : 0}%</strong><span>{fmt(job.bytes)} / {fmt(job.total)} · {job.filesDone} / {job.filesTotal} files</span></div>}
               <div className="queue-data"><span>{archiveResult(game)}</span><span>{job.speed ? `${fmt(job.speed)}/s` : game?.status || job.state.replaceAll('_', ' ')}{remaining ? ` · ${Math.ceil(remaining / 60)} min left` : ''}</span></div>
               {job.state === 'failed' && job.errorDetails && <div className="queue-failure" role="alert"><strong>{job.errorDetails.safeMessage}</strong><small>{job.errorDetails.stage} · {job.errorDetails.filename}{job.errorDetails.code ? ` · ${job.errorDetails.code}` : ''}</small></div>}
+                {job.state !== 'completed' && <div className="queue-progress"><span style={{ width: `${job.total ? Math.min(100, job.bytes / job.total * 100) : 0}%` }} /></div>}
             </div>; })}
           {jobs.length ? (
             jobs.map((job) => {
@@ -1311,13 +1346,6 @@ function App() {
                       ? <><span>GOG could not provide this optional extra. Resume alone retries the same link; completed files are kept.</span><button className="secondary-button" disabled={!!busy} onClick={() => void skipUnavailableExtra(job)}>Skip unavailable extra and resume</button></>
                       : <span>{job.errorDetails.retryable ? 'Resume retries this part; completed parts are kept.' : 'Review this failure before retrying.'}</span>}
                   </div>}
-                  <div className="queue-progress">
-                    <span
-                      style={{
-                        width: `${job.total ? Math.min(100, (job.bytes / job.total) * 100) : 0}%`,
-                      }}
-                    />
-                  </div>
                   <div className="queue-data">
                     <strong>
                       Transfer {job.total
@@ -1338,6 +1366,13 @@ function App() {
                         : "—"}
                     </span>
                   </div>}
+                  <div className="queue-progress">
+                    <span
+                      style={{
+                        width: `${job.total ? Math.min(100, (job.bytes / job.total) * 100) : 0}%`,
+                      }}
+                    />
+                  </div>
                 </div>
               );
             })
@@ -1350,6 +1385,10 @@ function App() {
           ) : null}
         </div>
       </aside>
+      {cardMenu && <div className="card-context-menu" role="group" aria-label={`${cardMenu.game.title} actions`} style={{ left: Math.max(8, cardMenu.x), top: Math.max(8, cardMenu.y) }} onPointerDown={event => event.stopPropagation()}>
+        <button onClick={() => { const game = cardMenu.game; setCardMenu(null); void openGame(game.id); }}>View details</button>
+        {gogStoreUrl(cardMenu.game) && <button onClick={() => { const url = gogStoreUrl(cardMenu.game); setCardMenu(null); void openUrl(url).catch(cause => setError(String(cause))); }}>View on GOG <ArrowUpRight size={14} aria-hidden="true" /></button>}
+      </div>}
       {detail && (
         <GameModal
           detail={detail}
@@ -1357,7 +1396,16 @@ function App() {
           busy={!!busy}
           close={() => setDetail(null)}
           onOpenGame={id => void openGame(id)}
+          onOpenStore={url => void openUrl(url).catch(cause => setError(String(cause)))}
           update={updateDetail}
+          applySelection={(selectedFiles, selectedImages, selectedChildren) => void notify(async () => {
+            const id = detail.game.id;
+            await api(`/games/${id}/selections`, 'PATCH', { files: selectedFiles });
+            if (selectedImages.length) await api(`/games/${id}/media`, 'PATCH', { files: selectedImages });
+            for (const child of selectedChildren) await api(`/games/${id}/dlc/${child.id}`, 'PATCH', { selected: child.selected });
+            const updated = await api<Detail>(`/games/${id}`);
+            setDetail(current => current?.game.id === id ? updated : current);
+          }, 'Saving selected content')}
           verification={verifications.find(job => job.gameId === detail.game.id && ['queued', 'verifying', 'reconciling'].includes(job.state))}
           onVerify={() => { if (!verificationAvailable) { setError('Restart GOG Vault to enable background verification.'); return; } void notify(async () => {
             await api(`/games/${detail.game.id}/verify`, 'POST');
@@ -1395,7 +1443,9 @@ function GameModal({
   defaults: defaultSettings,
   close,
   onOpenGame,
+  onOpenStore,
   update,
+  applySelection,
   verification,
   onVerify,
   onVisibility,
@@ -1409,7 +1459,9 @@ function GameModal({
   defaults: Settings | null;
   close: () => void;
   onOpenGame: (id: string) => void;
+  onOpenStore: (url: string) => void;
   update: (path: string, method?: string, body?: unknown) => void;
+  applySelection: (selectedFiles: { key: string; selected: boolean }[], selectedImages: { key: string; selected: boolean }[], selectedChildren: { id: string; selected: boolean }[]) => void;
   verification?: VerificationJob;
   onVerify: () => void;
   onVisibility: (hidden: boolean) => void;
@@ -1420,10 +1472,13 @@ function GameModal({
   onQueue: (action: { id: number; command: string }) => void;
 }) {
   const { game, files, media } = detail;
-  const [platform, setPlatform] = useState("All systems");
-  const [language, setLanguage] = useState("All languages");
+  const storeUrl = gogStoreUrl(game);
+  const [filterPlatforms, setFilterPlatforms] = useState<Platform[]>([]);
+  const [filterLanguages, setFilterLanguages] = useState<string[]>([]);
+  useEffect(() => { setFilterPlatforms([]); setFilterLanguages([]); }, [game.id]);
   const [chosenPlatforms, setChosenPlatforms] = useState<Platform[]>(defaultSettings?.platforms || ['windows']);
   const [chosenLanguages, setChosenLanguages] = useState<string[]>(defaultSettings?.languages || ['English']);
+  const [chosenMisc, setChosenMisc] = useState({ dlc: defaultSettings?.dlc ?? true, extras: defaultSettings?.extras ?? false, images: defaultSettings?.storeImages ?? false });
   const [mediaOpen, setMediaOpen] = useState(false);
   const [activeMedia, setActiveMedia] = useState(0);
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -1462,15 +1517,16 @@ function GameModal({
     update(`/games/${game.id}/selections`, "PATCH", {
       files: [{ key, selected }],
     });
-  const matchesSelection = (file: RemoteFile, platforms: Platform[], languages: string[]) =>
-    platforms.includes(file.platform) && (file.language === 'Neutral' || languages.some(value => value.toLowerCase() === file.language.toLowerCase())) &&
-      (file.category === 'main' || file.category === 'dlc' && !!defaultSettings?.dlc || file.category === 'extras' && !!defaultSettings?.extras || file.category === 'patches' && !!defaultSettings?.patches || file.category === 'languagePacks' && !!defaultSettings?.languagePacks)
-  const applySelection = (platforms: Platform[], languages: string[]) => update(`/games/${game.id}/selections`, 'PATCH', { files: files.map(file => ({ key: file.key, selected: matchesSelection(file, platforms, languages) })) });
-  const shown = files.filter(
-    (file) =>
-      (platform === "All systems" || file.platform === platform) &&
-      (language === "All languages" || file.language === language),
-  );
+  const matchesSelection = (file: RemoteFile, platforms: Platform[], languages: string[], misc: typeof chosenMisc) =>
+    platforms.includes(file.platform) && (isNeutralLanguage(file.language) || languages.some(value => value.toLowerCase() === file.language.toLowerCase())) &&
+      (file.category === 'main' || file.category === 'dlc' && misc.dlc || file.category === 'extras' && misc.extras || file.category === 'patches' && !!defaultSettings?.patches || file.category === 'languagePacks' && !!defaultSettings?.languagePacks);
+  const selectableImages = media.filter(asset => asset.role === 'screenshot' || asset.role === 'additionalArtwork');
+  const selectMatching = (platforms: Platform[], languages: string[], misc: typeof chosenMisc) =>
+    applySelection(files.map(file => ({ key: file.key, selected: matchesSelection(file, platforms, languages, misc) })),
+      selectableImages.map(asset => ({ key: asset.key, selected: misc.images })),
+      (game.dlcChildren || []).map(child => ({ id: child.id, selected: misc.dlc })));
+  const languageOptions = [...new Set(files.map(file => file.language).filter(value => !isNeutralLanguage(value)))];
+  const shown = files.filter(file => matchesManifestFilters(file, filterPlatforms, filterLanguages));
   const groups: [Category, string][] = [
     ["main", game.productType === 'dlc' ? "OFFLINE INSTALLERS" : "MAIN / OFFLINE INSTALLERS"],
     ["dlc", "DLC"],
@@ -1510,6 +1566,7 @@ function GameModal({
               <div className="eyebrow">PRODUCT / {game.id}</div>
               <h2>{game.title}</h2>
               {game.productType === 'dlc' && <small className="dlc-badge" title={`Downloadable content${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`}>DLC</small>}
+              {game.productType === 'bundle' && <small className="dlc-badge bundle-badge" title={bundleHint(game)}>BUNDLE</small>}
               {game.parentProduct && <button className="dlc-parent-link" onClick={() => onOpenGame(game.parentProduct!.id)}>DLC FOR {game.parentProduct.title} <ArrowRight size={13} /></button>}
               <div className="identity-meta">
                 {game.hiddenFromLibrary && <span className="hidden-badge">HIDDEN</span>}
@@ -1523,6 +1580,7 @@ function GameModal({
                 {game.releaseDate && (
                   <span>{game.releaseDate.slice(0, 10)}</span>
                 )}
+                {storeUrl && <a className="gog-store-link" href={storeUrl} onClick={event => { event.preventDefault(); onOpenStore(storeUrl); }}>View on GOG <ArrowUpRight size={13} aria-hidden="true" /></a>}
               </div>
             </div>
           </div>
@@ -1615,7 +1673,7 @@ function GameModal({
               <button
                 className="primary-button"
                 disabled={
-                  !files.some((file) => file.selected && !file.verified && !file.matched) && !game.dlcChildren?.some(child => child.selected && child.completion !== 100) || busy
+                  !files.some((file) => file.selected && !file.verified && !file.matched) && !game.dlcChildren?.some(child => child.selected && child.pending) || busy
                 }
                 onClick={() => update(`/games/${game.id}/queue`)}
               >
@@ -1704,37 +1762,31 @@ function GameModal({
               Query GOG
             </button>
           </div>
-          <div className="file-filters">
-            <select
-              aria-label="Filter file system"
-              value={platform}
-              onChange={(event) => setPlatform(event.target.value)}
-            >
-              <option>All systems</option>
-              <option value="windows">Windows</option>
-              <option value="linux">Linux</option>
-              <option value="mac">macOS</option>
-            </select>
-            <select
-              aria-label="Filter file language"
-              value={language}
-              onChange={(event) => setLanguage(event.target.value)}
-            >
-              <option>All languages</option>
-              {[...new Set(files.map((file) => file.language))].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
+          <div className="file-filters" aria-label="Filter download content">
+            <fieldset>
+              <legend>SHOW PLATFORMS</legend>
+              <label><input type="checkbox" checked={!filterPlatforms.length} onChange={() => setFilterPlatforms([])} />All systems</label>
+              {(['windows', 'linux', 'mac'] as Platform[]).map(value => <label key={value}>
+                <input type="checkbox" checked={filterPlatforms.includes(value)} onChange={() => setFilterPlatforms(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value === 'mac' ? 'macOS' : value}
+              </label>)}
+            </fieldset>
+            <fieldset>
+              <legend>SHOW LANGUAGES</legend>
+              <label><input type="checkbox" checked={!filterLanguages.length} onChange={() => setFilterLanguages([])} />All languages</label>
+              {languageOptions.map(value => <label key={value}>
+                <input type="checkbox" checked={filterLanguages.includes(value)} onChange={() => setFilterLanguages(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value}
+              </label>)}
+            </fieldset>
           </div>
-          <div className="selection-quick"><div><strong>PLATFORMS</strong>{(['windows', 'linux', 'mac'] as Platform[]).map(value => <label key={value}><input type="checkbox" checked={chosenPlatforms.includes(value)} onChange={() => setChosenPlatforms(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value === 'mac' ? 'macOS' : value}</label>)}</div><div><strong>LANGUAGES</strong>{[...new Set(files.map(file => file.language).filter(value => value !== 'Neutral'))].map(value => <label key={value}><input type="checkbox" checked={chosenLanguages.some(item => item.toLowerCase() === value.toLowerCase())} onChange={() => setChosenLanguages(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value}</label>)}</div><div className="selection-actions"><small>{files.filter(file => matchesSelection(file, chosenPlatforms, chosenLanguages)).length} matching files</small><button className="secondary-button" disabled={busy} onClick={() => applySelection(chosenPlatforms, chosenLanguages)}>Select matching</button><button className="secondary-button" disabled={busy} onClick={() => update(`/games/${game.id}/selections`, 'PATCH', { files: files.map(file => ({ key: file.key, selected: false })) })}>Clear selection</button><button className="secondary-button" disabled={busy} onClick={() => { const platforms = defaultSettings?.platforms || ['windows']; const languages = defaultSettings?.languages || ['English']; setChosenPlatforms(platforms); setChosenLanguages(languages); applySelection(platforms, languages); }}>Reset to defaults</button></div></div>
+          <div className="selection-quick">
+            <div><strong>PLATFORMS</strong>{(['windows', 'linux', 'mac'] as Platform[]).map(value => <label key={value}><input type="checkbox" checked={chosenPlatforms.includes(value)} onChange={() => setChosenPlatforms(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value === 'mac' ? 'macOS' : value}</label>)}</div>
+            <div><strong>LANGUAGES</strong>{[...new Set(files.map(file => file.language).filter(value => !isNeutralLanguage(value)))].map(value => <label key={value}><input type="checkbox" checked={chosenLanguages.some(item => item.toLowerCase() === value.toLowerCase())} onChange={() => setChosenLanguages(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value}</label>)}</div>
+            <div><strong>MISC</strong>{(['dlc', 'extras', 'images'] as const).map(value => <label key={value}><input type="checkbox" checked={chosenMisc[value]} onChange={() => setChosenMisc(old => ({ ...old, [value]: !old[value] }))} />{value.toUpperCase()}</label>)}</div>
+            <div className="selection-actions"><small>{files.filter(file => matchesSelection(file, chosenPlatforms, chosenLanguages, chosenMisc)).length + (chosenMisc.images ? selectableImages.length : 0) + (chosenMisc.dlc ? game.dlcChildren?.length || 0 : 0)} matching items</small><button className="secondary-button" disabled={busy} onClick={() => selectMatching(chosenPlatforms, chosenLanguages, chosenMisc)}>Select matching</button><button className="secondary-button" disabled={busy} onClick={() => applySelection(files.map(file => ({ key: file.key, selected: false })), selectableImages.map(asset => ({ key: asset.key, selected: false })), (game.dlcChildren || []).map(child => ({ id: child.id, selected: false })))}>Clear selection</button><button className="secondary-button" disabled={busy} onClick={() => { const platforms = defaultSettings?.platforms || ['windows']; const languages = defaultSettings?.languages || ['English']; const misc = { dlc: defaultSettings?.dlc ?? true, extras: defaultSettings?.extras ?? false, images: defaultSettings?.storeImages ?? false }; setChosenPlatforms(platforms); setChosenLanguages(languages); setChosenMisc(misc); selectMatching(platforms, languages, misc); }}>Reset to defaults</button></div>
+          </div>
           {groups.map(([category, label]) => (
-            <section className="file-group" key={category}>
-              <h4>
-                {label}
-                <span>
-                  {shown.filter((file) => file.category === category).length + (category === 'dlc' ? game.dlcChildren?.length || 0 : 0)}
-                </span>
-              </h4>
+            <details className="file-group" key={`${game.id}:${category}`} open={files.some(file => file.category === category) || category === 'dlc' && !!game.dlcChildren?.length}>
+              <summary><h4>{label}<span>{shown.filter((file) => file.category === category).length + (category === 'dlc' ? game.dlcChildren?.length || 0 : 0)}</span></h4><ChevronDown size={16} /></summary>
               {category === 'dlc' && game.dlcChildren?.map(child => <div className="dlc-child-row" key={child.id}>
                 {child.cover && <img src={child.cover} alt="" loading="lazy" />}
                 <input type="checkbox" aria-label={`Archive ${child.title}`} checked={child.selected} disabled={busy}
@@ -1764,7 +1816,7 @@ function GameModal({
                           ? "macOS"
                           : file.platform} · {file.language}
                         {file.version && ` · Version ${file.version}`}
-                        {file.verified ? file.verificationSource === 'local-sha256' ? ' · Local SHA-256 verified (GOG checksum unavailable)' : ' · GOG checksum verified' : file.matched ? " · Matched by name and size" : game.folder ? " · Missing" : ""}
+                        {file.verified ? file.verificationSource === 'local-sha256' ? ' · Local SHA-256 verified (GOG checksum unavailable)' : ' · GOG checksum verified' : file.matched ? " · Matched by name and size" : file.unavailable ? ' · Unavailable from GOG' : game.folder ? " · Missing" : ""}
                       </small>
                     </span>
                     <span className="file-size">{fmt(file.verifiedSize || file.size)}</span>
@@ -1772,14 +1824,14 @@ function GameModal({
                 ))}
               {!shown.some((file) => file.category === category) && (
                 <div className="no-files">
-                  No files available in this category.
+                  {files.some(file => file.category === category) ? 'No files match the current filters.' : 'No files available in this category.'}
                 </div>
               )}
-            </section>
+            </details>
           ))}
           {(imageCount > 0 || videoCount > 0) && (
-            <section className="file-group">
-              <h4>STORE MEDIA <span>{imageCount} images · {videoCount} videos</span></h4>
+            <details className="file-group" key={`${game.id}:media`} open>
+              <summary><h4>STORE MEDIA <span>{imageCount} images · {videoCount} videos</span></h4><ChevronDown size={16} /></summary>
               {media.filter(asset => asset.role === 'screenshot' || asset.role === 'additionalArtwork' || asset.role === 'video').map(asset => (
                 <label className="file-row" key={asset.key}>
                   <input type="checkbox" disabled={asset.external || busy} checked={asset.selected} onChange={event => update(`/games/${game.id}/media`, 'PATCH', { files: [{ key: asset.key, selected: event.target.checked }] })} />
@@ -1788,7 +1840,7 @@ function GameModal({
                 </label>
               ))}
               {media.some(asset => asset.selected && !asset.localPath && !asset.external) && <button className="secondary-button" disabled={busy || !game.folder} onClick={onArchiveMedia}><Download size={15} /> Archive selected media</button>}
-            </section>
+            </details>
           )}
         </div>
         {previewOpen && gallery[activeMedia] && (

@@ -46,7 +46,7 @@ export function enqueue(gameId: string) {
   const vaultId = activeVault()!.id;
   const game = gameById(gameId);
   if (!game) throw new Error('Game not found');
-  const files = filesFor(gameId).filter(file => file.selected && !file.verified && !file.matched);
+  const files = filesFor(gameId).filter(file => file.selected && !file.verified && !file.matched && !file.unavailable);
   if (!files.length) throw new Error('No missing selected files to download');
   for (const file of files) if (db.query(`SELECT 1 FROM download_files snapshot JOIN download_jobs job ON job.id=snapshot.job_id
     WHERE job.vault_id=? AND job.game_id!=? AND snapshot.file_key=? AND job.state IN ('queued','downloading','verifying','paused','error') LIMIT 1`)
@@ -87,6 +87,9 @@ export function command(id: number, action: 'pause' | 'resume' | 'cancel' | 'rem
     const next: JobState = action === 'resume' ? 'queued' : action === 'pause' ? 'paused' : 'cancelled';
     if (!transition(job.state, next)) throw new Error(`Cannot ${action} a ${job.state} job`);
     if (action === 'resume') {
+      const unavailable = filesFor(job.gameId).some(file => file.selected && file.unavailable &&
+        db.query("SELECT 1 FROM download_files WHERE job_id=? AND file_key=? AND state!='complete'").get(id, file.key));
+      if (unavailable) throw new Error('Refresh GOG metadata before retrying an unavailable file');
       const selected = new Map(filesFor(job.gameId).map(file => [file.key, file.selected]));
       const obsolete = (db.query("SELECT file_key FROM download_files WHERE job_id=? AND state!='complete'").all(id) as { file_key: string }[])
         .filter(file => selected.get(file.file_key) === false);
@@ -107,6 +110,16 @@ export function command(id: number, action: 'pause' | 'resume' | 'cancel' | 'rem
     if (action === 'resume') schedule();
   }
   broadcast();
+}
+export function cancelObsoleteSnapshots(gameId: string, currentKeys: ReadonlySet<string>) {
+  const pending = db.query(`SELECT DISTINCT job.id, snapshot.file_key FROM download_jobs job
+    JOIN download_files snapshot ON snapshot.job_id=job.id
+    WHERE job.game_id=? AND job.state IN ('queued','downloading','verifying','paused','error') AND snapshot.state!='complete'`)
+    .all(gameId) as { id: number; file_key: string }[];
+  for (const id of new Set(pending.filter(row => !currentKeys.has(row.file_key)).map(row => row.id))) {
+    if (jobsFor().some(job => job.id === id)) command(id, 'cancel');
+    else changeJob(id, 'cancelled');
+  }
 }
 let scheduling = false;
 export function schedule() {
@@ -211,6 +224,10 @@ async function run(job: Job, controller: AbortController) {
   } catch (error) {
     if (!controller.signal.aborted) {
       const message = safeError(error);
+      if (activeFile && stage === 'resolve_downlink' && /^GOG \/products\/.* returned HTTP 404$/.test(message)) {
+        db.query('UPDATE remote_files SET unavailable=1 WHERE game_id=? AND key=? AND downlink=?')
+          .run(job.gameId, activeFile.key, activeFile.downlink);
+      }
       const details: DownloadFailure = { stage, productId: job.gameId, fileId: activeFile?.key || '', filename: activeFile?.name || '',
         partNumber: activeFile ? partNumber(activeFile.name) : null, httpStatus, errorCode: error instanceof Error && 'code' in error && typeof error.code === 'string' && /^[A-Z0-9_]+$/.test(error.code) ? error.code : '',
         safeMessage: message, technicalMessage: message, timestamp: now(), retryable: !/Unsafe|checksum mismatch/i.test(message) };

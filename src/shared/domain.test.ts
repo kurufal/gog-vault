@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
-import { bulkDownloadWarningBytes, committedNumber, completion, contentAvailability, desiredFingerprint, manifestFingerprint, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, selectedChildCompletion, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
+import { bulkDownloadWarningBytes, committedNumber, completion, contentAvailability, desiredFingerprint, isNeutralLanguage, manifestFingerprint, matchesManifestFilters, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, selectedChildCompletion, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
 import { withinRoot } from '../server/paths';
 import { scoreFolder } from '../server/matching';
 import { isLibraryLandscape, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from './media';
@@ -41,6 +41,14 @@ test('matching confidence requires corroboration before auto-linking', () => {
 const file = (partial: Partial<RemoteFile> = {}): RemoteFile => ({
   key: 'one', gameId: '42', name: 'setup.exe', category: 'main', platform: 'windows', language: 'English',
   version: '1', size: 100, downlink: 'https://api.gog.com/products/42/downlink/installer/one', selected: true, verified: false, ...partial
+});
+test('manifest language filters retain neutral Extras without bypassing platform filters', () => {
+  expect(matchesManifestFilters(file({ category: 'extras', language: 'Neutral' }), ['windows'], ['French'])).toBe(true);
+  expect(matchesManifestFilters(file({ category: 'extras', language: 'N/A' }), ['windows'], ['English'])).toBe(true);
+  expect(matchesManifestFilters(file({ category: 'extras', language: 'Neutral', platform: 'linux' }), ['windows'], ['English'])).toBe(false);
+  expect(matchesManifestFilters(file({ language: 'French' }), ['windows'], ['English'])).toBe(false);
+  expect(matchesManifestFilters(file({ language: 'French' }), [], [])).toBe(true);
+  expect(isNeutralLanguage('All languages')).toBe(true);
 });
 describe('vault paths and names', () => {
   test('sanitizes Windows and SMB reserved names', () => {
@@ -108,6 +116,15 @@ describe('archive state', () => {
     expect(statusFor([file({ verified: true }), file({ key: 'dlc', category: 'dlc' })], [], false, true)).toBe('Incomplete');
     expect(statusFor([file({ verified: true }), file({ key: 'extra', category: 'extras', selected: true })], [], false, true)).toBe('Incomplete');
     expect(statusFor([file({ verified: true }), file({ key: 'patch', category: 'other', selected: true })], [], false, true)).toBe('Incomplete');
+  });
+  test('unavailable GOG Extras remain visible without penalizing a verified base archive', () => {
+    const files = [file({ verified: true }), file({ key: 'bonus', category: 'extras', unavailable: true })];
+    const failure = { id: 1, gameId: '42', state: 'error' as const, createdAt: '', updatedAt: '', error: 'GOG returned HTTP 404',
+      currentFile: '', bytes: 0, total: 0, speed: 0, errorDetails: { stage: 'resolve_downlink', productId: '42', fileId: 'bonus', filename: 'soundtrack', partNumber: null,
+        httpStatus: 404, errorCode: '', safeMessage: 'GOG returned HTTP 404', technicalMessage: '', timestamp: '', retryable: true } };
+    expect(completion(files, 'extras')).toBeNull();
+    expect(statusFor(files, [failure], false, true)).toBe('Vaulted');
+    expect(reconcileLocalGameState(1, '42', files, [failure], false, true, 0, 100)).toMatchObject({ overallStatus: 'Vaulted', selectedCompletion: 100, remoteSelectedBytes: 100 });
   });
   test('reconciles one vault-scoped archive state for Main, selected Extras and version uncertainty', () => {
     const main = file({ verified: true, size: 100 });

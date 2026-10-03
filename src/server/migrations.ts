@@ -83,7 +83,22 @@ const migrations = [
          PRIMARY KEY(vault_id,child_product_id,file_key),
          UNIQUE(vault_id,storage_game_id,relative_path)
        );
-      CREATE INDEX idx_dlc_parent ON product_relationships(parent_product_id,relationship_type);`
+      CREATE INDEX idx_dlc_parent ON product_relationships(parent_product_id,relationship_type);`,
+      `ALTER TABLE games ADD COLUMN owned INTEGER NOT NULL DEFAULT 1;
+       ALTER TABLE remote_files ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0;
+       ALTER TABLE remote_files ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';`,
+      `CREATE TABLE product_relationships_next (
+         parent_product_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+         child_product_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+         relationship_type TEXT NOT NULL CHECK(relationship_type='dlc'),
+         selected INTEGER NOT NULL DEFAULT 0,
+         PRIMARY KEY(parent_product_id,child_product_id,relationship_type),
+         CHECK(parent_product_id!=child_product_id)
+       );
+       INSERT INTO product_relationships_next SELECT * FROM product_relationships;
+       DROP TABLE product_relationships;
+       ALTER TABLE product_relationships_next RENAME TO product_relationships;
+       CREATE INDEX idx_dlc_parent ON product_relationships(parent_product_id,relationship_type);`
     ];
 
     const backfillDlc = `INSERT OR IGNORE INTO product_relationships(parent_product_id,child_product_id,relationship_type,selected)
@@ -146,6 +161,16 @@ export function migrate(db: Database, databasePath?: string, throughVersion = mi
           if (!columns.some(column => column.name === 'vault_id')) db.exec(`ALTER TABLE ${table} ADD COLUMN vault_id INTEGER REFERENCES vaults(id)`);
         }
         db.exec('CREATE INDEX IF NOT EXISTS idx_unlinked_vault ON unlinked_folders(vault_id); CREATE INDEX IF NOT EXISTS idx_ignored_vault ON ignored_folders(vault_id)');
+        db.query('INSERT INTO migrations(version) VALUES (?)').run(version);
+      })();
+      continue;
+    }
+    if (version === 16) {
+      db.transaction(() => {
+        if (db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='games'").get())
+          db.exec('ALTER TABLE games ADD COLUMN owned INTEGER NOT NULL DEFAULT 1');
+        if (db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_files'").get())
+          db.exec("ALTER TABLE remote_files ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0; ALTER TABLE remote_files ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}'");
         db.query('INSERT INTO migrations(version) VALUES (?)').run(version);
       })();
       continue;

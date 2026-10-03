@@ -18,12 +18,14 @@ mock.module('./gog/products', () => ({
     if (!online) throw new Error('GOG unavailable');
     return { url: 'https://cdn.gog.com/file', filename: file.key === 'one' ? 'setup_agony_v1.exe' :
       file.key === 'official-size' ? 'setup_official.exe' :
+      file.key === 'bonus-missing' ? 'track.flac' :
       file.key === 'beyond-main' ? 'setup_beyond_two_souls_1.0.exe' :
       file.key === 'beyond-part' ? 'setup_beyond_two_souls_1.0-1.bin' : 'setup_agony_v1-1.bin',
-      checksum: file.key === 'official-size' ? 'https://cdn.gog.com/official.xml' : undefined };
+      checksum: file.key === 'official-size' ? 'https://cdn.gog.com/official.xml' :
+        file.key === 'bonus-missing' ? 'https://cdn.gog.com/missing.xml' : undefined };
   }
 }));
-const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, saveLocalGame, activeVault, linkDlcProducts, selectDlcProduct } = await import('./db');
+const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, saveLocalGame, activeVault, linkDlcProducts, selectDlcProduct, saveOwnedProducts } = await import('./db');
 const { scanGame, scanVault, findGameFolder, linkAndScan, organizePreview, organizeGame, importPreview, importGame, scanState, matchingReview, ignoreFolder, writeOfflineMetadata } = await import('./storage');
 const { enqueueVerification, cancelVerification, verificationJobs, hasActiveVerification } = await import('./verification');
 const { archiveMedia } = await import('./media');
@@ -727,6 +729,71 @@ test('Blades DLC remains its own card while the parent references one existing i
   saveSettings({ vaultPath: root });
   expect(gameById('blades-base')?.completion.dlc).toBe(100);
 });
+test('a base game adopts verified DLC after its child was linked to another edition', async () => {
+  const root = join(directory, 'blasphemous-vault');
+  const folder = join(root, 'Blasphemous');
+  await mkdir(folder, { recursive: true });
+  const filename = 'setup_blasphemous_alloy_of_sin.exe';
+  const content = Buffer.from('Alloy of Sin installer');
+  await writeFile(join(folder, filename), content);
+  await writeFile(join(folder, 'blasphemous.exe'), 'base');
+  const info = await import('node:fs/promises').then(fs => fs.lstat(join(folder, filename)));
+  const baseInfo = await import('node:fs/promises').then(fs => fs.lstat(join(folder, 'blasphemous.exe')));
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'blasphemous-base', title: 'Blasphemous' });
+  upsertGame({ id: 'blasphemous-deluxe', title: 'Blasphemous Digital Deluxe Edition' });
+  upsertGame({ id: 'alloy-skin', title: 'Alloy of Sin Character Skin', productType: 'dlc' });
+  const childFile = { key: 'alloy-skin:installers:1:1', gameId: 'alloy-skin', name: filename,
+    category: 'main' as const, platform: 'windows' as const, language: 'English', version: '1', size: content.length,
+    downlink: 'https://api.gog.com/child', selected: true, verified: false, provenance: { sourceProductId: 'alloy-skin' } };
+  replaceFiles('alloy-skin', [childFile]);
+  linkDlcProducts('blasphemous-deluxe', ['alloy-skin']);
+  const parentFile = { ...childFile, gameId: 'blasphemous-base', category: 'dlc' as const };
+  const baseFile = { ...childFile, key: 'blasphemous-base:installers:1:1', gameId: 'blasphemous-base', name: 'blasphemous.exe' };
+  replaceFiles('blasphemous-base', [baseFile, parentFile]);
+  mapVaultGame('blasphemous-base', 'Blasphemous');
+  saveLocalGame('blasphemous-base', { localSize: content.length + 4 });
+  saveFileState('blasphemous-base', baseFile.key, { name: 'blasphemous.exe', matched: true, verified: true, verifiedSize: 4 });
+  saveFileState('blasphemous-base', parentFile.key, { name: filename, matched: true, verified: true, verifiedSize: content.length });
+  db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?)')
+    .run(activeVault()!.id, 'blasphemous-base', filename, content.length, Math.round(info.mtimeMs), createHash('sha256').update(content).digest('hex'), 'now');
+  db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?)')
+    .run(activeVault()!.id, 'blasphemous-base', 'blasphemous.exe', 4, Math.round(baseInfo.mtimeMs), createHash('sha256').update('base').digest('hex'), 'now');
+  replaceFiles('blasphemous-base', [baseFile, parentFile]);
+  expect(db.query('SELECT parent_product_id FROM product_relationships WHERE child_product_id=? ORDER BY parent_product_id').all('alloy-skin'))
+    .toEqual([{ parent_product_id: 'blasphemous-base' }, { parent_product_id: 'blasphemous-deluxe' }]);
+  expect(gameById('alloy-skin')).toMatchObject({ parentProduct: { id: 'blasphemous-base' }, status: 'Vaulted', completion: { main: 100 } });
+  expect(filesFor('alloy-skin')[0]?.provenance?.parentProductId).toBe('blasphemous-base');
+  expect(gameById('blasphemous-base')).toMatchObject({ status: 'Vaulted', completion: { dlc: 100 } });
+  expect(filesFor('blasphemous-base').map(file => file.key)).toEqual([baseFile.key]);
+  expect(db.query('SELECT storage_game_id FROM vault_child_file_locations WHERE child_product_id=? AND file_key=?')
+    .get('alloy-skin', childFile.key)).toEqual({ storage_game_id: 'blasphemous-base' });
+});
+test('an existing DLC-only bundle reports its archived components without inventing a base-game parent', async () => {
+  const root = join(directory, 'sacrament-vault');
+  await mkdir(join(root, 'Mea Culpa'), { recursive: true });
+  await writeFile(join(root, 'Mea Culpa', 'mea-culpa.exe'), 'dlc');
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'sacrament-bundle', title: 'Complete Sacrament Edition Bundle', slug: 'blasphemous_2_complete_sacrament_edition_bundle' });
+  upsertGame({ id: 'sacrament-dlc', title: 'Mea Culpa', productType: 'dlc' });
+  replaceFiles('sacrament-dlc', [{ key: 'sacrament-dlc:installers:1:1', gameId: 'sacrament-dlc', name: 'mea-culpa.exe',
+    category: 'main', platform: 'windows', language: 'English', version: '1', size: 3,
+    downlink: 'https://api.gog.com/dlc', selected: true, verified: false }]);
+  mapVaultGame('sacrament-dlc', 'Mea Culpa');
+  saveLocalGame('sacrament-dlc', { localSize: 3 });
+  saveFileState('sacrament-dlc', 'sacrament-dlc:installers:1:1', { matched: true, verified: true, name: 'mea-culpa.exe', verifiedSize: 3 });
+  upsertGame({ id: 'sacrament-soundtrack', title: 'Original Soundtrack', productType: 'dlc' });
+  replaceFiles('sacrament-soundtrack', [{ key: 'sacrament-soundtrack:extra:1', gameId: 'sacrament-soundtrack', name: 'soundtrack.zip',
+    category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5,
+    downlink: 'https://api.gog.com/soundtrack', selected: false, verified: false }]);
+  linkDlcProducts('sacrament-bundle', ['sacrament-dlc', 'sacrament-soundtrack']);
+  expect(gameById('sacrament-bundle')).toMatchObject({ productType: 'bundle', parentProduct: undefined,
+    status: 'Vaulted', completion: { main: null, dlc: 100 }, dlcChildren: [{ id: 'sacrament-dlc', selected: true, pending: false },
+      { id: 'sacrament-soundtrack', selected: true, pending: false }] });
+  db.query('UPDATE remote_files SET selected=1 WHERE game_id=?').run('sacrament-soundtrack');
+  expect(gameById('sacrament-bundle')).toMatchObject({ status: 'Incomplete', completion: { dlc: 38 },
+    dlcChildren: [{ id: 'sacrament-dlc', pending: false }, { id: 'sacrament-soundtrack', pending: true }] });
+});
 test('importing a child DLC updates its parent without a second local installer', async () => {
   const root = join(directory, 'dlc-import-vault');
   const source = join(directory, 'dlc-import-source', 'Imported DLC');
@@ -748,4 +815,61 @@ test('importing a child DLC updates its parent without a second local installer'
   expect(gameById('import-dlc-parent')).toMatchObject({ status: 'Vaulted', completion: { dlc: 100 } });
   expect(db.query('SELECT game_id,COUNT(*) AS count FROM vault_local_files WHERE vault_id=? AND relative_path=? GROUP BY game_id').all(activeVault()!.id, 'installer.bin'))
     .toEqual([{ game_id: 'import-dlc-child', count: 1 }]);
+});
+
+test('scan retains size-only Extra verification when advertised checksum XML is missing', async () => {
+  const root = join(directory, 'bonus-vault');
+  const folder = join(root, 'Music Game');
+  await mkdir(folder, { recursive: true });
+  await writeFile(join(folder, 'track.flac'), 'music');
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'bonus-scan', title: 'Music Game' });
+  replaceFiles('bonus-scan', [{ key: 'bonus-missing', gameId: 'bonus-scan', name: 'track.flac', category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5,
+    downlink: 'https://api.gog.com/products/bonus-scan/downlink/product_bonus/1', selected: true, verified: false }]);
+  mapVaultGame('bonus-scan', 'Music Game');
+  await scanGame('bonus-scan');
+  db.query('UPDATE vault_local_files SET sha256=?,verified_at=? WHERE vault_id=? AND game_id=?').run(createHash('sha256').update('music').digest('hex'), new Date().toISOString(), activeVault()!.id, 'bonus-scan');
+  saveFileState('bonus-scan', 'bonus-missing', { matched: true, verified: true, name: 'track.flac', verifiedSize: 5, verificationSource: 'local-sha256', checksumUrl: '' });
+  const previousFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = Object.assign(async () => new Response(null, { status: 404 }), { preconnect: previousFetch.preconnect });
+    expect((await scanGame('bonus-scan', true)).completion.extras).toBe(100);
+    expect(filesFor('bonus-scan')[0]).toMatchObject({ verified: true, verificationSource: 'local-sha256', verifiedSize: 5 });
+    globalThis.fetch = Object.assign(async () => new Response('<file md5="00000000000000000000000000000000" total_size="5"/>'), { preconnect: previousFetch.preconnect });
+    await scanGame('bonus-scan', true);
+    expect(filesFor('bonus-scan')[0]).toMatchObject({ verified: false, verificationSource: '' });
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test('ownership refresh removes unowned DLC content but preserves local archive records', async () => {
+  const root = join(directory, 'ownership-vault');
+  const folder = join(root, 'Old soundtrack');
+  await mkdir(folder, { recursive: true });
+  await writeFile(join(folder, 'soundtrack.zip'), 'saved bytes');
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'owned-base', title: 'Owned Game' });
+  upsertGame({ id: 'unowned-child', title: 'Separate Soundtrack', productType: 'dlc' });
+  const manual = { key: 'owned-base:bonus_content:1993:1993', gameId: 'owned-base', name: 'manual (55 pages)', category: 'extras' as const,
+    platform: 'windows' as const, language: 'Neutral', version: '', size: 1048576,
+    downlink: 'https://api.gog.com/products/owned-base/downlink/product_bonus/1993', selected: true, verified: false,
+    provenance: { sourceProductId: 'owned-base', bonusContentId: '1993', bonusType: 'manuals', bonusTotalSize: 1048576, fileId: '1993' } };
+  replaceFiles('owned-base', [manual]);
+  db.query('UPDATE remote_files SET unavailable=1 WHERE game_id=?').run('owned-base');
+  replaceFiles('unowned-child', [{ key: 'unowned-child:bonus_content:1:1', gameId: 'unowned-child', name: 'soundtrack.zip', category: 'extras',
+    platform: 'windows', language: 'Neutral', version: '', size: 11, downlink: 'https://api.gog.com/products/123/downlink/product_bonus/1', selected: true, verified: false,
+    provenance: { sourceProductId: 'unowned-child', bonusContentId: '1', bonusType: 'audio', bonusTotalSize: 11, fileId: '1' } }]);
+  linkDlcProducts('owned-base', ['unowned-child']);
+  expect(filesFor('unowned-child')[0]?.provenance).toMatchObject({ sourceProductId: 'unowned-child', parentProductId: 'owned-base', bonusType: 'audio' });
+  mapVaultGame('unowned-child', 'Old soundtrack');
+  db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms) VALUES (?,?,?,?,?)')
+    .run(activeVault()!.id, 'unowned-child', 'soundtrack.zip', 11, 1);
+  saveOwnedProducts(new Set(['owned-base']));
+  expect(filesFor('owned-base')[0]).toMatchObject({ selected: true, unavailable: true, provenance: manual.provenance });
+  expect(db.query('SELECT selected FROM remote_files WHERE game_id=?').all('unowned-child')).toEqual([]);
+  expect(db.query('SELECT child_product_id FROM product_relationships WHERE parent_product_id=?').all('owned-base')).toEqual([]);
+  expect(games().some(game => game.id === 'unowned-child')).toBe(false);
+  expect(db.query('SELECT relative_path FROM vault_local_files WHERE game_id=?').get('unowned-child')).toEqual({ relative_path: 'soundtrack.zip' });
+  expect(await readFile(join(folder, 'soundtrack.zip'), 'utf8')).toBe('saved bytes');
+  replaceFiles('owned-base', [manual]);
+  expect(filesFor('owned-base')[0]).toMatchObject({ selected: true, unavailable: false, provenance: manual.provenance });
 });

@@ -10,7 +10,7 @@ test('initial migration creates schema once and is safe to rerun', () => {
   try {
     migrate(database);
     migrate(database);
-    expect(database.query('SELECT version FROM migrations').all()).toEqual(Array.from({ length: 15 }, (_, index) => ({ version: index + 1 })));
+    expect(database.query('SELECT version FROM migrations').all()).toEqual(Array.from({ length: 17 }, (_, index) => ({ version: index + 1 })));
     expect(database.query("SELECT name FROM sqlite_master WHERE name='download_files'").get()).toEqual({ name: 'download_files' });
     expect(database.query("SELECT name FROM sqlite_master WHERE name='import_files'").get()).toEqual({ name: 'import_files' });
     expect(database.query("SELECT name FROM sqlite_master WHERE name='product_relationships'").get()).toEqual({ name: 'product_relationships' });
@@ -37,7 +37,7 @@ test('upgrading a disk database backs up legacy records before adding vault scop
       expect(original.query('SELECT id FROM games').get()).toEqual({ id: 'legacy-owned-game' });
       expect(original.query('SELECT version FROM migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 12 });
     } finally { original.close(); }
-    expect(database.query('SELECT version FROM migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 15 });
+    expect(database.query('SELECT version FROM migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 17 });
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 test('schema 13 can gain missing scan columns even if another one already exists', () => {
@@ -51,7 +51,21 @@ test('schema 13 can gain missing scan columns even if another one already exists
     for (let version = 1; version <= 13; version++) database.query('INSERT INTO migrations VALUES (?)').run(version);
     migrate(database);
     expect((database.query('PRAGMA table_info(ignored_folders)').all() as { name: string }[]).some(column => column.name === 'vault_id')).toBe(true);
-    expect(database.query('SELECT MAX(version) AS version FROM migrations').get()).toEqual({ version: 15 });
+    expect(database.query('SELECT MAX(version) AS version FROM migrations').get()).toEqual({ version: 17 });
+  } finally { database.close(); }
+});
+test('upgrading existing DLC relationships permits a second owned parent', () => {
+  const database = new Database(':memory:');
+  database.exec('PRAGMA foreign_keys=ON');
+  try {
+    migrate(database, undefined, 16);
+    database.exec("INSERT INTO games(id,title,first_seen) VALUES ('blasphemous','Blasphemous','now'),('deluxe','Deluxe','now'),('alloy','Alloy of Sin','now');");
+    database.exec("INSERT INTO product_relationships(parent_product_id,child_product_id,relationship_type,selected) VALUES ('deluxe','alloy','dlc',1);");
+    migrate(database);
+    database.exec("INSERT INTO product_relationships(parent_product_id,child_product_id,relationship_type,selected) VALUES ('blasphemous','alloy','dlc',1);");
+    expect(database.query('SELECT parent_product_id,selected FROM product_relationships WHERE child_product_id=? ORDER BY parent_product_id').all('alloy'))
+      .toEqual([{ parent_product_id: 'blasphemous', selected: 1 }, { parent_product_id: 'deluxe', selected: 1 }]);
+    expect(database.query('PRAGMA foreign_key_check').all()).toEqual([]);
   } finally { database.close(); }
 });
 test('Blades legacy DLC moves logical ownership without moving or duplicating installer bytes', () => {

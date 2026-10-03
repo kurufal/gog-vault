@@ -7,6 +7,8 @@ export interface RemoteFile {
   key: string; gameId: string; name: string; category: Category; platform: Platform;
   language: string; version: string; size: number; downlink: string; checksumUrl?: string;
   dlc?: string; selected: boolean; verified: boolean; matched?: boolean;
+  unavailable?: boolean;
+  provenance?: { sourceProductId: string; parentProductId?: string; bonusContentId?: string; bonusType?: string; bonusTotalSize?: number; fileId?: string };
   verificationSource?: 'gog-checksum' | 'local-sha256' | 'import-identified' | ''; verifiedSize?: number;
 }
 export interface DownloadFailure {
@@ -19,7 +21,7 @@ export interface Game {
   productType?: ProductType;
   parentProduct?: { id: string; title: string };
   dlcChildren?: { id: string; title: string; selected: boolean; files: number; bytes: number; completion: number | null;
-    status: VaultStatus; cover: string; platform: Platform[]; updateAvailable: boolean }[];
+    status: VaultStatus; cover: string; platform: Platform[]; updateAvailable: boolean; pending: boolean }[];
   availability?: Partial<Record<Category, 'none' | 'off' | 'selected'>>;
   folderPath?: string;
   linkedFiles?: boolean;
@@ -56,6 +58,14 @@ export function committedNumber(draft: string, minimum: number, maximum: number,
 }
 export type Settings = typeof defaults;
 
+export function isNeutralLanguage(value: string): boolean {
+  return /^(neutral|none|n\/?a|any|all languages?)$/i.test(value.trim());
+}
+export function matchesManifestFilters(file: Pick<RemoteFile, 'platform' | 'language'>, platforms: readonly Platform[], languages: readonly string[]): boolean {
+  return (!platforms.length || platforms.includes(file.platform)) &&
+    (!languages.length || isNeutralLanguage(file.language) || languages.includes(file.language));
+}
+
 export function usedCapacity(total: number | null, free: number | null): number | null {
   if (total === null || free === null || !Number.isSafeInteger(total) || !Number.isSafeInteger(free) || free < 0 || free > total) return null;
   return total - free;
@@ -71,7 +81,7 @@ export function normalizeTitle(value: string): string {
     .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
 }
 export function completion(files: RemoteFile[], category: Category): number | null {
-  const selected = files.filter(file => file.category === category && file.selected);
+  const selected = files.filter(file => file.category === category && file.selected && !file.unavailable);
   if (!selected.length) return null;
   const total = selected.reduce((sum, file) => sum + Math.max(1, file.size), 0);
   return Math.round(100 * selected.reduce((sum, file) => sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) / total);
@@ -87,9 +97,9 @@ export function desiredFingerprint(files: RemoteFile[]): string {
 export function statusFor(files: RemoteFile[], jobs: Job[], changed: boolean, hasFolder: boolean, previousInstallerParts = 0): VaultStatus {
   const active = jobs.find(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state));
   if (active) return ({ queued: 'Queued', downloading: 'Downloading', paused: 'Paused', verifying: 'Verifying' } as const)[active.state as 'queued'];
-  if (jobs[0]?.state === 'error') return 'Error';
+  if (jobs[0]?.state === 'error' && !files.some(file => file.key === jobs[0]?.errorDetails?.fileId && file.unavailable)) return 'Error';
   const main = completion(files, 'main');
-  const selected = files.filter(file => file.selected);
+  const selected = files.filter(file => file.selected && !file.unavailable);
   if (!hasFolder || !selected.some(file => file.verified || file.matched) && !previousInstallerParts) return 'Not Downloaded';
   if (previousInstallerParts && !selected.some(file => file.category === 'main' && file.verified)) {
     const other = selected.filter(file => file.category !== 'main');
@@ -153,7 +163,7 @@ export function previousInstallerSet(files: RemoteFile[], local: { name: string;
 }
 export function reconcileLocalGameState(vaultId: number, productId: string, files: RemoteFile[], jobs: Job[],
   changed: boolean, hasFolder: boolean, previousInstallerParts: number, localBytes: number): LocalGameState {
-  const selected = files.filter(file => file.selected);
+  const selected = files.filter(file => file.selected && !file.unavailable);
   const progress = (entries: RemoteFile[]) => entries.length ? Math.round(100 * entries.reduce((sum, file) =>
     sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) /
     entries.reduce((sum, file) => sum + Math.max(1, file.size), 0)) : null;

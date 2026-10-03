@@ -122,8 +122,17 @@ export function saveSettings(input: Partial<Settings>): Settings {
   if (input.vaultPath) { currentVaultPath = ''; activeVault(); }
   return settings();
 }
+function preferredDlcParent(gameId: string, vaultId: number): { id: string; title: string } | null {
+  return db.query(`SELECT parent.id,parent.title FROM product_relationships relation JOIN games parent ON parent.id=relation.parent_product_id
+    WHERE relation.child_product_id=? AND relation.relationship_type='dlc'
+    ORDER BY EXISTS (SELECT 1 FROM vault_child_file_locations location JOIN vault_local_files physical
+      ON physical.vault_id=location.vault_id AND physical.game_id=location.storage_game_id AND physical.relative_path=location.relative_path
+      WHERE location.vault_id=? AND location.child_product_id=relation.child_product_id AND location.storage_game_id=parent.id) DESC, parent.id LIMIT 1`)
+    .get(gameId, vaultId) as { id: string; title: string } | null;
+}
 export function filesFor(gameId: string): RemoteFile[] {
   const vaultId = activeVault()?.id;
+  const parent = preferredDlcParent(gameId, vaultId || -1);
   return (db.query('SELECT * FROM remote_files WHERE game_id=? ORDER BY category,name').all(gameId) as Row[]).map(row => {
     const local = vaultId ? db.query('SELECT * FROM vault_file_state WHERE vault_id=? AND game_id=? AND file_key=?').get(vaultId, gameId, row.key) as Row | null : null;
     const borrowed = vaultId ? db.query(`SELECT physical.size,physical.mtime_ms,physical.verified_at,physical.sha256,storage.folder
@@ -136,11 +145,13 @@ export function filesFor(gameId: string): RemoteFile[] {
       !!borrowed && (!local?.verified_size || borrowed.size === local.verified_size) && !!borrowed.sha256 && !!borrowed.verified_at;
     return { key: row.key, gameId: row.game_id, name: local?.name || row.name, category: row.category, platform: row.platform,
     language: row.language, version: row.version, size: row.size, downlink: row.downlink,
-    checksumUrl: local?.checksum_url || row.checksum_url, dlc: row.dlc, selected: !!row.selected,
+    checksumUrl: local?.checksum_url || row.checksum_url, dlc: row.dlc, selected: !!row.selected, unavailable: !!row.unavailable,
+    provenance: row.provenance && row.provenance !== '{}' ? { ...JSON.parse(row.provenance), ...(parent ? { parentProductId: parent.id } : {}) } : undefined,
     matched: linked && !!local?.matched, verified: linked && !!local?.verified, verificationSource: local?.verification_source || '', verifiedSize: local?.verified_size || 0 };
   });
 }
 migrateLegacyLocalState();
+reconcileDlcRecords(db);
 reconcileLinkedArchiveState();
 export function jobsFor(gameId?: string): Job[] {
   const vaultId = activeVault()?.id || -1;
@@ -151,7 +162,7 @@ export function jobsFor(gameId?: string): Job[] {
 }
 export function gameById(id: string, includeChildren = true): Game | null {
   const row = db.query('SELECT * FROM games WHERE id=?').get(id) as Row | null;
-  if (!row) return null;
+  if (!row || !row.owned) return null;
   const local = localGameRow(id);
   const files = filesFor(id);
   const vaultId = activeVault()?.id || -1;
@@ -172,11 +183,12 @@ export function gameById(id: string, includeChildren = true): Game | null {
     local.archived_selected_hash && (local.local_size > 0 || borrowed.verified > 0) &&
     !['Queued', 'Downloading', 'Paused', 'Verifying', 'Error'].includes(archive.overallStatus)) archive.overallStatus = 'Vaulted';
   if (row.product_type === 'dlc' && changed && archive.overallStatus === 'Vaulted') archive.selectedCompletion = 100;
-  const parent = db.query("SELECT parent.id,parent.title FROM product_relationships relation JOIN games parent ON parent.id=relation.parent_product_id WHERE relation.child_product_id=? AND relation.relationship_type='dlc'")
-    .get(id) as { id: string; title: string } | null;
+  const parent = preferredDlcParent(id, vaultId);
   const childRows = includeChildren ? db.query(`SELECT child.id,child.title,relation.selected FROM product_relationships relation
     JOIN games child ON child.id=relation.child_product_id WHERE relation.parent_product_id=? AND relation.relationship_type='dlc' ORDER BY child.title COLLATE NOCASE`)
     .all(id) as { id: string; title: string; selected: number }[] : [];
+  const productType = row.product_type === 'game' && childRows.length && /(?:^|[_-])bundle$/i.test(row.slug) ? 'bundle' : row.product_type;
+  const filelessBundle = productType === 'bundle' && files.length === 0;
   const childStates = childRows.map(child => ({ ...child, game: gameById(child.id, false)!, files: filesFor(child.id) }));
   const selectedChildren = childStates.filter(child => child.selected);
   const childProgress = childStates.map(child => ({ selected: !!child.selected, files: child.files.map(file =>
@@ -184,15 +196,26 @@ export function gameById(id: string, includeChildren = true): Game | null {
       ? { ...file, verified: true } : file) }));
   const childCompletion = selectedChildCompletion(childProgress);
   const legacyDlc = files.filter(file => file.category === 'dlc');
-  const dlcCompletion = childCompletion === null ? completion(files, 'dlc') : selectedChildCompletion([
+  const selectedChildFiles = childProgress.filter(child => child.selected).flatMap(child => child.files.filter(file =>
+    file.selected && !file.unavailable && (filelessBundle || file.category === 'main')));
+  const dlcCompletion = filelessBundle ? selectedChildCompletion([{ selected: true, files: selectedChildFiles.map(file => ({ ...file, category: 'main' as const })) }])
+    : childCompletion === null ? completion(files, 'dlc') : selectedChildCompletion([
     ...childProgress, { selected: true, files: legacyDlc.map(file => ({ ...file, category: 'main' as const })) }]);
-  const selectedChildFiles = selectedChildren.flatMap(child => child.files.filter(file => file.category === 'main' && file.selected));
-  const selectedFiles = [...files.filter(file => file.selected), ...childProgress.filter(child => child.selected).flatMap(child => child.files.filter(file => file.category === 'main' && file.selected))];
+  const selectedFiles = [...files.filter(file => file.selected && !file.unavailable), ...(filelessBundle ? selectedChildFiles
+    : selectedChildren.flatMap(child => child.files.filter(file => file.category === 'main' && file.selected)))];
   if (selectedFiles.length) archive.selectedCompletion = Math.round(100 * selectedFiles.reduce((sum, file) =>
     sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) /
     selectedFiles.reduce((sum, file) => sum + Math.max(1, file.size), 0));
   if (selectedChildren.length && (dlcCompletion === null || dlcCompletion < 100) && archive.overallStatus === 'Vaulted') archive.overallStatus = 'Incomplete';
   if (selectedChildren.length && dlcCompletion === 100 && selectedChildren.some(child => child.game.status === 'Needs Verification') && archive.overallStatus === 'Vaulted') archive.overallStatus = 'Needs Verification';
+  if (filelessBundle && selectedChildFiles.length) {
+    const activeChild = selectedChildren.find(child => ['Queued', 'Downloading', 'Paused', 'Verifying', 'Error'].includes(child.game.status));
+    archive.overallStatus = activeChild?.game.status || (selectedChildFiles.every(file => file.verified) ? 'Vaulted'
+      : selectedChildFiles.every(file => file.verified || file.matched) ? 'Needs Verification'
+      : selectedChildFiles.some(file => file.verified || file.matched) ? 'Incomplete' : 'Not Downloaded');
+    archive.verificationState = selectedChildFiles.every(file => file.verified) ? 'verified'
+      : selectedChildFiles.some(file => file.verified || file.matched) ? 'identified' : 'missing';
+  }
   if (selectedChildren.some(child => child.game.archive?.updateState === 'manifest_changed' || child.game.status === 'Update Available')) archive.updateState = 'manifest_changed';
   archive.dlc = dlcCompletion;
   archive.remoteSelectedBytes += selectedChildFiles.reduce((sum, file) => sum + file.size, 0);
@@ -200,11 +223,11 @@ export function gameById(id: string, includeChildren = true): Game | null {
     ? selectedChildren.length || legacyDlc.some(file => file.selected) ? 'selected' as const : 'off' as const
     : contentAvailability(files, 'dlc'), extras: contentAvailability(files, 'extras') };
   const logo = (db.query("SELECT url FROM media_assets WHERE game_id=? AND role='logo' LIMIT 1").get(id) as { url: string } | null)?.url || '';
-  return { id, title: row.title, slug: row.slug, productType: row.product_type, parentProduct: parent || undefined,
+  return { id, title: row.title, slug: row.slug, productType, parentProduct: parent || undefined,
     dlcChildren: childStates.map(child => ({ id: child.id, title: child.title, selected: !!child.selected,
       files: child.files.filter(file => file.category === 'main').length, bytes: child.files.filter(file => file.category === 'main').reduce((sum, file) => sum + file.size, 0),
       completion: child.game.completion.main, status: child.game.status, cover: child.game.cover, platform: child.game.platforms,
-      updateAvailable: child.game.archive?.updateState === 'manifest_changed' })), availability, background: row.background,
+      updateAvailable: child.game.archive?.updateState === 'manifest_changed', pending: child.files.some(file => file.selected && !file.verified && !file.matched && !file.unavailable) })), availability, background: row.background,
     hiddenFromLibrary: !!row.hidden_from_library,
     logo, cover: resolveLibraryLandscapeArtwork({ cover: row.cover, background: row.background, logo }),
     releaseDate: row.release_date, platforms: JSON.parse(row.platforms), languages: JSON.parse(row.languages),
@@ -218,7 +241,7 @@ export function gameById(id: string, includeChildren = true): Game | null {
   };
 }
 export function games(): Game[] {
-  return (db.query('SELECT id FROM games ORDER BY title COLLATE NOCASE').all() as { id: string }[]).map(row => gameById(row.id)!);
+  return (db.query('SELECT id FROM games WHERE owned=1 ORDER BY title COLLATE NOCASE').all() as { id: string }[]).map(row => gameById(row.id)!);
 }
 export function setHiddenGames(ids: string[], hidden: boolean) {
   const unique = [...new Set(ids)];
@@ -241,6 +264,21 @@ export function upsertGame(input: Partial<Game> & { id: string; title: string })
       product_type=CASE WHEN $type='game' AND games.product_type='dlc' THEN games.product_type ELSE $type END`)
     .run({ $id: input.id, $title: input.title, $slug: input.slug || '', $cover: input.cover || '', $background: input.background || '',
       $release: input.releaseDate || '', $platforms: JSON.stringify(input.platforms || []), $languages: JSON.stringify(input.languages || []), $now: now(), $type: input.productType || 'game' });
+}
+export function unownedDlcProductIds(ownedIds: ReadonlySet<string>): string[] {
+  const candidates = db.query(`SELECT id FROM games WHERE product_type='dlc' UNION SELECT child_product_id AS id FROM product_relationships`)
+    .all() as { id: string }[];
+  return candidates.map(row => row.id).filter(id => !ownedIds.has(id));
+}
+export function saveOwnedProducts(ownedIds: ReadonlySet<string>) {
+  const children = unownedDlcProductIds(ownedIds);
+  db.transaction(() => {
+    const setOwned = db.query('UPDATE games SET owned=? WHERE id=?');
+    for (const row of db.query('SELECT id FROM games').all() as { id: string }[]) setOwned.run(Number(ownedIds.has(row.id)), row.id);
+    for (const id of children) db.query('DELETE FROM remote_files WHERE game_id=?').run(id);
+    db.query(`DELETE FROM product_relationships WHERE parent_product_id IN (SELECT id FROM games WHERE owned=0)
+      OR child_product_id IN (SELECT id FROM games WHERE owned=0)`).run();
+  })();
 }
 export function linkDlcProducts(parentId: string, childIds: string[]) {
   db.transaction(() => {
@@ -270,8 +308,8 @@ export function selectDlcProduct(parentId: string, childId: string, selected: bo
 }
 export function replaceFiles(gameId: string, files: RemoteFile[]) {
   const old = new Map(filesFor(gameId).map(file => [file.key, file]));
-  const insert = db.query(`INSERT INTO remote_files(game_id,key,name,category,platform,language,version,size,downlink,checksum_url,dlc,selected,verified,verification_source,verified_size)
-    VALUES ($game,$key,$name,$category,$platform,$language,$version,$size,$downlink,$checksum,$dlc,$selected,$verified,$source,$verifiedSize)`);
+  const insert = db.query(`INSERT INTO remote_files(game_id,key,name,category,platform,language,version,size,downlink,checksum_url,dlc,selected,verified,verification_source,verified_size,provenance)
+    VALUES ($game,$key,$name,$category,$platform,$language,$version,$size,$downlink,$checksum,$dlc,$selected,$verified,$source,$verifiedSize,$provenance)`);
   db.transaction(() => {
     for (const file of files) {
       const previous = db.query('SELECT version,size FROM remote_files WHERE game_id=? AND key=?').get(gameId, file.key) as { version: string; size: number } | null;
@@ -282,6 +320,7 @@ export function replaceFiles(gameId: string, files: RemoteFile[]) {
     for (const file of files) insert.run({ $game: gameId, $key: file.key, $name: file.name, $category: file.category, $platform: file.platform,
       $language: file.language, $version: file.version, $size: file.size, $downlink: file.downlink, $checksum: file.checksumUrl || '',
       $dlc: file.dlc || '', $selected: Number(old.get(file.key)?.selected ?? file.selected),
+      $provenance: JSON.stringify(file.provenance || old.get(file.key)?.provenance || {}),
       $verified: 0,
       $source: old.get(file.key)?.size === file.size && old.get(file.key)?.version === file.version ? old.get(file.key)?.verificationSource || '' : '',
       $verifiedSize: old.get(file.key)?.size === file.size && old.get(file.key)?.version === file.version ? old.get(file.key)?.verifiedSize || 0 : 0 });
@@ -293,7 +332,10 @@ export function replaceFiles(gameId: string, files: RemoteFile[]) {
       }
     }
     db.query('UPDATE games SET manifest_hash=? WHERE id=?').run(manifestFingerprint(files), gameId);
-    if (db.query('SELECT 1 FROM product_relationships WHERE child_product_id=?').get(gameId)) reconcileDlcRecords(db);
+    if (db.query('SELECT 1 FROM product_relationships WHERE child_product_id=?').get(gameId) ||
+      db.query(`SELECT 1 FROM remote_files parent JOIN remote_files child ON child.game_id=substr(parent.key,1,instr(parent.key,':')-1)
+        AND child.key=parent.key WHERE parent.game_id=? AND parent.category IN ('dlc','extras','patches','languagePacks')
+        AND parent.game_id!=child.game_id LIMIT 1`).get(gameId)) reconcileDlcRecords(db);
   })();
 }
 export function changeJob(id: number, state: JobState, error = '') {

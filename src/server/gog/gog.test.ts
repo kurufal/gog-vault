@@ -158,7 +158,7 @@ describe('GOG response adapters', () => {
     expect(files.find(file => file.platform === 'mac')).toBeDefined();
     expect(files.find(file => file.category === 'extras')?.selected).toBe(false);
   });
-  test('unowned expanded DLC stays available but is not selected for download', () => {
+  test('DLC default selection does not determine product ownership', () => {
     const soundtrack = { downloads: { bonus_content: [{ id: '90287', name: 'soundtrack (WAV)', os: 'windows', files: [
       { id: '90287', size: 912261120, downlink: 'https://api.gog.com/products/1438925691/downlink/product_bonus/90287' }
     ] }] } };
@@ -167,6 +167,16 @@ describe('GOG response adapters', () => {
       { gameId: '2028023186', category: 'extras', selected: false }
     ]);
     expect(parseDownloads(soundtrack, '2028023186', 'Agony Soundtrack', '1438925691', config, true)[0]?.selected).toBe(true);
+    expect(productManifest({ expanded_dlcs: [{ id: 1438925691 }] }, '2028023186', config, false, new Set(['2028023186'])).childIds).toEqual([]);
+  });
+  test('uses bonus artifact filenames instead of soundtrack display titles in download snapshots', () => {
+    const files = parseDownloads({ downloads: { bonus_content: [{ name: 'Soundtrack (WAV)', files: [
+      { id: 1, filename: 'Soundtrack (WAV).zip', size: 10, downlink: 'https://api.gog.com/products/42/downlink/product_bonus/1' },
+      { id: 2, name: 'disc-01.flac', size: 5, downlink: 'https://api.gog.com/products/42/downlink/product_bonus/2' },
+      { id: 3, name: 'Bonus track.mp3', size: 4, downlink: 'https://api.gog.com/products/42/downlink/product_bonus/3' }
+    ] }] } }, '42');
+    expect(files.map(file => file.name)).toEqual(['Soundtrack (WAV).zip', 'disc-01.flac', 'Bonus track.mp3']);
+    expect(JSON.parse(JSON.stringify(files[0])).name).toBe('Soundtrack (WAV).zip');
   });
   test('owned expanded DLC is a relationship, not a second parent-owned installer', () => {
     const child = { id: '1613811126', title: 'Blades of Time - Dismal Swamp DLC', type: 'dlc', downloads: {
@@ -175,13 +185,42 @@ describe('GOG response adapters', () => {
       ] }] } };
     const parent = { id: '1164193173', title: 'Blades of Time', downloads: response.downloads, expanded_dlcs: [child] };
     expect(parseProduct(child).productType).toBe('dlc');
-    const parentManifest = productManifest(parent, '1164193173', defaults, false);
+    const owned = new Set(['1164193173', '1613811126']);
+    const parentManifest = productManifest(parent, '1164193173', defaults, false, owned);
     expect(parentManifest.childIds).toEqual(['1613811126']);
     expect(parentManifest.files.every(file => file.gameId === '1164193173' && !file.key.startsWith('1613811126:'))).toBe(true);
-    expect(productManifest(child, '1613811126', defaults, true).files).toMatchObject([
+    expect(productManifest(child, '1613811126', defaults, true, owned).files).toMatchObject([
       { gameId: '1613811126', category: 'main', selected: true }
     ]);
-    expect(productManifest(child, '1613811126', { ...defaults, dlc: false }, true).files[0]?.selected).toBe(false);
+    expect(productManifest(child, '1613811126', { ...defaults, dlc: false }, true, owned).files[0]?.selected).toBe(false);
+  });
+  test('identifies a DLC-only GOG bundle without treating its components as parent-owned files', () => {
+    const bundle = { id: '1346262377', title: 'Blasphemous 2 - Complete Sacrament Edition Bundle',
+      slug: 'blasphemous_2_complete_sacrament_edition_bundle', type: 'game', downloads: {},
+      expanded_dlcs: [{ id: 1142921539 }, { id: 1510544469 }, { id: 1641729393 }] };
+    expect(parseProduct(bundle).productType).toBe('bundle');
+    expect(productManifest(bundle, bundle.id, defaults, false, new Set([bundle.id, '1142921539', '1510544469', '1641729393'])))
+      .toMatchObject({ files: [], childIds: ['1142921539', '1510544469', '1641729393'] });
+  });
+  test('owned base bonuses survive DLC filtering while unowned expanded bonus content does not', () => {
+    const base = { downloads: { bonus_content: [{ id: 1993, name: 'manual (55 pages)', type: 'manuals', total_size: 1048576, files: [
+      { id: 1993, size: 1048576, downlink: 'https://api.gog.com/products/1207658806/downlink/product_bonus/1993' }
+    ] }] }, expanded_dlcs: [{ id: 1438925691, title: 'Agony Soundtrack', downloads: { bonus_content: [{ id: 90287, files: [
+      { id: 90287, size: 912261120, downlink: 'https://api.gog.com/products/1438925691/downlink/product_bonus/90287' }
+    ] }] } }] };
+    const unowned = productManifest(base, '1207658806', defaults, false, new Set(['1207658806']));
+    expect(unowned.files.map(file => file.key)).toEqual(['1207658806:bonus_content:1993:1993']);
+    expect(unowned.childIds).toEqual([]);
+    expect(productManifest(base, '1207658806', defaults, false, new Set(['1207658806', '1438925691'])).childIds).toEqual(['1438925691']);
+  });
+  test('normalizes all seven Beyond Divinity base-product Extras', () => {
+    const names = ['manual (55 pages)', 'HD wallpapers', 'avatars', "'Child of the Chaos' novella", 'in-game soundtrack',
+      'official strategy guide', 'The Lady, The Mage, and The Knight tech demo'];
+    const raw = { downloads: { bonus_content: names.map((name, index) => ({ id: 1993 + 10 * index, name, type: 'bonus', total_size: 1048576,
+      files: [{ id: 1993 + 10 * index, size: 1048576, downlink: `https://api.gog.com/products/1207658806/downlink/product_bonus/${1993 + 10 * index}` }] })) } };
+    const files = productManifest(raw, '1207658806', defaults, false, new Set(['1207658806'])).files;
+    expect(files.map(file => file.name)).toEqual(names);
+    expect(files.every(file => file.category === 'extras' && file.gameId === '1207658806')).toBe(true);
   });
   test('selects the intersection of multiple systems, English, and enabled categories', () => {
     const config = { ...defaults, platforms: ['windows', 'linux'] as (typeof defaults.platforms), languages: ['English'], extras: false };
