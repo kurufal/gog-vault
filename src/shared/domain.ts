@@ -19,9 +19,11 @@ export interface DownloadFailure {
 export interface Game {
   id: string; title: string; slug: string; cover: string; background: string; logo?: string;
   productType?: ProductType;
+  bonusOnly?: boolean;
+  bonusCoverage?: number | null;
   parentProduct?: { id: string; title: string };
   dlcChildren?: { id: string; title: string; selected: boolean; files: number; bytes: number; completion: number | null;
-    status: VaultStatus; cover: string; platform: Platform[]; updateAvailable: boolean; pending: boolean }[];
+    status: VaultStatus; cover: string; platform: Platform[]; updateAvailable: boolean; pending: boolean; bonusOnly: boolean }[];
   availability?: Partial<Record<Category, 'none' | 'off' | 'selected'>>;
   folderPath?: string;
   linkedFiles?: boolean;
@@ -107,8 +109,9 @@ export function statusFor(files: RemoteFile[], jobs: Job[], changed: boolean, ha
     return other.every(file => file.verified || file.matched) ? 'Needs Verification' : 'Incomplete';
   }
   if (selected.some(file => !file.verified && !file.matched)) return 'Incomplete';
-  if (main === 100 && selected.length && selected.every(file => file.verified)) return 'Vaulted';
-  if (main === 100 && selected.length && selected.every(file => file.verified || file.matched)) return 'Needs Verification';
+  const contentComplete = main === 100 || !files.some(file => file.category === 'main');
+  if (contentComplete && selected.length && selected.every(file => file.verified)) return 'Vaulted';
+  if (contentComplete && selected.length && selected.every(file => file.verified || file.matched)) return 'Needs Verification';
   return 'Incomplete';
 }
 export function transition(from: JobState, to: JobState): boolean {

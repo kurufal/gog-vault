@@ -78,6 +78,14 @@ describe('archive state', () => {
     expect(completion([identified], 'main')).toBe(100);
     expect(statusFor([identified], [], false, true)).toBe('Needs Verification');
   });
+  test('archives products with only bonus downloads without relaxing installer requirements', () => {
+    const extra = file({ category: 'extras', verified: true });
+    expect(statusFor([extra], [], false, true)).toBe('Vaulted');
+    expect(statusFor([{ ...extra, verified: false, matched: true }], [], false, true)).toBe('Needs Verification');
+    expect(statusFor([extra], [], false, false)).toBe('Not Downloaded');
+    expect(statusFor([{ ...extra, selected: false }], [], false, true)).toBe('Not Downloaded');
+    expect(statusFor([file({ selected: false }), extra], [], false, true)).toBe('Incomplete');
+  });
   test('identifies only a complete hashed older multipart set', () => {
     const files = [file(), file({ key: 'part-one' }), file({ key: 'part-two' })];
     const hash = 'a'.repeat(64);

@@ -201,6 +201,14 @@ describe('GOG response adapters', () => {
     expect(parseProduct(bundle).productType).toBe('bundle');
     expect(productManifest(bundle, bundle.id, defaults, false, new Set([bundle.id, '1142921539', '1510544469', '1641729393'])))
       .toMatchObject({ files: [], childIds: ['1142921539', '1510544469', '1641729393'] });
+    for (const [id, type, name] of [['1142921539', 'audio', 'Soundtrack (MP3)'], ['1641729393', 'artworks', 'Artbook (PDF)']] as const) {
+      const child = { downloads: { bonus_content: [{ id: 95660, name, type, files: [
+        { id: 95661, size: 40, downlink: `https://api.gog.com/products/${id}/downlink/product_bonus/95661` }
+      ] }] } };
+      expect(productManifest(child, id, defaults, true, new Set([id])).files).toMatchObject([
+        { gameId: id, category: 'extras', selected: false, provenance: { bonusType: type } }
+      ]);
+    }
   });
   test('owned base bonuses survive DLC filtering while unowned expanded bonus content does not', () => {
     const base = { downloads: { bonus_content: [{ id: 1993, name: 'manual (55 pages)', type: 'manuals', total_size: 1048576, files: [

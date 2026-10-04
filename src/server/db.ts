@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, normalize } from 'node:path';
-import { defaults, completion, contentAvailability, selectedChildCompletion, desiredFingerprint, manifestFingerprint, platformStates, previousInstallerSet, reconcileLocalGameState, type Game, type Job, type RemoteFile, type MediaAsset, type Settings, type JobState } from '../shared/domain';
+import { defaults, completion, contentAvailability, selectedChildCompletion, desiredFingerprint, manifestFingerprint, platformStates, previousInstallerSet, reconcileLocalGameState, statusFor, type Game, type Job, type RemoteFile, type MediaAsset, type Settings, type JobState } from '../shared/domain';
 import { resolveLibraryLandscapeArtwork } from '../shared/media';
 import { migrate, reconcileDlcRecords } from './migrations';
 
@@ -188,8 +188,15 @@ export function gameById(id: string, includeChildren = true): Game | null {
     JOIN games child ON child.id=relation.child_product_id WHERE relation.parent_product_id=? AND relation.relationship_type='dlc' ORDER BY child.title COLLATE NOCASE`)
     .all(id) as { id: string; title: string; selected: number }[] : [];
   const productType = row.product_type === 'game' && childRows.length && /(?:^|[_-])bundle$/i.test(row.slug) ? 'bundle' : row.product_type;
+  const bonusOnly = files.length > 0 && files.every(file => file.category === 'extras');
+  if (bonusOnly) archive.overallStatus = statusFor(files.map(file => ({ ...file, selected: true })), jobsFor(id), changed,
+    !!local?.folder || borrowed.count > 0, prior);
   const filelessBundle = productType === 'bundle' && files.length === 0;
   const childStates = childRows.map(child => ({ ...child, game: gameById(child.id, false)!, files: filesFor(child.id) }));
+  const bonusFiles = [...files, ...childStates.flatMap(child => child.files)].filter(file => file.category === 'extras' && !file.unavailable);
+  const bonusCoverage = !bonusFiles.length ? null : bonusFiles.every(file => file.verified) ? 100
+    : Math.min(99, Math.round(100 * bonusFiles.reduce((sum, file) =>
+      sum + (file.verified ? Math.max(1, file.size) : 0), 0) / bonusFiles.reduce((sum, file) => sum + Math.max(1, file.size), 0)));
   const selectedChildren = childStates.filter(child => child.selected);
   const childProgress = childStates.map(child => ({ selected: !!child.selected, files: child.files.map(file =>
     child.game.archive?.updateState === 'manifest_changed' && child.game.status === 'Vaulted' && file.category === 'main' && file.selected
@@ -198,6 +205,8 @@ export function gameById(id: string, includeChildren = true): Game | null {
   const legacyDlc = files.filter(file => file.category === 'dlc');
   const selectedChildFiles = childProgress.filter(child => child.selected).flatMap(child => child.files.filter(file =>
     file.selected && !file.unavailable && (filelessBundle || file.category === 'main')));
+  const bundleFiles = filelessBundle ? childProgress.flatMap(child => child.files.filter(file =>
+    !file.unavailable && (file.category === 'extras' || child.selected && file.selected))) : [];
   const dlcCompletion = filelessBundle ? selectedChildCompletion([{ selected: true, files: selectedChildFiles.map(file => ({ ...file, category: 'main' as const })) }])
     : childCompletion === null ? completion(files, 'dlc') : selectedChildCompletion([
     ...childProgress, { selected: true, files: legacyDlc.map(file => ({ ...file, category: 'main' as const })) }]);
@@ -208,13 +217,13 @@ export function gameById(id: string, includeChildren = true): Game | null {
     selectedFiles.reduce((sum, file) => sum + Math.max(1, file.size), 0));
   if (selectedChildren.length && (dlcCompletion === null || dlcCompletion < 100) && archive.overallStatus === 'Vaulted') archive.overallStatus = 'Incomplete';
   if (selectedChildren.length && dlcCompletion === 100 && selectedChildren.some(child => child.game.status === 'Needs Verification') && archive.overallStatus === 'Vaulted') archive.overallStatus = 'Needs Verification';
-  if (filelessBundle && selectedChildFiles.length) {
+  if (filelessBundle && bundleFiles.length) {
     const activeChild = selectedChildren.find(child => ['Queued', 'Downloading', 'Paused', 'Verifying', 'Error'].includes(child.game.status));
-    archive.overallStatus = activeChild?.game.status || (selectedChildFiles.every(file => file.verified) ? 'Vaulted'
-      : selectedChildFiles.every(file => file.verified || file.matched) ? 'Needs Verification'
-      : selectedChildFiles.some(file => file.verified || file.matched) ? 'Incomplete' : 'Not Downloaded');
-    archive.verificationState = selectedChildFiles.every(file => file.verified) ? 'verified'
-      : selectedChildFiles.some(file => file.verified || file.matched) ? 'identified' : 'missing';
+    archive.overallStatus = activeChild?.game.status || (bundleFiles.every(file => file.verified) ? 'Vaulted'
+      : bundleFiles.every(file => file.verified || file.matched) ? 'Needs Verification'
+      : bundleFiles.some(file => file.verified || file.matched) ? 'Incomplete' : 'Not Downloaded');
+    archive.verificationState = bundleFiles.every(file => file.verified) ? 'verified'
+      : bundleFiles.some(file => file.verified || file.matched) ? 'identified' : 'missing';
   }
   if (selectedChildren.some(child => child.game.archive?.updateState === 'manifest_changed' || child.game.status === 'Update Available')) archive.updateState = 'manifest_changed';
   archive.dlc = dlcCompletion;
@@ -223,11 +232,12 @@ export function gameById(id: string, includeChildren = true): Game | null {
     ? selectedChildren.length || legacyDlc.some(file => file.selected) ? 'selected' as const : 'off' as const
     : contentAvailability(files, 'dlc'), extras: contentAvailability(files, 'extras') };
   const logo = (db.query("SELECT url FROM media_assets WHERE game_id=? AND role='logo' LIMIT 1").get(id) as { url: string } | null)?.url || '';
-  return { id, title: row.title, slug: row.slug, productType, parentProduct: parent || undefined,
+  return { id, title: row.title, slug: row.slug, productType, bonusOnly, bonusCoverage, parentProduct: parent || undefined,
     dlcChildren: childStates.map(child => ({ id: child.id, title: child.title, selected: !!child.selected,
-      files: child.files.filter(file => file.category === 'main').length, bytes: child.files.filter(file => file.category === 'main').reduce((sum, file) => sum + file.size, 0),
+      files: child.files.length, bytes: child.files.reduce((sum, file) => sum + file.size, 0),
       completion: child.game.completion.main, status: child.game.status, cover: child.game.cover, platform: child.game.platforms,
-      updateAvailable: child.game.archive?.updateState === 'manifest_changed', pending: child.files.some(file => file.selected && !file.verified && !file.matched && !file.unavailable) })), availability, background: row.background,
+      updateAvailable: child.game.archive?.updateState === 'manifest_changed', pending: child.files.some(file => file.selected && !file.verified && !file.matched && !file.unavailable),
+      bonusOnly: !!child.game.bonusOnly })), availability, background: row.background,
     hiddenFromLibrary: !!row.hidden_from_library,
     logo, cover: resolveLibraryLandscapeArtwork({ cover: row.cover, background: row.background, logo }),
     releaseDate: row.release_date, platforms: JSON.parse(row.platforms), languages: JSON.parse(row.languages),

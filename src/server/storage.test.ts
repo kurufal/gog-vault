@@ -787,12 +787,53 @@ test('an existing DLC-only bundle reports its archived components without invent
     category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5,
     downlink: 'https://api.gog.com/soundtrack', selected: false, verified: false }]);
   linkDlcProducts('sacrament-bundle', ['sacrament-dlc', 'sacrament-soundtrack']);
+  expect(gameById('sacrament-soundtrack')).toMatchObject({ productType: 'dlc', bonusOnly: true,
+    completion: { main: null, extras: null }, bonusCoverage: 0, status: 'Not Downloaded' });
+  upsertGame({ id: 'standalone-bonus', title: 'Standalone Bonus' });
+  replaceFiles('standalone-bonus', [{ key: 'standalone-bonus:extra:1', gameId: 'standalone-bonus', name: 'bonus.pdf',
+    category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 400,
+    downlink: 'https://api.gog.com/bonus', selected: false, verified: false }]);
+  expect(gameById('standalone-bonus')).toMatchObject({ productType: 'game', bonusOnly: true, bonusCoverage: 0 });
   expect(gameById('sacrament-bundle')).toMatchObject({ productType: 'bundle', parentProduct: undefined,
-    status: 'Vaulted', completion: { main: null, dlc: 100 }, dlcChildren: [{ id: 'sacrament-dlc', selected: true, pending: false },
-      { id: 'sacrament-soundtrack', selected: true, pending: false }] });
+    status: 'Incomplete', bonusCoverage: 0, completion: { main: null, dlc: 100 }, dlcChildren: [{ id: 'sacrament-dlc', selected: true, pending: false, bonusOnly: false },
+      { id: 'sacrament-soundtrack', selected: true, pending: false, bonusOnly: true, files: 1, bytes: 5 }] });
   db.query('UPDATE remote_files SET selected=1 WHERE game_id=?').run('sacrament-soundtrack');
   expect(gameById('sacrament-bundle')).toMatchObject({ status: 'Incomplete', completion: { dlc: 38 },
     dlcChildren: [{ id: 'sacrament-dlc', pending: false }, { id: 'sacrament-soundtrack', pending: true }] });
+  await mkdir(join(root, 'Original Soundtrack'), { recursive: true });
+  await writeFile(join(root, 'Original Soundtrack', 'soundtrack.zip'), 'bonus');
+  mapVaultGame('sacrament-soundtrack', 'Original Soundtrack');
+  saveLocalGame('sacrament-soundtrack', { localSize: 5 });
+  saveFileState('sacrament-soundtrack', 'sacrament-soundtrack:extra:1', { matched: true, verified: true, name: 'soundtrack.zip', verifiedSize: 5 });
+  expect(gameById('sacrament-soundtrack')).toMatchObject({ productType: 'dlc', bonusOnly: true, status: 'Vaulted', bonusCoverage: 100,
+    completion: { main: null, extras: 100 } });
+  db.query('UPDATE remote_files SET selected=0 WHERE game_id=?').run('sacrament-soundtrack');
+  expect(gameById('sacrament-soundtrack')).toMatchObject({ status: 'Vaulted', bonusCoverage: 100, completion: { extras: null } });
+  expect(gameById('sacrament-bundle')).toMatchObject({ status: 'Vaulted', completion: { dlc: 100 } });
+  replaceFiles('sacrament-soundtrack', [
+    { key: 'sacrament-soundtrack:extra:1', gameId: 'sacrament-soundtrack', name: 'soundtrack.zip', category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5, downlink: 'https://api.gog.com/soundtrack', selected: false, verified: false },
+    { key: 'sacrament-soundtrack:extra:2', gameId: 'sacrament-soundtrack', name: 'soundtrack-wav.zip', category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5, downlink: 'https://api.gog.com/soundtrack-wav', selected: false, verified: false }
+  ]);
+  expect(gameById('sacrament-soundtrack')).toMatchObject({ status: 'Incomplete', bonusCoverage: 50 });
+  expect(gameById('sacrament-bundle')).toMatchObject({ status: 'Incomplete', bonusCoverage: 50 });
+  replaceFiles('standalone-bonus', [
+    { key: 'standalone-bonus:extra:1', gameId: 'standalone-bonus', name: 'bonus.pdf', category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 400, downlink: 'https://api.gog.com/bonus', selected: false, verified: false },
+    { key: 'standalone-bonus:extra:2', gameId: 'standalone-bonus', name: 'bonus-music.zip', category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 400, downlink: 'https://api.gog.com/bonus-music', selected: false, verified: false }
+  ]);
+  await mkdir(join(root, 'Standalone Bonus'), { recursive: true });
+  await writeFile(join(root, 'Standalone Bonus', 'bonus.pdf'), 'book'.repeat(100));
+  mapVaultGame('standalone-bonus', 'Standalone Bonus');
+  saveFileState('standalone-bonus', 'standalone-bonus:extra:1', { matched: true, verified: true, name: 'bonus.pdf', verifiedSize: 400 });
+  expect(gameById('standalone-bonus')).toMatchObject({ productType: 'game', status: 'Incomplete', bonusCoverage: 50 });
+  await writeFile(join(root, 'Standalone Bonus', 'bonus-music.zip'), 'song'.repeat(100));
+  saveFileState('standalone-bonus', 'standalone-bonus:extra:2', { matched: true, verified: true, name: 'bonus-music.zip', verifiedSize: 400 });
+  expect(gameById('standalone-bonus')).toMatchObject({ productType: 'game', status: 'Vaulted', bonusCoverage: 100 });
+  replaceFiles('standalone-bonus', [
+    { key: 'standalone-bonus:extra:1', gameId: 'standalone-bonus', name: 'bonus.pdf', category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 400, downlink: 'https://api.gog.com/bonus', selected: false, verified: false },
+    { key: 'standalone-bonus:extra:2', gameId: 'standalone-bonus', name: 'bonus-music.zip', category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 400, downlink: 'https://api.gog.com/bonus-music', selected: false, verified: false },
+    { key: 'standalone-bonus:extra:3', gameId: 'standalone-bonus', name: 'bonus-readme.txt', category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 1, downlink: 'https://api.gog.com/bonus-readme', selected: false, verified: false }
+  ]);
+  expect(gameById('standalone-bonus')).toMatchObject({ status: 'Incomplete', bonusCoverage: 99 });
 });
 test('importing a child DLC updates its parent without a second local installer', async () => {
   const root = join(directory, 'dlc-import-vault');
