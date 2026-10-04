@@ -32,8 +32,8 @@ test('a queued download uses its saved manifest after refresh', async () => {
       expect(url).toBe('https://embed.gog.com/user/data/games');
       return { owned: ['42', '43', '44', '45', '46', '47', '50', '51', '60', '61'] };
     } }));
-  const { activeVault, db, filesFor, upsertGame, replaceFiles, saveSettings, linkDlcProducts } = await import('./db');
-  const { command, enqueue, enqueueWithChildren, shutdownQueue } = await import('./queue');
+  const { activeVault, db, filesFor, gameById, upsertGame, replaceFiles, saveSettings, linkDlcProducts } = await import('./db');
+  const { command, enqueue, enqueueWithChildren, missingFilesForParent, shutdownQueue } = await import('./queue');
   const { refreshOwnedProducts, saveProductManifest } = await import('./gog/library');
   try {
     saveSettings({ vaultPath: dir });
@@ -151,6 +151,17 @@ test('a queued download uses its saved manifest after refresh', async () => {
       }, 10);
     });
     expect(downloaded.filter(file => file.gameId === '51')).toHaveLength(1);
+    upsertGame({ id: '52', title: 'Bonus bundle', slug: 'bonus_bundle' });
+    upsertGame({ id: '53', title: 'Soundtrack', productType: 'dlc' });
+    replaceFiles('53', [{ ...original, gameId: '53', key: '53:bonus', category: 'extras', selected: false }]);
+    linkDlcProducts('52', ['53']);
+    expect(missingFilesForParent(gameById('52')!, '53').map(file => file.key)).toEqual(['53:bonus']);
+    expect(missingFilesForParent(gameById('50')!, '53')).toEqual([]);
+    const bonusJobs = enqueueWithChildren('52');
+    expect(bonusJobs).toHaveLength(1);
+    expect(db.query('SELECT game_id FROM download_jobs WHERE id=?').get(bonusJobs[0])).toEqual({ game_id: '53' });
+    expect(db.query('SELECT file_key FROM download_files WHERE job_id=?').get(bonusJobs[0])).toEqual({ file_key: '53:bonus' });
+    expect(filesFor('53')[0]?.selected).toBe(true);
     upsertGame({ id: '60', title: 'Legacy base game' });
     upsertGame({ id: '61', title: 'Legacy queued DLC' });
     replaceFiles('61', [{ ...original, gameId: '61', key: '61:installer' }]);

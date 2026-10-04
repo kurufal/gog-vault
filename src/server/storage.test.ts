@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 import { createHash } from 'node:crypto';
+import { showLibraryCard } from '../shared/domain';
 import { uniqueMedia } from '../shared/media';
 
 const directory = await mkdtemp(join(tmpdir(), 'gog-vault-adoption-'));
@@ -350,6 +351,26 @@ test('hidden games remain owned and hidden after metadata refresh', () => {
   expect(games().length).toBe(owned);
   setHiddenGames(['hide-fixture'], false);
   expect(gameById('hide-fixture')?.hiddenFromLibrary).toBe(false);
+});
+test('confirmed empty GOG entitlements are hidden by default without losing ownership or parent links', async () => {
+  const root = join(directory, 'empty-entitlement-vault');
+  await mkdir(join(root, 'Mapped Copy'), { recursive: true });
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'empty-bundle', title: 'Dino Crisis Bundle' });
+  upsertGame({ id: 'empty-copy', title: 'Divinity - free copy' });
+  expect(gameById('empty-bundle')).toMatchObject({ autoHiddenFromLibrary: false });
+  replaceFiles('empty-bundle', []);
+  replaceFiles('empty-copy', []);
+  expect(gameById('empty-bundle')).toMatchObject({ autoHiddenFromLibrary: true, hiddenFromLibrary: false });
+  expect(gameById('empty-copy')).toMatchObject({ autoHiddenFromLibrary: true, hiddenFromLibrary: false });
+  expect(games().map(game => game.id)).toContain('empty-bundle');
+  setHiddenGames(['empty-copy'], false);
+  expect(gameById('empty-copy')?.autoHiddenFromLibrary).toBe(true);
+  mapVaultGame('empty-copy', 'Mapped Copy');
+  expect(gameById('empty-copy')?.autoHiddenFromLibrary).toBe(false);
+  upsertGame({ id: 'bundle-child', title: 'Playable DLC' });
+  linkDlcProducts('empty-bundle', ['bundle-child']);
+  expect(gameById('empty-bundle')).toMatchObject({ autoHiddenFromLibrary: false, dlcChildren: [{ id: 'bundle-child' }] });
 });
 test('Beyond: Two Souls remains owned but archives only in its selected vault', async () => {
   const first = join(directory, 'beyond-vault-a');
@@ -787,6 +808,8 @@ test('an existing DLC-only bundle reports its archived components without invent
     category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5,
     downlink: 'https://api.gog.com/soundtrack', selected: false, verified: false }]);
   linkDlcProducts('sacrament-bundle', ['sacrament-dlc', 'sacrament-soundtrack']);
+  upsertGame({ id: 'sacrament-base', title: 'Base Game' });
+  linkDlcProducts('sacrament-base', ['sacrament-soundtrack']);
   expect(gameById('sacrament-soundtrack')).toMatchObject({ productType: 'dlc', bonusOnly: true,
     completion: { main: null, extras: null }, bonusCoverage: 0, status: 'Not Downloaded' });
   upsertGame({ id: 'standalone-bonus', title: 'Standalone Bonus' });
@@ -794,9 +817,13 @@ test('an existing DLC-only bundle reports its archived components without invent
     category: 'extras', platform: 'windows', language: 'Neutral', version: '1', size: 400,
     downlink: 'https://api.gog.com/bonus', selected: false, verified: false }]);
   expect(gameById('standalone-bonus')).toMatchObject({ productType: 'game', bonusOnly: true, bonusCoverage: 0 });
+  expect(games().filter(showLibraryCard).map(game => game.id)).toEqual(expect.arrayContaining(['sacrament-base', 'sacrament-bundle', 'sacrament-dlc', 'standalone-bonus']));
+  expect(games().filter(showLibraryCard).map(game => game.id)).not.toContain('sacrament-soundtrack');
+  expect(gameById('sacrament-soundtrack')).toMatchObject({ parentProduct: { id: 'sacrament-base' } });
   expect(gameById('sacrament-bundle')).toMatchObject({ productType: 'bundle', parentProduct: undefined,
-    status: 'Incomplete', bonusCoverage: 0, completion: { main: null, dlc: 100 }, dlcChildren: [{ id: 'sacrament-dlc', selected: true, pending: false, bonusOnly: false },
-      { id: 'sacrament-soundtrack', selected: true, pending: false, bonusOnly: true, files: 1, bytes: 5 }] });
+    status: 'Incomplete', bonusCoverage: 0, completion: { main: null, dlc: 38 }, archive: { selectedCompletion: 38, remoteSelectedBytes: 8 },
+    dlcChildren: [{ id: 'sacrament-dlc', selected: true, pending: false, bonusOnly: false },
+      { id: 'sacrament-soundtrack', selected: true, pending: true, bonusOnly: true, files: 1, bytes: 5 }] });
   db.query('UPDATE remote_files SET selected=1 WHERE game_id=?').run('sacrament-soundtrack');
   expect(gameById('sacrament-bundle')).toMatchObject({ status: 'Incomplete', completion: { dlc: 38 },
     dlcChildren: [{ id: 'sacrament-dlc', pending: false }, { id: 'sacrament-soundtrack', pending: true }] });

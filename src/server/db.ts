@@ -187,6 +187,7 @@ export function gameById(id: string, includeChildren = true): Game | null {
   const childRows = includeChildren ? db.query(`SELECT child.id,child.title,relation.selected FROM product_relationships relation
     JOIN games child ON child.id=relation.child_product_id WHERE relation.parent_product_id=? AND relation.relationship_type='dlc' ORDER BY child.title COLLATE NOCASE`)
     .all(id) as { id: string; title: string; selected: number }[] : [];
+  const autoHiddenFromLibrary = !!row.manifest_hash && !files.length && !childRows.length && !local?.folder && !local?.local_size && !borrowed.count;
   const productType = row.product_type === 'game' && childRows.length && /(?:^|[_-])bundle$/i.test(row.slug) ? 'bundle' : row.product_type;
   const bonusOnly = files.length > 0 && files.every(file => file.category === 'extras');
   if (bonusOnly) archive.overallStatus = statusFor(files.map(file => ({ ...file, selected: true })), jobsFor(id), changed,
@@ -198,15 +199,15 @@ export function gameById(id: string, includeChildren = true): Game | null {
     : Math.min(99, Math.round(100 * bonusFiles.reduce((sum, file) =>
       sum + (file.verified ? Math.max(1, file.size) : 0), 0) / bonusFiles.reduce((sum, file) => sum + Math.max(1, file.size), 0)));
   const selectedChildren = childStates.filter(child => child.selected);
-  const childProgress = childStates.map(child => ({ selected: !!child.selected, files: child.files.map(file =>
+  const childProgress = childStates.map(child => ({ selected: !!child.selected, bonusOnly: !!child.game.bonusOnly, files: child.files.map(file =>
     child.game.archive?.updateState === 'manifest_changed' && child.game.status === 'Vaulted' && file.category === 'main' && file.selected
       ? { ...file, verified: true } : file) }));
   const childCompletion = selectedChildCompletion(childProgress);
   const legacyDlc = files.filter(file => file.category === 'dlc');
   const selectedChildFiles = childProgress.filter(child => child.selected).flatMap(child => child.files.filter(file =>
-    file.selected && !file.unavailable && (filelessBundle || file.category === 'main')));
-  const bundleFiles = filelessBundle ? childProgress.flatMap(child => child.files.filter(file =>
-    !file.unavailable && (file.category === 'extras' || child.selected && file.selected))) : [];
+    !file.unavailable && (file.selected || filelessBundle && child.bonusOnly && file.category === 'extras') &&
+    (filelessBundle || file.category === 'main')).map(file => filelessBundle ? { ...file, selected: true } : file));
+  const bundleFiles = filelessBundle ? selectedChildFiles : [];
   const dlcCompletion = filelessBundle ? selectedChildCompletion([{ selected: true, files: selectedChildFiles.map(file => ({ ...file, category: 'main' as const })) }])
     : childCompletion === null ? completion(files, 'dlc') : selectedChildCompletion([
     ...childProgress, { selected: true, files: legacyDlc.map(file => ({ ...file, category: 'main' as const })) }]);
@@ -236,9 +237,11 @@ export function gameById(id: string, includeChildren = true): Game | null {
     dlcChildren: childStates.map(child => ({ id: child.id, title: child.title, selected: !!child.selected,
       files: child.files.length, bytes: child.files.reduce((sum, file) => sum + file.size, 0),
       completion: child.game.completion.main, status: child.game.status, cover: child.game.cover, platform: child.game.platforms,
-      updateAvailable: child.game.archive?.updateState === 'manifest_changed', pending: child.files.some(file => file.selected && !file.verified && !file.matched && !file.unavailable),
+      updateAvailable: child.game.archive?.updateState === 'manifest_changed', pending: child.files.some(file =>
+        !file.unavailable && !file.verified && !file.matched && (file.selected || filelessBundle && !!child.game.bonusOnly && file.category === 'extras')),
       bonusOnly: !!child.game.bonusOnly })), availability, background: row.background,
     hiddenFromLibrary: !!row.hidden_from_library,
+    autoHiddenFromLibrary,
     logo, cover: resolveLibraryLandscapeArtwork({ cover: row.cover, background: row.background, logo }),
     releaseDate: row.release_date, platforms: JSON.parse(row.platforms), languages: JSON.parse(row.languages),
     firstSeen: row.first_seen, refreshedAt: row.refreshed_at, scannedAt: local?.scanned_at || '', folder: local?.folder || '', linkedFiles: borrowed.count > 0,

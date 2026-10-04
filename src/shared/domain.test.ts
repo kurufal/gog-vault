@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
-import { bulkDownloadWarningBytes, committedNumber, completion, contentAvailability, desiredFingerprint, isNeutralLanguage, manifestFingerprint, matchesManifestFilters, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, selectedChildCompletion, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
+import { bulkDownloadWarningBytes, committedNumber, completion, contentAvailability, desiredFingerprint, isNeutralLanguage, manifestFingerprint, matchesManifestFilters, normalizeTitle, platformStates, previousInstallerSet, reconcileLocalGameState, removeUnresolvedFolder, safeName, scopedDownloadPreview, selectedChildCompletion, showLibraryCard, statusFor, transition, usedCapacity, visibilityMatches, type RemoteFile } from './domain';
 import { withinRoot } from '../server/paths';
 import { scoreFolder } from '../server/matching';
 import { isLibraryLandscape, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from './media';
@@ -49,6 +49,13 @@ test('manifest language filters retain neutral Extras without bypassing platform
   expect(matchesManifestFilters(file({ language: 'French' }), ['windows'], ['English'])).toBe(false);
   expect(matchesManifestFilters(file({ language: 'French' }), [], [])).toBe(true);
   expect(isNeutralLanguage('All languages')).toBe(true);
+});
+test('linked bonus products live under their parent while standalone goodies and playable DLC keep cards', () => {
+  const parentProduct = { id: 'base', title: 'Base Game' };
+  expect(showLibraryCard({ bonusOnly: true, parentProduct })).toBe(false);
+  expect(showLibraryCard({ bonusOnly: true })).toBe(true);
+  expect(showLibraryCard({ bonusOnly: false, parentProduct })).toBe(true);
+  expect(showLibraryCard({ bonusOnly: false })).toBe(true);
 });
 describe('vault paths and names', () => {
   test('sanitizes Windows and SMB reserved names', () => {
@@ -168,12 +175,16 @@ test('review count drops immediately after linking or ignoring a folder', () => 
   expect(unresolved).toHaveLength(4);
 });
 test('Library visibility scopes search without changing owned game counts', () => {
-  const owned = [{ title: 'Agony', hiddenFromLibrary: true }, { title: 'Doom', hiddenFromLibrary: false }];
-  expect(owned).toHaveLength(2);
+  const owned = [{ title: 'Agony', hiddenFromLibrary: true }, { title: 'Doom', hiddenFromLibrary: false },
+    { title: 'Dino Crisis Bundle', autoHiddenFromLibrary: true, hiddenFromLibrary: false }];
+  expect(owned).toHaveLength(3);
   expect(owned.filter(game => visibilityMatches(game, 'Visible', ''))).toEqual([owned[1]]);
   expect(owned.filter(game => visibilityMatches(game, 'Hidden', 'ago'))).toEqual([owned[0]]);
   expect(owned.filter(game => visibilityMatches(game, 'Visible', 'ago'))).toEqual([]);
   expect(owned.filter(game => visibilityMatches(game, 'All', 'ago'))).toEqual([owned[0]]);
+  expect(owned.filter(game => visibilityMatches(game, 'Hidden', 'dino'))).toEqual([owned[2]]);
+  expect(owned.filter(game => visibilityMatches(game, 'Visible', 'dino'))).toEqual([]);
+  expect(owned.filter(game => visibilityMatches(game, 'All', 'dino'))).toEqual([owned[2]]);
 });
 test('platform icons distinguish available, selected and vaulted independently', () => {
   const files = (['windows', 'linux', 'mac'] as const).map((platform, index) => ({

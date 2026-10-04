@@ -1,7 +1,7 @@
 import { activeVault, db, activity, changeJob, filesFor, gameById, jobsFor, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { desiredFingerprint, transition, type DownloadFailure, type Job, type JobState, type RemoteFile } from '../shared/domain';
+import { desiredFingerprint, transition, type DownloadFailure, type Game, type Job, type JobState, type RemoteFile } from '../shared/domain';
 import { downloadFile, type DownloadVerification } from './transfer';
 import { folderName, gameFolder, scanGame, vaultPath } from './storage';
 import { archiveMedia } from './media';
@@ -63,6 +63,12 @@ export function enqueue(gameId: string) {
   activity(`${game.title} queued`); broadcast(); schedule();
   return job.id;
 }
+export function missingFilesForParent(game: Game, gameId: string): RemoteFile[] {
+  const bundleBonus = game.productType === 'bundle' && !filesFor(game.id).length &&
+    game.dlcChildren?.some(child => child.id === gameId && child.selected && child.bonusOnly);
+  return filesFor(gameId).filter(file => !file.unavailable && !file.verified && !file.matched &&
+    (file.selected || bundleBonus && file.category === 'extras'));
+}
 export function enqueueWithChildren(gameId: string) {
   if (!settings().vaultPath) throw new Error('Select a vault directory first');
   const game = gameById(gameId);
@@ -70,8 +76,11 @@ export function enqueueWithChildren(gameId: string) {
   const ids = [gameId, ...(game.dlcChildren || []).filter(child => child.selected).map(child => child.id)];
   const started: number[] = [];
   for (const id of new Set(ids)) {
-    if (!filesFor(id).some(file => file.selected && !file.verified && !file.matched) ||
-      jobsFor(id).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) continue;
+    if (jobsFor(id).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) continue;
+    const missing = missingFilesForParent(game, id);
+    if (!missing.length) continue;
+    for (const file of missing.filter(file => !file.selected))
+      db.query('UPDATE remote_files SET selected=1 WHERE game_id=? AND key=?').run(id, file.key);
     started.push(enqueue(id));
   }
   if (!started.length) throw new Error('No missing selected files to download');

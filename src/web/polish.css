@@ -22,7 +22,7 @@
 .queue-item .queue-data { gap: 8px; flex-wrap: wrap; }
 .queue-panel { width: min(420px, 100%); overflow: hidden; }
 .queue-items { padding: 8px 16px 20px; }
-.queue-item.activity-row { position: relative; isolation: isolate; display: flex; flex-direction: column; align-items: stretch; gap: 0; margin: 0; padding: 12px 4px 14px; border: 0; border-radius: 0; background: transparent; transition: background-color 140ms ease; }
+.queue-item.activity-row { position: relative; isolation: isolate; display: flex; flex-direction: column; align-items: stretch; gap: 0; margin: 0; padding: 12px 4px 14px; border: 0; border-radius: 0; background: transparent; text-shadow: 0 1px 3px #000, 0 2px 8px #000b; transition: background-color 140ms ease; }
 .queue-item.activity-row::before { content: ''; position: absolute; inset: 0; z-index: -1; background: #20313a; transform: scaleY(0); transform-origin: bottom; transition: transform 220ms ease; }
 .queue-item.activity-row:hover::before, .queue-item.activity-row:focus-within::before { transform: scaleY(1); }
 .queue-item.activity-row::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: url('/api/texture/line-BG.png') center / 100% 100% no-repeat; opacity: .72; }
@@ -40,8 +40,7 @@
 .activity-row-done .activity-filename:empty { display: none; }
 .activity-row .queue-progress { margin-top: 8px; }
 .activity-row .queue-data { margin-top: 3px; padding-top: 0; }
-.activity-hover-preview { position: absolute; z-index: 2; width: 55%; aspect-ratio: 16 / 9; left: var(--preview-left, 22%); top: 32px; pointer-events: none; border: 1px solid #7596a4; box-shadow: 0 16px 42px #000b; background: #10191f; opacity: 0; visibility: hidden; transform: translateY(25%) scaleY(1.08) rotate(var(--preview-rotate, 0deg)); transition: opacity 240ms ease, transform 240ms ease, left 180ms ease, visibility 240ms; }
-.activity-hover-preview { position: absolute; z-index: 2; width: 55%; aspect-ratio: 16 / 9; left: var(--preview-left, 22%); top: 32px; pointer-events: none; background: #10191f; opacity: 0; visibility: hidden; transform: translateY(25%) scaleY(1.08) rotate(var(--preview-rotate, 0deg)); transition: opacity 240ms ease, transform 240ms ease, left 180ms ease, visibility 240ms; }
+.activity-hover-preview { position: absolute; z-index: 2; width: 55%; aspect-ratio: 16 / 9; left: var(--preview-left, 22%); top: 14px; pointer-events: none; border: 1px solid #7596a4; box-shadow: 0 16px 42px #000b; background: #10191f; opacity: 0; visibility: hidden; transform: translateY(25%) scaleY(1.08) rotate(var(--preview-rotate, 0deg)); transition: opacity 240ms ease, transform 240ms ease, left 180ms ease, visibility 240ms; }
 .activity-row:hover::after, .activity-row:focus-within::after { opacity: 1; }
 .activity-hover-preview.visible { opacity: 1; visibility: visible; transform: translateY(0) scaleY(1) rotate(var(--preview-rotate, 0deg)); }
 .activity-hover-preview img { display: block; width: 100%; height: 100%; object-fit: cover; }
@@ -85,7 +84,10 @@
 .bundle-badge { border-color: #a59a6b; color: #f3dfaa; }
 .bonus-download-badge { border-color: #658fb2; color: #c2d9ec; }
 .dlc-card-badge { position: absolute; z-index: 3; top: 10px; right: 10px; margin: 0; background: #142b2de8; }
-.bonus-card-badge { position: absolute; z-index: 3; top: 32px; right: 10px; margin: 0; background: #142b2de8; }
+.bonus-card-badge { position: absolute; z-index: 3; top: 10px; right: 10px; margin: 0; background: #142b2de8; }
+.game-art:has(.bonus-card-badge) .dlc-card-badge { top: 32px; }
+.game-art:has(.bonus-card-badge) .update-tag { top: 32px; right: 10px; }
+.game-art:has(.bonus-card-badge):has(.dlc-card-badge) .update-tag { top: 54px; right: 10px; }
 .game-art:has(.dlc-card-badge) .update-tag { right: 55px; }
 .game-art:has(.bundle-badge) .update-tag { right: 83px; }
 .card-context-menu { position: fixed; z-index: 50; min-width: 160px; padding: 4px; border: 1px solid var(--line); background: var(--surface); box-shadow: 0 10px 28px #0009; }
@@ -96,7 +98,7 @@
 .dlc-child-row { display: grid; grid-template-columns: 64px 16px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-top: 1px solid var(--line); padding: 10px 0; }
 .dlc-child-row img { width: 64px; height: 36px; object-fit: cover; }
 .dlc-child-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
-.dlc-child-row small { color: var(--muted); }
+.dlc-child-row small:not(.dlc-badge) { color: var(--muted); }
 .dlc-child-row .text-button { white-space: nowrap; }
 @media (max-width: 620px) { .dlc-child-row { grid-template-columns: 48px 16px minmax(0, 1fr); } .dlc-child-row img { width: 48px; height: 30px; } .dlc-child-row .text-button { grid-column: 3; justify-self: start; } }
 .detail-more { position: relative; order: 10; }
@@ -194,7 +196,7 @@
 .dashboard-stats .stat { position: relative; min-width: 0; height: auto; min-height: 137px; border-radius: 0; box-shadow: 0 8px 20px #070d1399; overflow: hidden; }
 .dashboard-stats .stat::before, .dashboard-stats .stat::after { content: ''; position: absolute; left: 0; right: 0; height: 12px; pointer-events: none; background: url('/api/texture/line-BG.png') center top / 100% 2px no-repeat; filter: drop-shadow(0 1px 4px #ae63c680); transition: filter .2s; }
 .dashboard-stats .stat::before { top: 0; }
-.dashboard-stats .stat::after { bottom: 0; transform: rotate(180deg); }
+.dashboard-stats .stat::after { bottom: 0; background-position: center bottom; }
 .dashboard-stats .stat:hover { border-color: var(--line); box-shadow: 0 12px 26px #070d13bb; }
 .dashboard-stats .stat:hover::before, .dashboard-stats .stat:hover::after { filter: drop-shadow(0 1px 8px #c878e0b3); }
 .dashboard-stats .stat strong { font-size: 23px; overflow-wrap: anywhere; }
@@ -210,7 +212,7 @@
 .detail-cover { width: 190px; height: 107px; flex: 0 0 190px; }
 .game-card::before, .game-card::after { content: ''; position: absolute; left: 0; right: 0; height: 12px; z-index: 2; pointer-events: none; background: url('/api/texture/line-BG.png') center top / 100% 2px no-repeat; filter: drop-shadow(0 1px 4px #ae63c680); transition: filter .2s; }
 .game-card::before { top: 0; }
-.game-card::after { bottom: 0; transform: rotate(180deg); }
+.game-card::after { bottom: 0; background-position: center bottom; }
 .game-card:hover::before, .game-card:hover::after { filter: drop-shadow(0 1px 8px #c878e0b3); }
 .card-select, .list-select { width: 20px; height: 20px; accent-color: #d37db8; cursor: pointer; z-index: 5; }
 .card-select { position: absolute; top: 10px; left: 10px; margin: 0; outline: 2px solid #111c22aa; }

@@ -28,6 +28,7 @@ export interface Game {
   folderPath?: string;
   linkedFiles?: boolean;
   hiddenFromLibrary?: boolean;
+  autoHiddenFromLibrary?: boolean;
   releaseDate: string; platforms: Platform[]; languages: string[]; firstSeen: string;
   refreshedAt: string; scannedAt: string; folder: string; localSize: number;
   remoteSize: number; status: VaultStatus; manifestHash: string; archivedHash: string;
@@ -135,9 +136,12 @@ export interface MediaAsset {
 export function removeUnresolvedFolder(folders: string[], folder: string): string[] {
   return folders.filter(item => item !== folder);
 }
-export function visibilityMatches(game: Pick<Game, 'title' | 'hiddenFromLibrary'>, visibility: 'Visible' | 'Hidden' | 'All', search: string) {
-  return (visibility === 'All' || !!game.hiddenFromLibrary === (visibility === 'Hidden')) &&
+export function visibilityMatches(game: Pick<Game, 'title' | 'hiddenFromLibrary' | 'autoHiddenFromLibrary'>, visibility: 'Visible' | 'Hidden' | 'All', search: string) {
+  return (visibility === 'All' || (!!game.hiddenFromLibrary || !!game.autoHiddenFromLibrary) === (visibility === 'Hidden')) &&
     game.title.toLowerCase().includes(search.toLowerCase());
+}
+export function showLibraryCard(game: Pick<Game, 'bonusOnly' | 'parentProduct'>): boolean {
+  return !game.bonusOnly || !game.parentProduct;
 }
 export const bulkDownloadWarningBytes = 100 * 1024 ** 3;
 export function scopedDownloadPreview<T extends { id: string; bytes: number }>(items: readonly T[], visibleSelectedIds: ReadonlySet<string>, updateIds: ReadonlySet<string>, includeUpdates: boolean): T[] {

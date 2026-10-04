@@ -12,7 +12,7 @@ import { cancelScan, ignoreFolder, importPreview, linkAndScan, loadScanFolders, 
 import { enqueueImports, importCommand, importJobs, shutdownImports, startImports, subscribeImports } from './imports';
 import { cancelVerification, enqueueVerification, hasActiveVerification, removeVerification, verificationJobs } from './verification';
 import { archiveMedia, selectMedia } from './media';
-import { broadcast, command, enqueueWithChildren, schedule, shutdownQueue, startQueue, subscribe } from './queue';
+import { broadcast, command, enqueueWithChildren, missingFilesForParent, schedule, shutdownQueue, startQueue, subscribe } from './queue';
 
 const { token, host, port } = startupConfig();
 let playbackPort = port;
@@ -82,7 +82,7 @@ const app = new Elysia()
   .get('/api/library/download-preview', () => games().flatMap(game => {
     const ids = [game.id, ...(game.dlcChildren || []).filter(child => child.selected).map(child => child.id)];
     const missing = [...new Set(ids)].flatMap(id => jobsFor(id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))
-      ? [] : filesFor(id).filter(file => file.selected && !file.matched && !file.verified));
+      ? [] : missingFilesForParent(game, id));
     return missing.length ? [{ id: game.id, title: game.title, files: missing.length, bytes: missing.reduce((sum, file) => sum + file.size, 0) }] : [];
   }))
   .post('/api/library/download-missing', ({ body }) => {
