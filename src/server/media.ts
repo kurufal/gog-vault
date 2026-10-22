@@ -7,7 +7,7 @@ import { trustedGogUrl } from './gog/products';
 import { gameFolder, writeOfflineMetadata } from './storage';
 
 export function selectMedia(gameId: string, files: { key: string; selected: boolean }[]) {
-  const update = db.query("UPDATE media_assets SET selected=? WHERE game_id=? AND key=? AND (role IN ('screenshot','additionalArtwork') OR role='video' AND external=0)");
+  const update = db.query('UPDATE media_assets SET selected=? WHERE game_id=? AND key=?');
   db.transaction(() => { for (const file of files) update.run(Number(file.selected), gameId, file.key); })();
   return mediaFor(gameId);
 }
@@ -15,6 +15,7 @@ export function selectMedia(gameId: string, files: { key: string; selected: bool
 export async function archiveMedia(gameId: string) {
   const game = gameById(gameId);
   if (!game?.folder) throw new Error('Link a game folder before archiving media');
+  await writeOfflineMetadata(gameId);
   const folder = await gameFolder(game);
   const root = join(folder, '.gog-vault');
   await mkdir(root, { recursive: true });

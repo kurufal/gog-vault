@@ -1,8 +1,27 @@
 export type Category = 'main' | 'dlc' | 'extras' | 'patches' | 'languagePacks' | 'other';
-export type ProductType = 'game' | 'dlc' | 'bundle' | 'standalone_expansion' | 'bonus_content';
+export type ProductType = 'game' | 'dlc' | 'bundle' | 'standalone_expansion' | 'bonus_content' | 'unknown';
+export type LibraryShelf = 'collection' | 'products';
+export interface AccountShelf { ids: string[]; refreshedAt: string }
+export function libraryShelfGames<T extends { id: string }>(games: T[], shelf: LibraryShelf, collectionIds: readonly string[]): T[] {
+  if (shelf === 'products') return games;
+  const ids = new Set(collectionIds);
+  return games.filter(game => ids.has(game.id));
+}
 export type Platform = 'windows' | 'linux' | 'mac';
 export type JobState = 'queued' | 'downloading' | 'paused' | 'verifying' | 'complete' | 'error' | 'cancelled';
 export type VaultStatus = 'Not Downloaded' | 'Queued' | 'Downloading' | 'Paused' | 'Verifying' | 'Vaulted' | 'Update Available' | 'Needs Verification' | 'Incomplete' | 'Error';
+export const libraryStatusFilters = ['Vaulted', 'Missing', 'Incomplete', 'Downloading', 'Updates', 'Errors'] as const;
+export type LibraryStatusFilter = typeof libraryStatusFilters[number];
+export function toggleLibraryStatus(filters: readonly LibraryStatusFilter[], filter: LibraryStatusFilter | 'All'): LibraryStatusFilter[] {
+  return filter === 'All' ? [] : filters.includes(filter) ? filters.filter(value => value !== filter) : [...filters, filter];
+}
+export function libraryStatusMatches(game: Pick<Game, 'status' | 'archive'>, filters: readonly LibraryStatusFilter[]): boolean {
+  return !filters.length || filters.some(filter => filter === 'Missing' ? game.status === 'Not Downloaded'
+    : filter === 'Errors' ? game.status === 'Error'
+    : filter === 'Updates' ? game.status === 'Update Available' || game.archive?.updateState === 'manifest_changed'
+    : filter === 'Downloading' ? ['Queued', 'Downloading', 'Paused', 'Verifying'].includes(game.status)
+    : game.status === filter);
+}
 export interface RemoteFile {
   key: string; gameId: string; name: string; category: Category; platform: Platform;
   language: string; version: string; size: number; downlink: string; checksumUrl?: string;
@@ -19,9 +38,16 @@ export interface DownloadFailure {
 export interface Game {
   id: string; title: string; slug: string; cover: string; background: string; logo?: string;
   productType?: ProductType;
+  gogGameType?: string;
+  mediaStatus?: { images: { archived: number; total: number }; videos: { archived: number; total: number; external: number } };
   bonusOnly?: boolean;
   bonusCoverage?: number | null;
   parentProduct?: { id: string; title: string };
+  includedIn?: { id: string; title: string }[];
+  includedProducts?: { id: string; title: string; owned: boolean; selected: boolean; status?: VaultStatus; completion: number | null; pending: boolean }[];
+  inclusionsRefreshedAt?: string;
+  inclusionError?: string;
+  inclusionWarning?: boolean;
   dlcChildren?: { id: string; title: string; selected: boolean; files: number; bytes: number; completion: number | null;
     status: VaultStatus; cover: string; platform: Platform[]; updateAvailable: boolean; pending: boolean; bonusOnly: boolean }[];
   availability?: Partial<Record<Category, 'none' | 'off' | 'selected'>>;
@@ -44,10 +70,20 @@ export interface LocalGameState {
   updateState: 'manifest_changed' | 'unknown' | 'unchanged'; overallStatus: VaultStatus;
   localBytes: number; remoteSelectedBytes: number;
 }
+export interface ActivityFile { name: string; size: number; bytes: number; state: string }
+export function activityElapsed(startedAt: string | undefined, finishedAt: string | undefined, currentTime = Date.now()): number | null {
+  if (!startedAt) return null;
+  const start = Date.parse(startedAt);
+  const end = finishedAt ? Date.parse(finishedAt) : currentTime;
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+}
 export interface Job {
   id: number; gameId: string; state: JobState; createdAt: string; updatedAt: string;
   error: string; currentFile: string; bytes: number; total: number; speed: number;
   errorDetails?: DownloadFailure | null;
+  startedAt?: string;
+  finishedAt?: string;
+  files?: ActivityFile[];
 }
 export const defaults = {
   vaultPath: '', concurrency: 2, platform: 'windows' as Platform, language: 'English',
@@ -144,8 +180,17 @@ export function showLibraryCard(game: Pick<Game, 'bonusOnly' | 'parentProduct'>)
   return !game.bonusOnly || !game.parentProduct;
 }
 export const bulkDownloadWarningBytes = 100 * 1024 ** 3;
-export function scopedDownloadPreview<T extends { id: string; bytes: number }>(items: readonly T[], visibleSelectedIds: ReadonlySet<string>, updateIds: ReadonlySet<string>, includeUpdates: boolean): T[] {
-  return items.filter(item => visibleSelectedIds.has(item.id) && (includeUpdates || !updateIds.has(item.id)));
+export function scopedDownloadPreview<T extends { id: string; bytes: number; targets?: { gameId: string; key: string; size: number }[] }>(items: readonly T[], visibleSelectedIds: ReadonlySet<string>, updateIds: ReadonlySet<string>, includeUpdates: boolean): T[] {
+  const seen = new Set<string>();
+  return items.filter(item => visibleSelectedIds.has(item.id) && (includeUpdates || !updateIds.has(item.id))).flatMap(item => {
+    if (!item.targets) return [item];
+    const targets = item.targets.filter(file => {
+      const key = `${file.gameId}:${file.key}`;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+    return targets.length ? [{ ...item, targets, files: targets.length, bytes: targets.reduce((sum, file) => sum + file.size, 0) }] : [];
+  });
 }
 export function platformStates(files: RemoteFile[], platforms: Platform[], hasFolder: boolean, previousInstallerParts = 0): Game['platformState'] {
   return Object.fromEntries(platforms.flatMap(platform => {

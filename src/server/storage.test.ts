@@ -26,10 +26,10 @@ mock.module('./gog/products', () => ({
         file.key === 'bonus-missing' ? 'https://cdn.gog.com/missing.xml' : undefined };
   }
 }));
-const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, saveLocalGame, activeVault, linkDlcProducts, selectDlcProduct, saveOwnedProducts } = await import('./db');
-const { scanGame, scanVault, findGameFolder, linkAndScan, organizePreview, organizeGame, importPreview, importGame, scanState, matchingReview, ignoreFolder, writeOfflineMetadata } = await import('./storage');
+const { db, upsertGame, saveSettings, filesFor, mediaFor, replaceMedia, replaceFiles, gameById, games, setHiddenGames, mapVaultGame, saveFileState, saveLocalGame, activeVault, linkDlcProducts, selectDlcProduct, saveOwnedProducts, accountShelf, saveAccountShelf, saveProductInclusions, productGraph, selectedProductFiles } = await import('./db');
+const { scanGame, scanVault, findGameFolder, linkAndScan, organizePreview, organizeGame, importPreview, importGame, scanState, matchingReview, ignoreFolder, writeOfflineMetadata, reconcileOfflineArtwork } = await import('./storage');
 const { enqueueVerification, cancelVerification, verificationJobs, hasActiveVerification } = await import('./verification');
-const { archiveMedia } = await import('./media');
+const { archiveMedia, selectMedia } = await import('./media');
 const { enqueueImports, importJobs, importCommand, shutdownImports, subscribeImports } = await import('./imports');
 afterAll(async () => {
   await shutdownImports();
@@ -37,6 +37,40 @@ afterAll(async () => {
   if (previousDataDir === undefined) delete process.env.GOG_VAULT_DATA_DIR;
   else process.env.GOG_VAULT_DATA_DIR = previousDataDir;
   await rm(directory, { recursive: true, force: true });
+});
+
+test('official GOG types survive DLC reconciliation and metadata without source types', () => {
+  upsertGame({ id: 'type-parent', title: 'Type Parent' });
+  upsertGame({ id: 'type-game', title: 'Official Game', slug: 'official_bundle' });
+  upsertGame({ id: 'type-addon', title: 'Addon', productType: 'dlc', gogGameType: 'dlc' });
+  linkDlcProducts('type-parent', ['type-game']);
+  expect(gameById('type-game')?.productType).toBe('dlc');
+  upsertGame({ id: 'type-game', title: 'Official Game', slug: 'official_bundle', productType: 'game', gogGameType: 'game' });
+  linkDlcProducts('type-parent', ['type-game']);
+  linkDlcProducts('type-game', ['type-addon']);
+  expect(gameById('type-game')).toMatchObject({ productType: 'game', gogGameType: 'game' });
+  upsertGame({ id: 'type-game', title: 'Metadata Without Source Type', productType: 'dlc' });
+  expect(gameById('type-game')).toMatchObject({ productType: 'game', gogGameType: 'game' });
+  upsertGame({ id: 'type-pack', title: 'Official Pack', productType: 'bundle', gogGameType: 'pack' });
+  linkDlcProducts('type-parent', ['type-pack']);
+  expect(gameById('type-pack')).toMatchObject({ productType: 'bundle', gogGameType: 'pack' });
+  upsertGame({ id: 'type-unknown', title: 'Future Type', productType: 'unknown', gogGameType: 'future_type' });
+  linkDlcProducts('type-parent', ['type-unknown']);
+  expect(gameById('type-unknown')).toMatchObject({ productType: 'unknown', gogGameType: 'future_type' });
+});
+
+test('account shelf snapshots stay account-scoped without modifying products or vault records', () => {
+  const before = ['games', 'remote_files', 'vault_games', 'product_relationships'].map(table => db.query(`SELECT * FROM ${table}`).all());
+  expect(accountShelf('account-one')).toEqual({ ids: [], refreshedAt: '' });
+  const saved = saveAccountShelf('account-one', ['10', '20', '10']);
+  expect(saved.ids).toEqual(['10', '20']);
+  expect(saved.refreshedAt).not.toBe('');
+  expect(accountShelf('account-two')).toEqual({ ids: [], refreshedAt: '' });
+  saveAccountShelf('account-two', ['30']);
+  expect(accountShelf('account-one')).toEqual(saved);
+  saveAccountShelf('account-one', []);
+  expect(accountShelf('account-one').ids).toEqual([]);
+  expect(['games', 'remote_files', 'vault_games', 'product_relationships'].map(table => db.query(`SELECT * FROM ${table}`).all())).toEqual(before);
 });
 
 test('adopts an existing multipart installer without redownloading or calling old files corrupt', async () => {
@@ -97,6 +131,49 @@ test('store media defaults off and per-game choice survives refresh', () => {
   expect(mediaFor('42')[0]).toMatchObject({ selected: true, size: 20 });
 });
 
+test('media categories select every image role and video while preserving external-video restrictions', () => {
+  upsertGame({ id: 'media-categories', title: 'Media Categories' });
+  const base = { gameId: 'media-categories', poster: '', localPath: '', size: 0, selected: false, external: false };
+  replaceMedia('media-categories', (['card', 'hero', 'icon', 'logo', 'videoPoster', 'screenshot', 'additionalArtwork', 'video'] as const)
+    .map(role => ({ ...base, key: role, role, url: `https://images.gog.com/${role}.png`, external: role === 'video' })));
+  const assets = mediaFor('media-categories');
+  selectMedia('media-categories', assets.filter(asset => asset.role !== 'video').map(asset => ({ key: asset.key, selected: true })));
+  expect(mediaFor('media-categories').filter(asset => asset.role !== 'video').every(asset => asset.selected)).toBe(true);
+  expect(mediaFor('media-categories').find(asset => asset.role === 'video')?.selected).toBe(false);
+  selectMedia('media-categories', [{ key: 'video', selected: true }]);
+  expect(mediaFor('media-categories').find(asset => asset.role === 'video')).toMatchObject({ selected: true, external: true, localPath: '' });
+  selectMedia('media-categories', assets.map(asset => ({ key: asset.key, selected: false })));
+  expect(mediaFor('media-categories').every(asset => !asset.selected)).toBe(true);
+});
+
+test('library media status deduplicates images and uses only the active vault archives', async () => {
+  const originalRoot = activeVault()?.rootPath || '';
+  const root = join(directory, 'media-summary-vault');
+  const otherRoot = join(directory, 'media-summary-other-vault');
+  await mkdir(root, { recursive: true });
+  await mkdir(otherRoot, { recursive: true });
+  saveSettings({ vaultPath: root });
+  upsertGame({ id: 'media-summary', title: 'Media Summary' });
+  mapVaultGame('media-summary', 'Media Summary');
+  const asset = { gameId: 'media-summary', poster: '', localPath: '', size: 0, selected: false, external: false };
+  replaceMedia('media-summary', [
+    { ...asset, key: 'card', role: 'card', url: 'https://images.gog.com/shared.png' },
+    { ...asset, key: 'hero', role: 'hero', url: 'https://images.gog.com/shared.png' },
+    { ...asset, key: 'shot', role: 'screenshot', url: 'https://images.gog.com/shot.png' },
+    { ...asset, key: 'poster', role: 'videoPoster', url: 'https://images.gog.com/poster.png' },
+    { ...asset, key: 'video', role: 'video', url: 'https://cdn.gog.com/trailer.mp4' },
+    { ...asset, key: 'youtube', role: 'video', url: 'https://youtube.com/watch?v=abcdefghijk', external: true }
+  ]);
+  try {
+    for (const key of ['hero', 'video']) db.query('INSERT INTO vault_media(vault_id,game_id,media_key,local_path) VALUES (?,?,?,?)')
+      .run(activeVault()!.id, 'media-summary', key, `.gog-vault/${key}.bin`);
+    expect(gameById('media-summary')?.mediaStatus).toEqual({ images: { archived: 1, total: 2 }, videos: { archived: 1, total: 2, external: 1 } });
+    saveSettings({ vaultPath: otherRoot });
+    expect(gameById('media-summary')?.mediaStatus).toEqual({ images: { archived: 0, total: 2 }, videos: { archived: 0, total: 2, external: 1 } });
+    expect(mediaFor('media-summary').every(asset => !asset.localPath)).toBe(true);
+  } finally { saveSettings({ vaultPath: originalRoot }); }
+});
+
 test('offline artwork persists image dimensions and replaces only stale role extensions', async () => {
   const root = join(directory, 'artwork-vault');
   const folder = join(root, 'Artwork');
@@ -125,10 +202,19 @@ test('offline artwork persists image dimensions and replaces only stale role ext
       expect.objectContaining({ role: 'card', width: 1, height: 1, mimeType: 'image/png', sourceUrl: 'https://images.gog.com/card.png' }),
       expect.objectContaining({ role: 'hero', width: 1, height: 1, mimeType: 'image/png' })
     ]));
+    expect(gameById('artwork-id')?.mediaStatus?.images).toEqual({ archived: 1, total: 1 });
+    expect(mediaFor('artwork-id').find(asset => asset.role === 'card')?.localPath).toBe('.gog-vault/artwork/cover.png');
+    db.query('DELETE FROM vault_media WHERE vault_id=? AND game_id=?').run(activeVault()!.id, 'artwork-id');
     db.query('UPDATE media_assets SET width=0,height=0,mime_type=? WHERE game_id=?').run('', 'artwork-id');
     globalThis.fetch = Object.assign(async () => { throw new Error('Cached artwork must not be fetched again'); }, { preconnect: originalFetch.preconnect });
-    await writeOfflineMetadata('artwork-id');
+    await reconcileOfflineArtwork('artwork-id');
     expect(mediaFor('artwork-id').map(asset => [asset.width, asset.height, asset.mimeType])).toEqual([[1, 1, 'image/png'], [1, 1, 'image/png']]);
+    expect(gameById('artwork-id')?.mediaStatus?.images).toEqual({ archived: 1, total: 1 });
+    expect(mediaFor('artwork-id').every(asset => !!asset.localPath)).toBe(true);
+    db.query('DELETE FROM vault_media WHERE vault_id=? AND game_id=? AND media_key=?').run(activeVault()!.id, 'artwork-id', 'card');
+    db.query('UPDATE media_assets SET sha256=? WHERE game_id=? AND key=?').run('0'.repeat(64), 'artwork-id', 'card');
+    await reconcileOfflineArtwork('artwork-id');
+    expect(mediaFor('artwork-id').find(asset => asset.key === 'card')?.localPath).toBe('');
   } finally {
     trustedArtwork = false;
     globalThis.fetch = originalFetch;
@@ -320,6 +406,9 @@ test('COPY returns a durable job immediately and streams progress without changi
     expect(importJobs().find(job => job.batchId === importJobId)).toMatchObject({ bytes: 4 * 1024 * 1024, total: 4 * 1024 * 1024, filesDone: 1 });
     expect(await readFile(join(root, 'Worker Game', 'installer.bin'))).toEqual(await readFile(join(source, 'installer.bin')));
     const completed = importJobs().find(job => job.batchId === importJobId)!;
+    expect(completed.startedAt).toBeTruthy();
+    expect(completed.completedAt).toBeTruthy();
+    expect(completed.files).toEqual([{ name: 'installer.bin', size: 4 * 1024 * 1024, bytes: 4 * 1024 * 1024, state: 'verified' }]);
     importCommand(completed.id, 'remove');
     expect(importJobs().find(job => job.id === completed.id)).toBeUndefined();
     expect(await readFile(join(root, 'Worker Game', 'installer.bin'))).toEqual(await readFile(join(source, 'installer.bin')));
@@ -629,7 +718,12 @@ test('Full Verify clears its lock after completion and failure', async () => {
   const first = enqueueVerification('verify-jobs');
   expect(() => enqueueVerification('verify-jobs')).toThrow('Verification already running');
   expect(hasActiveVerification()).toBe(true);
-  expect((await finished(first.id)).state).toBe('complete');
+  const firstResult = await finished(first.id);
+  expect(firstResult.state).toBe('complete');
+  expect(firstResult.createdAt).toBeTruthy();
+  expect(firstResult.startedAt).toBeTruthy();
+  expect(firstResult.finishedAt).toBeTruthy();
+  expect(Date.parse(firstResult.finishedAt)).toBeGreaterThanOrEqual(Date.parse(firstResult.startedAt));
   expect(hasActiveVerification()).toBe(false);
   await rm(root, { recursive: true });
   const failed = enqueueVerification('verify-jobs');
@@ -645,7 +739,8 @@ test('Full Verify clears its lock after completion and failure', async () => {
   const waiting = enqueueVerification('verify-jobs-second');
   expect(waiting.state).toBe('queued');
   cancelVerification(waiting.id);
-  expect((await finished(waiting.id)).state).toBe('cancelled');
+  expect(await finished(waiting.id)).toMatchObject({ state: 'cancelled', startedAt: '' });
+  expect((await finished(waiting.id)).finishedAt).toBeTruthy();
   expect((await finished(running.id)).state).toBe('complete');
   expect((await finished(enqueueVerification('verify-jobs-second').id)).state).toBe('complete');
 });
@@ -808,6 +903,8 @@ test('an existing DLC-only bundle reports its archived components without invent
     category: 'extras', platform: 'windows', language: 'English', version: '1', size: 5,
     downlink: 'https://api.gog.com/soundtrack', selected: false, verified: false }]);
   linkDlcProducts('sacrament-bundle', ['sacrament-dlc', 'sacrament-soundtrack']);
+  replaceFiles('sacrament-bundle', []);
+  saveProductInclusions('sacrament-bundle', ['sacrament-dlc', 'sacrament-soundtrack']);
   upsertGame({ id: 'sacrament-base', title: 'Base Game' });
   linkDlcProducts('sacrament-base', ['sacrament-soundtrack']);
   expect(gameById('sacrament-soundtrack')).toMatchObject({ productType: 'dlc', bonusOnly: true,
@@ -862,6 +959,64 @@ test('an existing DLC-only bundle reports its archived components without invent
   ]);
   expect(gameById('standalone-bonus')).toMatchObject({ status: 'Incomplete', bonusCoverage: 99 });
 });
+test('edition inclusions share verified base files, require selected DLC, and traverse nested packs once', () => {
+  const originalVault = activeVault()?.rootPath || '';
+  saveSettings({ vaultPath: join(directory, 'inclusion-shared-vault') });
+  upsertGame({ id: 'inclusion-base', title: 'Inclusion Base', productType: 'game' });
+  upsertGame({ id: 'inclusion-dlc', title: 'Inclusion Season Pass', productType: 'dlc' });
+  upsertGame({ id: 'inclusion-premium', title: 'Inclusion Premium', productType: 'bundle' });
+  upsertGame({ id: 'inclusion-outer', title: 'Inclusion Outer', productType: 'bundle' });
+  const base: import('../shared/domain').RemoteFile = { key: 'inclusion-base:main', gameId: 'inclusion-base', name: 'base.exe', category: 'main',
+    platform: 'windows', language: 'English', version: '1', size: 10, downlink: 'https://api.gog.com/base', selected: true, verified: false };
+  const addon = { ...base, key: 'inclusion-dlc:main', gameId: 'inclusion-dlc', size: 5 };
+  replaceFiles('inclusion-base', [base]); replaceFiles('inclusion-dlc', [addon]);
+  mapVaultGame('inclusion-base', 'Inclusion Base'); mapVaultGame('inclusion-dlc', 'Inclusion Season Pass');
+  replaceFiles('inclusion-premium', []); replaceFiles('inclusion-outer', []);
+  saveProductInclusions('inclusion-premium', ['inclusion-base', 'inclusion-dlc']);
+  saveProductInclusions('inclusion-outer', ['inclusion-premium', 'inclusion-base']);
+  expect(gameById('inclusion-base')).toMatchObject({ productType: 'game', includedIn: expect.arrayContaining([{ id: 'inclusion-premium', title: 'Inclusion Premium' }]) });
+  saveFileState('inclusion-base', base.key, { matched: true, verified: true, verifiedSize: 10 });
+  expect(gameById('inclusion-base')?.status).toBe('Vaulted');
+  expect(gameById('inclusion-premium')).toMatchObject({ status: 'Incomplete', archive: { selectedCompletion: 67, remoteSelectedBytes: 15 }, completion: { main: 100, dlc: 0 } });
+  expect(gameById('inclusion-outer')?.remoteSize).toBe(15);
+  expect(selectedProductFiles('inclusion-outer').map(file => file.key).sort()).toEqual([base.key, addon.key].sort());
+  linkDlcProducts('inclusion-base', ['inclusion-dlc']);
+  linkDlcProducts('inclusion-premium', ['inclusion-dlc']);
+  selectDlcProduct('inclusion-premium', 'inclusion-dlc', false);
+  expect(selectedProductFiles('inclusion-premium').map(file => file.key)).toEqual([base.key]);
+  expect(gameById('inclusion-premium')?.status).toBe('Vaulted');
+  saveProductInclusions('inclusion-outer', ['inclusion-premium']);
+  expect(selectedProductFiles('inclusion-outer').map(file => file.key)).toEqual([base.key]);
+  saveProductInclusions('inclusion-outer', ['inclusion-premium', 'inclusion-base']);
+  expect(selectedProductFiles('inclusion-outer')).toHaveLength(2);
+  selectDlcProduct('inclusion-premium', 'inclusion-dlc', true);
+  saveFileState('inclusion-dlc', addon.key, { matched: true, verified: true, verifiedSize: 5 });
+  expect(gameById('inclusion-premium')?.status).toBe('Vaulted');
+  expect(gameById('inclusion-outer')?.status).toBe('Vaulted');
+  expect(filesFor('inclusion-premium')).toEqual([]);
+  replaceFiles('inclusion-base', [{ ...base, version: '2', size: 20 }]);
+  expect(gameById('inclusion-premium')?.status).not.toBe('Vaulted');
+  saveFileState('inclusion-base', base.key, { matched: true, verified: true, verifiedSize: 20 });
+  expect(gameById('inclusion-premium')?.status).toBe('Vaulted');
+  saveProductInclusions('inclusion-premium', ['inclusion-base']);
+  expect(gameById('inclusion-premium')?.includedProducts?.map(child => child.id)).toEqual(['inclusion-base']);
+  saveProductInclusions('inclusion-premium', ['inclusion-base', 'missing-inclusion']);
+  expect(gameById('inclusion-premium')).toMatchObject({ status: 'Incomplete', inclusionWarning: true });
+  upsertGame({ id: 'inclusion-unowned', title: 'Unowned Included Game' });
+  db.query('UPDATE games SET owned=0 WHERE id=?').run('inclusion-unowned');
+  saveProductInclusions('inclusion-premium', ['inclusion-base', 'inclusion-unowned']);
+  expect(productGraph('inclusion-premium').ids).not.toContain('inclusion-unowned');
+  expect(gameById('inclusion-premium')).toMatchObject({ status: 'Incomplete', inclusionWarning: true,
+    includedProducts: expect.arrayContaining([expect.objectContaining({ id: 'inclusion-unowned', owned: false })]) });
+  saveProductInclusions('inclusion-premium', ['inclusion-outer']);
+  expect(productGraph('inclusion-outer').unresolvedIds).toContain('inclusion-outer');
+  expect(gameById('inclusion-outer')?.status).not.toBe('Vaulted');
+  saveProductInclusions('inclusion-premium', ['inclusion-base', 'inclusion-dlc']);
+  saveSettings({ vaultPath: join(directory, 'inclusion-other-vault') });
+  expect(gameById('inclusion-premium')?.status).toBe('Not Downloaded');
+  saveSettings({ vaultPath: originalVault });
+});
+
 test('importing a child DLC updates its parent without a second local installer', async () => {
   const root = join(directory, 'dlc-import-vault');
   const source = join(directory, 'dlc-import-source', 'Imported DLC');

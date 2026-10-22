@@ -6,13 +6,14 @@ import { activeVault, db, gameById, hasIndexedLinkedFile, jobsFor, now, activity
 import { folderName, finalizeImportedGame, inspectImport, vaultPath } from './storage';
 import { withinRoot } from './paths';
 import { localSha256 } from './transfer';
+import type { ActivityFile } from '../shared/domain';
 
 export type ImportState = 'queued' | 'analyzing' | 'copying' | 'hashing' | 'verifying' | 'finalizing' | 'completed' | 'failed' | 'cancelled';
 export type ImportFailure = { stage: string; sourcePath: string; destinationPath: string; filename: string;
   code: string; safeMessage: string; technicalMessage: string; retryable: boolean };
 export type ImportJob = { id: string; batchId: string; gameId: string; source: string; mode: 'copy' | 'move'; destination: string;
   state: ImportState; createdAt: string; startedAt: string; completedAt: string; bytes: number; total: number;
-  speed: number; currentFile: string; filesDone: number; filesTotal: number; errorDetails: ImportFailure | null };
+  speed: number; currentFile: string; filesDone: number; filesTotal: number; files: ActivityFile[]; errorDetails: ImportFailure | null };
 type Row = { id: string; batch_id: string; game_id: string; source: string; signature: string; mode: 'copy' | 'move';
   destination: string; staged_path: string; vault_id: number | null; state: ImportState; created_at: string; started_at: string;
   completed_at: string; bytes: number; total: number; speed: number; current_file: string; files_done: number;
@@ -30,7 +31,9 @@ export function importJobs(): ImportJob[] {
     id: row.id, batchId: row.batch_id, gameId: row.game_id, source: row.source, mode: row.mode,
     destination: row.destination, state: row.state, createdAt: row.created_at, startedAt: row.started_at,
     completedAt: row.completed_at, bytes: row.bytes, total: row.total, speed: row.speed, currentFile: row.current_file,
-    filesDone: row.files_done, filesTotal: row.files_total, errorDetails: row.error_details ? JSON.parse(row.error_details) as ImportFailure : null
+    filesDone: row.files_done, filesTotal: row.files_total, errorDetails: row.error_details ? JSON.parse(row.error_details) as ImportFailure : null,
+    files: (db.query('SELECT name,size,state FROM import_files WHERE job_id=? ORDER BY name').all(row.id) as { name: string; size: number; state: string }[])
+      .map(file => ({ ...file, bytes: file.state === 'verified' ? file.size : 0 }))
   }));
 }
 export function subscribeImports(listener: (jobs: ImportJob[]) => void) {

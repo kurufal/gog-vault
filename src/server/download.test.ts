@@ -26,7 +26,7 @@ test('complete partial retries checksum metadata without fetching installer byte
       downloads++;
       throw new Error('Complete partial was redownloaded');
     }, { preconnect: previousFetch.preconnect });
-    expect(await downloadFile(file(Buffer.byteLength(bytes)), dir, new AbortController().signal, () => {}, () => verifying++)).toBe('installer.exe');
+    expect(await downloadFile(file(Buffer.byteLength(bytes)), dir, new AbortController().signal, () => {}, () => { verifying++; })).toBe('installer.exe');
     expect(checks).toBe(2);
     expect(downloads).toBe(0);
     expect(verifying).toBe(1);
@@ -229,5 +229,55 @@ test('Extra with no checksum or reliable size cannot complete', async () => {
     globalThis.fetch = Object.assign(async () => new Response('music'), { preconnect: previousFetch.preconnect });
     await expect(downloadFile({ ...file(0), key: 'no-checksum', category: 'extras', name: 'track.mp3' }, dir, new AbortController().signal, () => {}))
       .rejects.toThrow('Extra expected size unavailable');
+  } finally { globalThis.fetch = previousFetch; await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a checksum retry waits for a transfer slot and replaces only corrupt partial bytes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vault-corrupt-retry-'));
+  const previousFetch = globalThis.fetch;
+  const bytes = 'offline installer';
+  let downloads = 0, admissions = 0;
+  let releaseRetry!: () => void;
+  let reachedRetry!: () => void;
+  const retryGate = new Promise<void>(resolve => { releaseRetry = resolve; });
+  const retryReady = new Promise<void>(resolve => { reachedRetry = resolve; });
+  let task: Promise<string> | undefined;
+  try {
+    globalThis.fetch = Object.assign(async (input: string | URL | Request) => {
+      if (String(input).includes('hash.xml')) return new Response(xml(bytes));
+      return new Response(++downloads === 1 ? 'corrupt installer' : bytes);
+    }, { preconnect: previousFetch.preconnect });
+    task = downloadFile(file(bytes.length), dir, new AbortController().signal, () => {}, () => {}, async () => {
+      if (++admissions === 2) { reachedRetry(); await retryGate; }
+    });
+    await retryReady;
+    expect(downloads).toBe(1);
+    expect(await Bun.file(join(dir, 'installer.exe.part')).exists()).toBe(false);
+    releaseRetry();
+    expect(await task).toBe('installer.exe');
+    expect(downloads).toBe(2);
+    expect(await readFile(join(dir, 'installer.exe'), 'utf8')).toBe(bytes);
+  } finally {
+    releaseRetry();
+    await task?.catch(() => {});
+    globalThis.fetch = previousFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('exhausted checksum retries leave no corrupt partial or completed installer', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vault-corrupt-limit-'));
+  const previousFetch = globalThis.fetch;
+  let downloads = 0;
+  try {
+    globalThis.fetch = Object.assign(async (input: string | URL | Request) => {
+      if (String(input).includes('hash.xml')) return new Response(xml('offline installer'));
+      downloads++;
+      return new Response('corrupt installer');
+    }, { preconnect: previousFetch.preconnect });
+    await expect(downloadFile(file(17), dir, new AbortController().signal, () => {})).rejects.toThrow('Installer checksum mismatch');
+    expect(downloads).toBe(2);
+    expect(await Bun.file(join(dir, 'installer.exe.part')).exists()).toBe(false);
+    expect(await Bun.file(join(dir, 'installer.exe')).exists()).toBe(false);
   } finally { globalThis.fetch = previousFetch; await rm(dir, { recursive: true, force: true }); }
 });

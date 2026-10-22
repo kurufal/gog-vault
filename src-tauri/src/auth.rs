@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::{webview::NewWindowResponse, AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{webview::{NewWindowFeatures, NewWindowResponse}, AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 use crate::Session;
 
@@ -14,6 +14,7 @@ struct Attempt {
     id: String,
     started: Instant,
     exchanging: bool,
+    popups: usize,
 }
 
 pub struct AuthState(Mutex<Option<Attempt>>);
@@ -46,7 +47,13 @@ fn send_code(session: &Session, code: &str) -> Result<(), &'static str> {
     let mut response = [0u8; 128];
     match stream.read(&mut response) {
         Ok(size) if response[..size].starts_with(b"HTTP/1.1 200") || response[..size].starts_with(b"HTTP/1.0 200") => Ok(()),
-        _ => Err("GOG sign-in could not be completed. Use browser login instead."),
+        _ => Err("GOG sign-in could not be completed. Please try again."),
+    }
+}
+
+fn close_popups(app: &AppHandle) {
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("gog-auth-popup-") { let _ = window.close(); }
     }
 }
 
@@ -56,13 +63,14 @@ fn finish(app: &AppHandle, id: &str, outcome: &str) {
     if pending.as_ref().is_none_or(|attempt| attempt.id != id || (outcome == "expired" && attempt.exchanging)) { return; }
     pending.take();
     drop(pending);
+    close_popups(app);
     if let Some(window) = app.get_webview_window(AUTH_WINDOW) { let _ = window.close(); }
     let _ = app.emit_to("main", "gog-auth-status", outcome);
 }
 
 fn navigate(app: &AppHandle, id: &str, session: &Session, url: &Url) -> bool {
     let result = callback(url);
-    if matches!(result, Ok(None)) { return url.scheme() == "https"; }
+    if matches!(result, Ok(None)) { return allowed_auth_url(url); }
     let state = app.state::<AuthState>();
     let mut pending = state.0.lock().unwrap();
     let Some(attempt) = pending.as_mut() else { return false };
@@ -82,6 +90,43 @@ fn navigate(app: &AppHandle, id: &str, session: &Session, url: &Url) -> bool {
     false
 }
 
+fn allowed_auth_url(url: &Url) -> bool {
+    (url.scheme() == "https" && url.username().is_empty() && url.password().is_none())
+        || url.as_str() == "about:blank"
+}
+
+fn popup(app: &AppHandle, id: &str, session: &Session, url: Url, features: NewWindowFeatures) -> NewWindowResponse<tauri::Wry> {
+    if !allowed_auth_url(&url) { return NewWindowResponse::Deny; }
+    let label = {
+        let state = app.state::<AuthState>();
+        let mut pending = state.0.lock().unwrap();
+        let Some(attempt) = pending.as_mut() else { return NewWindowResponse::Deny };
+        if attempt.id != id || attempt.started.elapsed() >= LIFETIME || attempt.exchanging { return NewWindowResponse::Deny; }
+        attempt.popups += 1;
+        format!("gog-auth-popup-{}-{}", id, attempt.popups)
+    };
+    let nav_app = app.clone();
+    let nav_id = id.to_owned();
+    let nav_session = session.clone();
+    let popup_app = app.clone();
+    let popup_id = id.to_owned();
+    let popup_session = session.clone();
+    match WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
+        .window_features(features)
+        .title("GOG single sign-on")
+        .inner_size(600.0, 750.0)
+        .center()
+        .resizable(true)
+        .incognito(true)
+        .on_navigation(move |url| navigate(&nav_app, &nav_id, &nav_session, url))
+        .on_new_window(move |url, features| popup(&popup_app, &popup_id, &popup_session, url, features))
+        .build()
+    {
+        Ok(window) => NewWindowResponse::Create { window },
+        Err(_) => { finish(app, id, "error"); NewWindowResponse::Deny }
+    }
+}
+
 pub fn start(app: AppHandle, session: Session, login_url: String) -> Result<(), String> {
     let url = Url::parse(&login_url).map_err(|_| "Invalid GOG login URL")?;
     if url.scheme() != "https" || url.host_str() != Some("auth.gog.com") || url.port_or_known_default() != Some(443) || url.path() != "/auth" || !url.username().is_empty() || url.password().is_some() {
@@ -99,11 +144,13 @@ pub fn start(app: AppHandle, session: Session, login_url: String) -> Result<(), 
         let state = app.state::<AuthState>();
         let mut pending = state.0.lock().unwrap();
         if pending.is_some() { return Err("A GOG login is already in progress".into()); }
-        *pending = Some(Attempt { id: id.clone(), started: Instant::now(), exchanging: false });
+        *pending = Some(Attempt { id: id.clone(), started: Instant::now(), exchanging: false, popups: 0 });
     }
     let nav_app = app.clone();
     let nav_id = id.clone();
     let nav_session = session.clone();
+    let popup_app = app.clone();
+    let popup_id = id.clone();
     let window = WebviewWindowBuilder::new(&app, AUTH_WINDOW, WebviewUrl::External(url))
         .title("Connect GOG")
         .inner_size(900.0, 700.0)
@@ -111,7 +158,7 @@ pub fn start(app: AppHandle, session: Session, login_url: String) -> Result<(), 
         .resizable(true)
         .incognito(true)
         .on_navigation(move |url| navigate(&nav_app, &nav_id, &nav_session, url))
-        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .on_new_window(move |url, features| popup(&popup_app, &popup_id, &session, url, features))
         .build();
     if let Err(error) = window {
         let state = app.state::<AuthState>();
@@ -134,6 +181,7 @@ pub fn cancel(app: &AppHandle) -> Result<(), String> {
     if pending.as_ref().is_some_and(|attempt| attempt.exchanging) { return Err("Finishing GOG sign-in. Please wait.".into()); }
     pending.take();
     drop(pending);
+    close_popups(app);
     if let Some(window) = app.get_webview_window(AUTH_WINDOW) { let _ = window.close(); }
     let _ = app.emit_to("main", "gog-auth-status", "cancelled");
     Ok(())
@@ -145,14 +193,25 @@ pub fn window_closed(app: &AppHandle) {
     if pending.as_ref().is_some_and(|attempt| attempt.exchanging) { return; }
     if pending.take().is_some() {
         drop(pending);
+        close_popups(app);
         let _ = app.emit_to("main", "gog-auth-status", "cancelled");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::callback;
+    use super::{allowed_auth_url, callback};
     use tauri::Url;
+
+    #[test]
+    fn permits_https_and_blank_sso_windows_only() {
+        for url in ["https://accounts.google.com/", "https://www.facebook.com/", "about:blank"] {
+            assert!(allowed_auth_url(&Url::parse(url).unwrap()));
+        }
+        for url in ["http://accounts.google.com/", "javascript:alert(1)", "file:///C:/test", "data:text/html,test", "https://user:password@example.com/", "about:config"] {
+            assert!(!allowed_auth_url(&Url::parse(url).unwrap()));
+        }
+    }
 
     #[test]
     fn accepts_only_exact_gog_callback() {

@@ -30,6 +30,15 @@ export function uniqueMedia(assets: MediaAsset[]): GalleryAsset[] {
   return gallery;
 }
 
+export function mediaArchiveStatus(assets: MediaAsset[]): NonNullable<Game['mediaStatus']> {
+  const gallery = uniqueMedia([...assets].sort((left, right) => Number(!!right.localPath) - Number(!!left.localPath)));
+  const images = gallery.filter(asset => asset.role !== 'video');
+  const videos = gallery.filter(asset => asset.role === 'video');
+  return { images: { archived: images.filter(asset => asset.localPath).length, total: images.length },
+    videos: { archived: videos.filter(asset => asset.localPath).length, total: videos.length,
+      external: videos.filter(asset => asset.external && !asset.localPath).length } };
+}
+
 export function resolveLibraryLandscapeArtwork(game: Pick<Game, 'cover' | 'background' | 'logo'>): string {
   if (game.cover && game.cover !== game.background) return game.cover;
   const logo = game.logo || '';

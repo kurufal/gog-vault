@@ -4,8 +4,59 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCode } from './auth';
 import { createCredentialStore } from './credentials';
-import { catalogCover, parseDownloads, parseMedia, parseProduct, productManifest, trustedGogUrl } from './products';
+import { catalogCover, parseDownloads, parseInclusionIds, parseMedia, parseProduct, productManifest, trustedGogUrl } from './products';
 import { defaults } from '../../shared/domain';
+import { accountShelfIds } from './shelf';
+
+test('GOG game_type is preserved verbatim and overrides conflicting legacy guesses', () => {
+  for (const [game_type, productType] of [['game', 'game'], ['dlc', 'dlc'], ['pack', 'bundle'], ['future_type', 'unknown']]) {
+    expect(parseProduct({ id: '10', title: 'Product', game_type, type: 'dlc', is_bundle: true, slug: 'product_bundle', expanded_dlcs: [{ id: 20 }] }))
+      .toMatchObject({ gogGameType: game_type, productType });
+  }
+  expect(parseProduct({ id: '10', title: 'Legacy DLC', type: 'dlc' })).toMatchObject({ productType: 'dlc', gogGameType: undefined });
+  expect(parseProduct({ id: '10', title: 'Legacy Pack', is_bundle: true })).toMatchObject({ productType: 'bundle', gogGameType: undefined });
+});
+
+test('explicit inclusion links identify edition contents without treating the base game as DLC', () => {
+  expect(parseProduct({ id: '1136349258', title: 'Premium Edition', game_type: 'pack' }).productType).toBe('bundle');
+  expect(parseProduct({ id: '1881970704', title: 'Base Game', game_type: 'game' }).productType).toBe('game');
+  expect(parseProduct({ id: '1863845756', title: 'Season Pass', game_type: 'dlc' }).productType).toBe('dlc');
+  expect(parseInclusionIds({ _links: { includesGames: [
+    { href: 'https://api.gog.com/v2/games/1881970704?locale=en-US' },
+    { href: 'https://api.gog.com/v2/games/1863845756' },
+    { href: 'https://api.gog.com/v2/games/1881970704' },
+    { href: 'https://api.gog.com/v2/games/1136349258' }
+  ] } }, '1136349258')).toEqual(['1881970704', '1863845756']);
+  expect(parseInclusionIds({ _links: {} }, '10')).toEqual([]);
+  for (const raw of [{}, { _links: { includesGames: {} } }, { _links: { includesGames: [{ href: 'https://example.com/v2/games/10' }] } },
+    { _links: { includesGames: [{ href: 'https://api.gog.com/v2/games/10', id: 20 }] } }])
+    expect(() => parseInclusionIds(raw, '30')).toThrow();
+});
+
+describe('GOG account shelf', () => {
+  test('paginates the account shelf independently of owned product IDs', async () => {
+    const urls: URL[] = [];
+    const ids = await accountShelfIds(async value => {
+      const url = new URL(value);
+      urls.push(url);
+      const page = Number(url.searchParams.get('page'));
+      return { page, totalPages: 2, products: page === 1 ? [{ id: 10 }, { id: '20' }] : [{ id: 20 }, { id: 30 }] };
+    });
+    expect(ids).toEqual(['10', '20', '30']);
+    expect(urls.map(url => url.searchParams.get('page'))).toEqual(['1', '2']);
+    expect(urls.every(url => url.origin === 'https://embed.gog.com' && url.searchParams.get('hiddenFlag') === '0')).toBe(true);
+  });
+  test('accepts an explicitly empty shelf but rejects malformed or partial pages', async () => {
+    expect(await accountShelfIds(async () => ({ page: 1, totalPages: 0, products: [] }))).toEqual([]);
+    for (const response of [null, {}, { page: 1, totalPages: 1, products: [{ id: 'invalid' }] },
+      { page: 2, totalPages: 2, products: [] }, { page: 1, totalPages: -1, products: [] }])
+      await expect(accountShelfIds(async () => response)).rejects.toThrow('shelf');
+    await expect(accountShelfIds(async url => {
+      if (new URL(url).searchParams.get('page') === '2') throw new Error('Page unavailable');
+      return { page: 1, totalPages: 2, products: [{ id: 10 }] };
+    })).rejects.toThrow('Page unavailable');
+  });
+});
 
 describe('GOG auth callback', () => {
   test('accepts a code or a GOG redirect URL', () => {

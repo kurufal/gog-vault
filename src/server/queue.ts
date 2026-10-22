@@ -1,4 +1,4 @@
-import { activeVault, db, activity, changeJob, filesFor, gameById, jobsFor, mediaFor, now, saveFileState, saveLocalGame, settings } from './db';
+import { activeVault, db, activity, changeJob, filesFor, gameById, jobsFor, mediaFor, now, productGraph, saveFileState, saveLocalGame, selectedProductFiles, settings } from './db';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { desiredFingerprint, transition, type DownloadFailure, type Game, type Job, type JobState, type RemoteFile } from '../shared/domain';
@@ -7,6 +7,8 @@ import { folderName, gameFolder, scanGame, vaultPath } from './storage';
 import { archiveMedia } from './media';
 
 const running = new Map<number, AbortController>();
+const transferring = new Set<number>();
+const waitingTransfers = new Map<number, () => void>();
 const inFlight = new Set<Promise<void>>();
 const listeners = new Set<(jobs: Job[]) => void>();
 export const partNumber = (name: string): number | null => {
@@ -64,22 +66,19 @@ export function enqueue(gameId: string) {
   return job.id;
 }
 export function missingFilesForParent(game: Game, gameId: string): RemoteFile[] {
-  const bundleBonus = game.productType === 'bundle' && !filesFor(game.id).length &&
-    game.dlcChildren?.some(child => child.id === gameId && child.selected && child.bonusOnly);
-  return filesFor(gameId).filter(file => !file.unavailable && !file.verified && !file.matched &&
-    (file.selected || bundleBonus && file.category === 'extras'));
+  return selectedProductFiles(game.id).filter(file => file.gameId === gameId && !file.verified && !file.matched);
 }
 export function enqueueWithChildren(gameId: string) {
   if (!settings().vaultPath) throw new Error('Select a vault directory first');
   const game = gameById(gameId);
   if (!game) throw new Error('Game not found');
-  const ids = [gameId, ...(game.dlcChildren || []).filter(child => child.selected).map(child => child.id)];
+  const ids = productGraph(gameId).ids;
   const started: number[] = [];
   for (const id of new Set(ids)) {
     if (jobsFor(id).some(job => ['queued', 'downloading', 'paused', 'verifying'].includes(job.state))) continue;
     const missing = missingFilesForParent(game, id);
     if (!missing.length) continue;
-    for (const file of missing.filter(file => !file.selected))
+    for (const file of missing.filter(file => !filesFor(id).find(current => current.key === file.key)?.selected))
       db.query('UPDATE remote_files SET selected=1 WHERE game_id=? AND key=?').run(id, file.key);
     started.push(enqueue(id));
   }
@@ -131,18 +130,44 @@ export function cancelObsoleteSnapshots(gameId: string, currentKeys: ReadonlySet
   }
 }
 let scheduling = false;
+async function acquireTransfer(id: number, signal: AbortSignal) {
+  if (signal.aborted) throw new Error('Download interrupted');
+  if (transferring.has(id)) return;
+  changeJob(id, 'queued'); broadcast();
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => { waitingTransfers.delete(id); reject(new Error('Download interrupted')); schedule(); };
+    waitingTransfers.set(id, () => {
+      signal.removeEventListener('abort', abort);
+      if (signal.aborted) { reject(new Error('Download interrupted')); return; }
+      transferring.add(id); resolve();
+    });
+    signal.addEventListener('abort', abort, { once: true });
+    schedule();
+  });
+}
+function releaseTransfer(id: number) {
+  transferring.delete(id);
+  schedule();
+}
 export function schedule() {
   if (scheduling || stopping) return;
   scheduling = true;
   void vaultPath().then(() => {
     scheduling = false;
     if (stopping) return;
-    const slots = Math.max(1, settings().concurrency) - running.size;
-    for (const job of jobsFor().filter(entry => entry.state === 'queued').slice(0, Math.max(0, slots))) {
+    const limit = Math.max(1, settings().concurrency);
+    let slots = Math.max(0, limit - transferring.size);
+    for (const [id, resume] of waitingTransfers) {
+      if (!slots) break;
+      waitingTransfers.delete(id); resume(); slots--;
+    }
+    slots = Math.min(slots, Math.max(0, limit + 1 - running.size));
+    for (const job of jobsFor().filter(entry => entry.state === 'queued' && !running.has(entry.id)).sort((left, right) => left.id - right.id).slice(0, slots)) {
       const controller = new AbortController();
       if ((db.query('SELECT vault_id FROM download_jobs WHERE id=?').get(job.id) as { vault_id: number } | null)?.vault_id !== activeVault()?.id) continue;
       running.set(job.id, controller);
-      const task = run(job, controller).finally(() => { running.delete(job.id); inFlight.delete(task); broadcast(); schedule(); });
+      transferring.add(job.id);
+      const task = run(job, controller).finally(() => { running.delete(job.id); transferring.delete(job.id); inFlight.delete(task); broadcast(); schedule(); });
       inFlight.add(task);
     }
   }).catch(() => { scheduling = false; });
@@ -171,6 +196,9 @@ async function run(job: Job, controller: AbortController) {
     const folder = await gameFolder(game, true, destination);
     for (const entry of pending) {
       if (controller.signal.aborted) return;
+      await acquireTransfer(job.id, controller.signal);
+      if (controller.signal.aborted) return;
+      changeJob(job.id, 'downloading');
       const file = entry.snapshot ? JSON.parse(entry.snapshot) as ReturnType<typeof filesFor>[number] : filesFor(job.gameId).find(item => item.key === entry.file_key);
       if (!file) throw new Error('Queued file has no saved download metadata');
       activeFile = file;
@@ -191,7 +219,10 @@ async function run(job: Job, controller: AbortController) {
         db.query('UPDATE download_files SET state=?,bytes=? WHERE job_id=? AND file_key=?').run('verifying', expectedSize || file.size, job.id, file.key);
         db.query('UPDATE download_jobs SET bytes=?,speed=0 WHERE id=?').run(completed.total + (expectedSize || file.size), job.id);
         broadcast();
-      }, () => {
+        releaseTransfer(job.id);
+      }, async () => {
+        await acquireTransfer(job.id, controller.signal);
+        if (controller.signal.aborted) throw new Error('Download interrupted');
         changeJob(job.id, 'downloading');
         db.query('UPDATE download_files SET state=? WHERE job_id=? AND file_key=?').run('downloading', job.id, file.key);
         lastWrite = lastBytes = 0; lastTime = Date.now();
@@ -209,7 +240,8 @@ async function run(job: Job, controller: AbortController) {
         saveFileState(job.gameId, file.key, { ...file, name: filename, matched: true, verified: true,
           verificationSource: verification?.source || 'gog-checksum', verifiedSize: verification?.size || file.size,
           checksumUrl: verification?.checksumUrl || '' }, jobVaultId);
-        db.query("UPDATE download_files SET state='complete',bytes=? WHERE job_id=? AND file_key=?").run(verification?.size || file.size, job.id, file.key);
+        db.query("UPDATE download_files SET state='complete',bytes=?,snapshot=? WHERE job_id=? AND file_key=?")
+          .run(verification?.size || file.size, JSON.stringify({ ...file, name: filename, size: verification?.size || file.size }), job.id, file.key);
         if (verification) db.query('UPDATE download_jobs SET total=total+? WHERE id=?').run(verification.size - file.size, job.id);
         if (verification && info) db.query('INSERT INTO vault_local_files(vault_id,game_id,relative_path,size,mtime_ms,sha256,verified_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(vault_id,game_id,relative_path) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,sha256=excluded.sha256,verified_at=excluded.verified_at')
           .run(jobVaultId, game.id, filename, verification.size, Math.round(info.mtimeMs), verification.sha256, now());
@@ -218,18 +250,22 @@ async function run(job: Job, controller: AbortController) {
     }
     if (controller.signal.aborted) return;
     changeJob(job.id, 'verifying'); broadcast();
+    releaseTransfer(job.id);
     stage = 'indexing';
-    await scanGame(job.gameId);
+    await scanGame(job.gameId, false, undefined, new Set(), undefined, controller.signal);
+    if (controller.signal.aborted) return;
     const snapshot = db.query('SELECT desired_hash FROM download_jobs WHERE id=?').get(job.id) as { desired_hash: string };
     saveLocalGame(job.gameId, { archivedHash: game.manifestHash, archivedSelectedHash: snapshot.desired_hash || desiredFingerprint(filesFor(job.gameId)) }, jobVaultId);
     if (mediaFor(job.gameId).some(asset => asset.selected && !asset.external && !asset.localPath)) {
       try { await archiveMedia(job.gameId); }
       catch (error) { activity(`${game.title} media archive incomplete: ${safeError(error)}`); }
     }
+    if (controller.signal.aborted) return;
     changeJob(job.id, 'complete');
     db.query('UPDATE download_jobs SET bytes=total,speed=0,current_file=? WHERE id=?').run('', job.id);
     activity(`${game.title} download verified`);
     console.log(JSON.stringify({ event: 'download_complete', title: game.title }));
+    void import('./gog/library').then(library => library.refreshIncompletePacks()).then(() => broadcast()).catch(() => {});
   } catch (error) {
     if (!controller.signal.aborted) {
       const message = safeError(error);
@@ -239,8 +275,9 @@ async function run(job: Job, controller: AbortController) {
       }
       const details: DownloadFailure = { stage, productId: job.gameId, fileId: activeFile?.key || '', filename: activeFile?.name || '',
         partNumber: activeFile ? partNumber(activeFile.name) : null, httpStatus, errorCode: error instanceof Error && 'code' in error && typeof error.code === 'string' && /^[A-Z0-9_]+$/.test(error.code) ? error.code : '',
-        safeMessage: message, technicalMessage: message, timestamp: now(), retryable: !/Unsafe|checksum mismatch/i.test(message) };
+        safeMessage: message, technicalMessage: message, timestamp: now(), retryable: !/Unsafe/i.test(message) };
       changeJob(job.id, 'error', message);
+      if (activeFile) db.query("UPDATE download_files SET state='error' WHERE job_id=? AND file_key=? AND state IN ('downloading','verifying')").run(job.id, activeFile.key);
       db.query('UPDATE download_jobs SET error_details=? WHERE id=?').run(JSON.stringify(details), job.id);
       if (process.env.GOG_VAULT_DEBUG_DOWNLOAD === '1') console.warn(JSON.stringify({ event: 'download', productId: job.gameId, file: details.filename, part: details.partNumber, stage, httpStatus, error: message }));
       activity(`${game.title} download failed`);

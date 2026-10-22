@@ -10,10 +10,12 @@ test('initial migration creates schema once and is safe to rerun', () => {
   try {
     migrate(database);
     migrate(database);
-    expect(database.query('SELECT version FROM migrations').all()).toEqual(Array.from({ length: 17 }, (_, index) => ({ version: index + 1 })));
+    expect(database.query('SELECT version FROM migrations').all()).toEqual(Array.from({ length: 21 }, (_, index) => ({ version: index + 1 })));
     expect(database.query("SELECT name FROM sqlite_master WHERE name='download_files'").get()).toEqual({ name: 'download_files' });
     expect(database.query("SELECT name FROM sqlite_master WHERE name='import_files'").get()).toEqual({ name: 'import_files' });
     expect(database.query("SELECT name FROM sqlite_master WHERE name='product_relationships'").get()).toEqual({ name: 'product_relationships' });
+    expect(database.query("SELECT name FROM sqlite_master WHERE name='account_shelves'").get()).toEqual({ name: 'account_shelves' });
+    expect(database.query("SELECT name FROM sqlite_master WHERE name='product_inclusions'").get()).toEqual({ name: 'product_inclusions' });
   } finally { database.close(); }
 });
 test('upgrading a disk database backs up legacy records before adding vault scope', () => {
@@ -23,7 +25,7 @@ test('upgrading a disk database backs up legacy records before adding vault scop
   try {
     database.exec(`CREATE TABLE migrations(version INTEGER PRIMARY KEY);
       CREATE TABLE games(id TEXT PRIMARY KEY);
-      CREATE TABLE download_jobs(id INTEGER PRIMARY KEY);
+      CREATE TABLE download_jobs(id INTEGER PRIMARY KEY,state TEXT NOT NULL DEFAULT 'queued',updated_at TEXT NOT NULL DEFAULT '');
       CREATE TABLE import_jobs(id TEXT PRIMARY KEY);
       CREATE TABLE unlinked_folders(vault_path TEXT,folder TEXT);
       CREATE TABLE ignored_folders(vault_path TEXT,folder TEXT);`);
@@ -37,7 +39,7 @@ test('upgrading a disk database backs up legacy records before adding vault scop
       expect(original.query('SELECT id FROM games').get()).toEqual({ id: 'legacy-owned-game' });
       expect(original.query('SELECT version FROM migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 12 });
     } finally { original.close(); }
-    expect(database.query('SELECT version FROM migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 17 });
+    expect(database.query('SELECT version FROM migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 21 });
   } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 test('schema 13 can gain missing scan columns even if another one already exists', () => {
@@ -46,12 +48,13 @@ test('schema 13 can gain missing scan columns even if another one already exists
     database.exec(`CREATE TABLE migrations(version INTEGER PRIMARY KEY);
       CREATE TABLE games(id TEXT PRIMARY KEY);
       CREATE TABLE vaults(id INTEGER PRIMARY KEY);
+      CREATE TABLE download_jobs(id INTEGER PRIMARY KEY,state TEXT NOT NULL DEFAULT 'queued',updated_at TEXT NOT NULL DEFAULT '',vault_id INTEGER);
       CREATE TABLE unlinked_folders(vault_path TEXT, folder TEXT, vault_id INTEGER);
       CREATE TABLE ignored_folders(vault_path TEXT, folder TEXT);`);
     for (let version = 1; version <= 13; version++) database.query('INSERT INTO migrations VALUES (?)').run(version);
     migrate(database);
     expect((database.query('PRAGMA table_info(ignored_folders)').all() as { name: string }[]).some(column => column.name === 'vault_id')).toBe(true);
-    expect(database.query('SELECT MAX(version) AS version FROM migrations').get()).toEqual({ version: 17 });
+    expect(database.query('SELECT MAX(version) AS version FROM migrations').get()).toEqual({ version: 21 });
   } finally { database.close(); }
 });
 test('upgrading existing DLC relationships permits a second owned parent', () => {

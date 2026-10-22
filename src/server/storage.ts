@@ -516,6 +516,45 @@ export async function scanVault() {
   } catch (error) { scanState.error = error instanceof Error ? error.message : 'Scan failed'; }
   finally { scanState.running = false; scanState.phase = scanState.cancelled ? 'Cancelled' : 'Complete'; scanState.current = ''; }
 }
+export async function reconcileOfflineArtwork(gameId: string) {
+  const game = gameById(gameId);
+  const vaultId = activeVault()?.id;
+  if (!game?.folder || !vaultId) return;
+  const names = { card: 'cover', hero: 'background', logo: 'logo', icon: 'icon', videoPoster: 'videoPoster' } as const;
+  const missing = mediaFor(gameId).filter(asset => !asset.localPath && asset.role in names);
+  if (!missing.length) return;
+  const folder = await gameFolder(game);
+  const metadata = await readFile(join(folder, '.gog-vault', 'metadata.json'), 'utf8').then(JSON.parse).catch(() => null);
+  if (!metadata?.artworkSources) return;
+  for (const asset of missing) {
+    const name = names[asset.role as keyof typeof names];
+    if (metadata.artworkSources[name] !== asset.url) continue;
+    for (const base of ['.gog-vault/artwork', '.gog-vault']) {
+      let indexed = false;
+      for (const extension of ['png', 'jpg', 'jpeg', 'webp']) {
+        const localPath = `${base}/${name}.${extension}`;
+        const path = join(folder, localPath);
+        try {
+          const info = await lstat(path);
+          if (!info.isFile() || info.size > 10_000_000 || await realpath(path) !== path) continue;
+          const bytes = await readFile(path);
+          const hash = createHash('sha256').update(bytes).digest('hex');
+          if (asset.sha256 && asset.sha256 !== hash) continue;
+          const dimensions = imageSize(bytes);
+          if (!dimensions.width || !dimensions.height || activeVault()?.id !== vaultId) continue;
+          db.query('INSERT INTO vault_media(vault_id,game_id,media_key,local_path) VALUES (?,?,?,?) ON CONFLICT(vault_id,game_id,media_key) DO UPDATE SET local_path=excluded.local_path')
+            .run(vaultId, gameId, asset.key, localPath);
+          db.query('UPDATE media_assets SET width=?,height=?,mime_type=?,sha256=?,size=? WHERE game_id=? AND key=?')
+            .run(dimensions.width, dimensions.height, dimensions.type === 'jpg' ? 'image/jpeg' : `image/${dimensions.type}`, hash, bytes.byteLength, gameId, asset.key);
+          indexed = true;
+          break;
+        } catch {}
+      }
+      if (indexed) break;
+    }
+  }
+}
+
 export async function writeOfflineMetadata(gameId: string) {
   const game = gameById(gameId);
   if (!game?.folder) return;
@@ -541,6 +580,12 @@ export async function writeOfflineMetadata(gameId: string) {
       .map(asset => [asset.role, asset.url])
   ];
   const artworkSources: Record<string, string> = { ...previous.artworkSources };
+  const recordArtwork = (name: string, url: string, filename: string) => {
+    db.query(`INSERT INTO vault_media(vault_id,game_id,media_key,local_path)
+      SELECT ?,game_id,key,? FROM media_assets WHERE game_id=? AND role=? AND url=?
+      ON CONFLICT(vault_id,game_id,media_key) DO UPDATE SET local_path=excluded.local_path`)
+      .run(activeVault()!.id, `.gog-vault/artwork/${filename}`, gameId, name === 'cover' ? 'card' : name === 'background' ? 'hero' : name, url);
+  };
   const recordImage = (name: string, url: string, bytes: Uint8Array) => {
     const dimensions = imageSize(bytes);
     if (!dimensions.width || !dimensions.height) throw new Error('Image dimensions unavailable');
@@ -559,7 +604,7 @@ export async function writeOfflineMetadata(gameId: string) {
       if (!await lstat(destination).then(info => info.isFile()).catch(() => false) && await lstat(join(dir, filename)).then(info => info.isFile()).catch(() => false))
         await rename(join(dir, filename), destination);
       if (await lstat(destination).then(info => info.isFile()).catch(() => false)) {
-        try { recordImage(name, url, await readFile(destination)); continue; } catch {}
+        try { recordImage(name, url, await readFile(destination)); recordArtwork(name, url, filename); continue; } catch {}
       }
     }
     try {
@@ -569,6 +614,7 @@ export async function writeOfflineMetadata(gameId: string) {
         if (bytes.byteLength < 10_000_000) {
           recordImage(name, url, new Uint8Array(bytes));
           await writeSafe(`artwork/${filename}`, Buffer.from(bytes));
+          recordArtwork(name, url, filename);
           for (const oldExt of ['jpg', 'png', 'webp']) {
             for (const base of [artworkDir, ...(previous.artworkSources?.[name] ? [dir] : [])]) {
               if (base !== dir && oldExt === ext) continue;

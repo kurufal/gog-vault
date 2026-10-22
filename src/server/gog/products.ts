@@ -18,6 +18,22 @@ export function trustedGogUrl(value: string, artwork = false): boolean {
 }
 const platform = (value: string): Platform => value === 'osx' || value === 'mac' ? 'mac' : value === 'linux' ? 'linux' : 'windows';
 
+export function parseInclusionIds(raw: unknown, productId: string): string[] {
+  const links = obj(raw)._links;
+  if (!links || typeof links !== 'object' || Array.isArray(links)) throw new Error('GOG inclusion metadata is missing links');
+  const included = links.includesGames;
+  if (included === undefined) return [];
+  if (!Array.isArray(included)) throw new Error('Invalid GOG inclusion links');
+  const ids = included.map(link => {
+    const url = new URL(String(obj(link).href || ''));
+    const match = /^\/v2\/games\/(\d+)$/.exec(url.pathname);
+    if (url.origin !== endpoints.api || url.username || url.password || !match ||
+      obj(link).id !== undefined && String(obj(link).id) !== match[1]) throw new Error('Invalid GOG inclusion link');
+    return match[1]!;
+  });
+  return [...new Set(ids)].filter(id => id !== productId);
+}
+
 export function parseMedia(raw: unknown, gameId: string): MediaAsset[] {
   const product = obj(raw);
   const images = obj(product.images);
@@ -61,10 +77,13 @@ export function parseProduct(raw: unknown): Partial<Game> & { id: string; title:
   const product = record.parse(raw);
   const images = obj(product.images);
   const compatibility = obj(product.content_system_compatibility);
-  const productType = product.type === 'dlc' || product.product_type === 'dlc' || product.is_dlc === true ? 'dlc'
+  const gogGameType = typeof product.game_type === 'string' && product.game_type ? product.game_type : undefined;
+  const productType = gogGameType !== undefined
+    ? gogGameType === 'game' ? 'game' : gogGameType === 'dlc' ? 'dlc' : gogGameType === 'pack' ? 'bundle' : 'unknown'
+    : product.type === 'dlc' || product.product_type === 'dlc' || product.is_dlc === true ? 'dlc'
     : product.type === 'bundle' || product.product_type === 'bundle' || product.is_bundle === true ||
       /(?:^|[_-])bundle$/i.test(String(product.slug || '')) && array(product.expanded_dlcs).length > 0 ? 'bundle' : 'game';
-  return { id: String(product.id), title: product.title, slug: String(product.slug || ''), productType,
+  return { id: String(product.id), title: product.title, slug: String(product.slug || ''), productType, gogGameType,
     cover: (trustedGogUrl(image(product.coverHorizontal), true) ? image(product.coverHorizontal) : '') || image(images.cover) || image(product.image) || image(images.background), background: image(images.background),
     releaseDate: typeof product.release_date === 'string' ? product.release_date : '',
     platforms: (['windows', 'linux', 'osx'] as const).filter(os => compatibility[os]).map(platform),
@@ -116,7 +135,10 @@ export async function product(id: string, ownedProductIds: ReadonlySet<string>) 
   if (!obj(raw).downloads || typeof obj(raw).downloads !== 'object') throw new Error(`GOG product ${id} has no download manifest`);
   const info = parseProduct(raw);
   const previous = gameById(id);
-  if (previous?.productType === 'dlc') info.productType = 'dlc';
+  if (!info.gogGameType && previous?.gogGameType) {
+    info.gogGameType = previous.gogGameType;
+    info.productType = previous.productType;
+  } else if (!info.gogGameType && previous?.productType === 'dlc' && info.productType !== 'bundle') info.productType = 'dlc';
   if (info.cover === info.background) {
     info.cover = await productCard(id, info.title) || resolveLibraryLandscapeArtwork({ cover: previous?.cover || info.cover || '', background: info.background || '', logo: previous?.logo });
   }
@@ -124,7 +146,11 @@ export async function product(id: string, ownedProductIds: ReadonlySet<string>) 
   const logoArtwork = resolveLibraryLandscapeArtwork({ cover: info.background || '', background: info.background || '', logo: previous?.logo });
   const logoIsCard = info.cover !== info.background && (previous?.logo === info.cover || logoArtwork === info.cover);
   const { files, childIds } = productManifest(raw, id, settings(), info.productType === 'dlc', ownedProductIds);
-  return { info, files, childIds, media: parseMedia({ ...obj(raw), coverHorizontal: info.cover, images: { ...obj(obj(raw).images), cover: info.cover, ...(logoIsCard ? { logo2x: info.cover } : {}) }, image: info.cover }, id) };
+  let inclusionIds: string[] | undefined;
+  let inclusionError = '';
+  try { inclusionIds = parseInclusionIds(await gogRequest(`${endpoints.api}/v2/games/${encodeURIComponent(id)}?locale=en-US`), id); }
+  catch (error) { inclusionError = error instanceof Error ? error.message : 'GOG inclusion metadata unavailable'; }
+  return { info, files, childIds, inclusionIds, inclusionError, media: parseMedia({ ...obj(raw), coverHorizontal: info.cover, images: { ...obj(obj(raw).images), cover: info.cover, ...(logoIsCard ? { logo2x: info.cover } : {}) }, image: info.cover }, id) };
 }
 export async function secureLink(file: RemoteFile): Promise<{ url: string; checksum?: string; filename: string; fromMetadata?: boolean }> {
   const data = await gogRequest<Record<string, unknown>>(file.downlink);

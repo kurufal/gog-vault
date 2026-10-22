@@ -12,11 +12,21 @@ test('a queued download uses its saved manifest after refresh', async () => {
   const downloaded: RemoteFile[] = [];
   const scanned: string[] = [];
   let secondStarted = false;
+  let overlapStarted = false;
+  let releaseVerification!: () => void;
+  let releaseTransfer!: () => void;
+  const verificationGate = new Promise<void>(resolve => { releaseVerification = resolve; });
+  const transferGate = new Promise<void>(resolve => { releaseTransfer = resolve; });
+  let releasePack!: () => void;
+  const packGate = new Promise<void>(resolve => { releasePack = resolve; });
+  const packMetadataCalls: string[] = [];
   mock.module('./storage', () => ({
     folderName: () => 'Game', vaultPath: async () => { await ready; return dir; },
     gameFolder: async () => dir, scanGame: async (gameId: string) => { scanned.push(gameId); }, writeOfflineMetadata: async () => {}
   }));
-  mock.module('./transfer', () => ({ downloadFile: async (file: RemoteFile, _folder: string, signal: AbortSignal, _progress: unknown, _verify: unknown, _resume: unknown, _verified: unknown, onStage?: (stage: string, status: number) => void) => {
+  mock.module('./transfer', () => ({ downloadFile: async (file: RemoteFile, _folder: string, signal: AbortSignal, _progress: unknown, onVerify?: (size?: number) => void | Promise<void>, onDownload?: () => void | Promise<void>, _verified?: unknown, onStage?: (stage: string, status: number) => void) => {
+    if (file.key === '80:first') { await onVerify?.(file.size); await verificationGate; }
+    if (file.gameId === '81') { await onDownload?.(); overlapStarted = true; await transferGate; }
     if (file.gameId === '44') { onStage?.('http_response', 416); throw new Error('Download failed at https://cdn.gog.com/file?token=secret'); }
     if (file.key === '45:bonus') { onStage?.('resolve_downlink', 404); throw new Error('GOG /products/42/downlink/product_bonus/90287 returned HTTP 404'); }
     if (file.gameId === '43') await new Promise<void>((_resolve, reject) => {
@@ -32,9 +42,17 @@ test('a queued download uses its saved manifest after refresh', async () => {
       expect(url).toBe('https://embed.gog.com/user/data/games');
       return { owned: ['42', '43', '44', '45', '46', '47', '50', '51', '60', '61'] };
     } }));
-  const { activeVault, db, filesFor, gameById, upsertGame, replaceFiles, saveSettings, linkDlcProducts } = await import('./db');
+  mock.module('./gog/auth', () => ({ accountInfo: async () => ({ connected: true, userId: 'fixture' }) }));
+  mock.module('./gog/products', () => ({ product: async (id: string) => {
+    packMetadataCalls.push(id);
+    if (id !== '90') throw new Error('GOG unavailable');
+    await packGate;
+    return { info: { id, title: 'Recovered deluxe pack', productType: 'bundle', gogGameType: 'pack' },
+      files: [], media: [], childIds: [], inclusionIds: ['72', '73'], inclusionError: '' };
+  }, parseProduct: (raw: unknown) => raw, trustedGogUrl: () => false, secureLink: async () => { throw new Error('No live download links in this test'); } }));
+  const { activeVault, db, filesFor, gameById, jobsFor, upsertGame, replaceFiles, saveSettings, linkDlcProducts, saveProductInclusions, recordInclusionError } = await import('./db');
   const { command, enqueue, enqueueWithChildren, missingFilesForParent, shutdownQueue } = await import('./queue');
-  const { refreshOwnedProducts, saveProductManifest } = await import('./gog/library');
+  const { refreshIncompletePacks, refreshOwnedProducts, saveProductManifest } = await import('./gog/library');
   try {
     saveSettings({ vaultPath: dir });
     upsertGame({ id: '42', title: 'Game' });
@@ -54,6 +72,14 @@ test('a queued download uses its saved manifest after refresh', async () => {
       }, 10);
     });
     await done;
+    const history = jobsFor('42').find(job => job.id === id)!;
+    expect(history.startedAt).toBeTruthy();
+    expect(history.finishedAt).toBeTruthy();
+    expect(Date.parse(history.finishedAt!)).toBeGreaterThanOrEqual(Date.parse(history.startedAt!));
+    expect(history.files?.map(file => ({ name: file.name, state: file.state }))).toEqual([
+      { name: 'Game (Part 1 of 11)', state: 'complete' }, { name: 'Game (Part 10 of 11)', state: 'complete' }, { name: 'Game (Part 2 of 11)', state: 'complete' }
+    ]);
+    expect(JSON.stringify(history.files)).not.toContain('https://');
     expect(scanned).toContain('42');
     expect(downloaded.map(file => file.name)).toEqual(['Game (Part 1 of 11)', 'Game (Part 2 of 11)', 'Game (Part 10 of 11)']);
     expect(downloaded[0]?.downlink).toBe(original.downlink);
@@ -162,6 +188,84 @@ test('a queued download uses its saved manifest after refresh', async () => {
     expect(db.query('SELECT game_id FROM download_jobs WHERE id=?').get(bonusJobs[0])).toEqual({ game_id: '53' });
     expect(db.query('SELECT file_key FROM download_files WHERE job_id=?').get(bonusJobs[0])).toEqual({ file_key: '53:bonus' });
     expect(filesFor('53')[0]?.selected).toBe(true);
+    upsertGame({ id: '70', title: 'Outer collection', productType: 'bundle' });
+    upsertGame({ id: '71', title: 'Premium edition', productType: 'bundle' });
+    upsertGame({ id: '72', title: 'Included base game' });
+    upsertGame({ id: '73', title: 'Included season pass', productType: 'dlc' });
+    replaceFiles('70', []); replaceFiles('71', []);
+    replaceFiles('72', [{ ...original, gameId: '72', key: '72:installer' }]);
+    replaceFiles('73', [{ ...original, gameId: '73', key: '73:installer' }]);
+    saveProductInclusions('71', ['72', '73']); saveProductInclusions('70', ['71', '72']);
+    linkDlcProducts('71', ['73']);
+    recordInclusionError('71', 'GOG metadata unavailable');
+    expect(gameById('71')).toMatchObject({ inclusionWarning: true, includedProducts: expect.arrayContaining([{ id: '72', title: 'Included base game', owned: true, selected: true, status: 'Not Downloaded', completion: 0, pending: true }]) });
+    saveProductInclusions('71', ['72', '73']);
+    expect(gameById('71')?.inclusionError).toBeUndefined();
+    const includedJobs = enqueueWithChildren('70');
+    expect(includedJobs).toHaveLength(2);
+    expect(db.query("SELECT game_id FROM download_jobs WHERE game_id IN ('70','71','72','73') ORDER BY game_id").all()).toEqual([{ game_id: '72' }, { game_id: '73' }]);
+    expect(() => enqueueWithChildren('72')).toThrow('No missing selected files');
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Included products did not finish')), 5000);
+      const poll = setInterval(() => {
+        if (includedJobs.every(job => (db.query('SELECT state FROM download_jobs WHERE id=?').get(job) as { state: string }).state === 'complete')) {
+          clearInterval(poll); clearTimeout(timeout); resolve();
+        }
+      }, 10);
+    });
+    expect(downloaded.filter(file => file.gameId === '72')).toHaveLength(1);
+    expect(downloaded.filter(file => file.gameId === '73')).toHaveLength(1);
+    expect(gameById('70')?.status).toBe('Vaulted');
+    expect(gameById('71')?.status).toBe('Vaulted');
+    saveSettings({ concurrency: 1 });
+    upsertGame({ id: '80', title: 'Verifying game' });
+    upsertGame({ id: '81', title: 'Overlapping transfer' });
+    replaceFiles('80', [{ ...original, gameId: '80', key: '80:first' }, { ...original, gameId: '80', key: '80:second' }]);
+    replaceFiles('81', [{ ...original, gameId: '81', key: '81:installer' }]);
+    const verifyingJob = enqueue('80');
+    const overlappingJob = enqueue('81');
+    expect(jobsFor('81')[0]?.files).toMatchObject([{ state: 'queued', bytes: 0, size: original.size }]);
+    const waitFor = async (condition: () => boolean) => {
+      const deadline = Date.now() + 5000;
+      while (!condition()) {
+        if (Date.now() > deadline) throw new Error('Overlapping queue did not advance');
+        await Bun.sleep(10);
+      }
+    };
+    await waitFor(() => overlapStarted);
+    expect(jobsFor('80')[0]?.state).toBe('verifying');
+    expect(jobsFor('81')[0]?.state).toBe('downloading');
+    const firstStart = jobsFor('80')[0]?.startedAt;
+    releaseVerification();
+    await waitFor(() => jobsFor('80')[0]?.state === 'queued');
+    expect(downloaded.filter(file => file.key === '80:second')).toHaveLength(0);
+    command(verifyingJob, 'pause');
+    await waitFor(() => jobsFor('80')[0]?.state === 'paused');
+    command(verifyingJob, 'resume');
+    releaseTransfer();
+    await waitFor(() => jobsFor('80')[0]?.state === 'complete' && jobsFor('81')[0]?.state === 'complete');
+    expect(jobsFor('80')[0]?.startedAt).toBe(firstStart);
+    expect(downloaded.filter(file => file.key === '80:first')).toHaveLength(1);
+    expect(downloaded.filter(file => file.key === '80:second')).toHaveLength(1);
+    expect(jobsFor('81')[0]?.id).toBe(overlappingJob);
+    const priorDownloads = downloaded.length;
+    upsertGame({ id: '90', title: 'Unresolved deluxe pack', productType: 'bundle' });
+    const packRepair = refreshIncompletePacks();
+    expect(refreshIncompletePacks()).toBe(packRepair);
+    await waitFor(() => packMetadataCalls.includes('90'));
+    expect(gameById('90')?.status).not.toBe('Vaulted');
+    releasePack();
+    await packRepair;
+    expect(gameById('90')?.status).toBe('Vaulted');
+    expect(gameById('90')?.includedProducts?.map(product => product.id)).toEqual(['72', '73']);
+    expect(packMetadataCalls.filter(id => id === '90')).toHaveLength(1);
+    upsertGame({ id: '94', title: 'Offline unresolved pack', productType: 'bundle' });
+    await refreshIncompletePacks();
+    await refreshIncompletePacks();
+    expect(packMetadataCalls.filter(id => id === '94')).toHaveLength(1);
+    expect(gameById('94')?.inclusionError).toContain('could not be refreshed');
+    expect(gameById('94')?.status).not.toBe('Vaulted');
+    expect(downloaded).toHaveLength(priorDownloads);
     upsertGame({ id: '60', title: 'Legacy base game' });
     upsertGame({ id: '61', title: 'Legacy queued DLC' });
     replaceFiles('61', [{ ...original, gameId: '61', key: '61:installer' }]);
@@ -186,6 +290,8 @@ test('a queued download uses its saved manifest after refresh', async () => {
     expect(db.query('SELECT state FROM download_files WHERE job_id=?').get(interrupted)).toEqual({ state: 'queued' });
   } finally {
     release();
+    releaseVerification(); releaseTransfer();
+    releasePack();
     await shutdownQueue();
     db.close();
     await rm(dir, { recursive: true, force: true });

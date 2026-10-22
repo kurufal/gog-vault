@@ -98,7 +98,21 @@ const migrations = [
        INSERT INTO product_relationships_next SELECT * FROM product_relationships;
        DROP TABLE product_relationships;
        ALTER TABLE product_relationships_next RENAME TO product_relationships;
-       CREATE INDEX idx_dlc_parent ON product_relationships(parent_product_id,relationship_type);`
+       CREATE INDEX idx_dlc_parent ON product_relationships(parent_product_id,relationship_type);`,
+      `CREATE TABLE account_shelves (account_id TEXT PRIMARY KEY, product_ids TEXT NOT NULL, refreshed_at TEXT NOT NULL);`,
+      `ALTER TABLE games ADD COLUMN inclusions_refreshed_at TEXT NOT NULL DEFAULT '';
+        ALTER TABLE games ADD COLUMN inclusions_error TEXT NOT NULL DEFAULT '';
+       CREATE TABLE product_inclusions (
+         parent_product_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+         included_product_id TEXT NOT NULL,
+         PRIMARY KEY(parent_product_id,included_product_id),
+         CHECK(parent_product_id!=included_product_id)
+       );
+      CREATE INDEX idx_included_product ON product_inclusions(included_product_id);`,
+            `ALTER TABLE games ADD COLUMN gog_game_type TEXT NOT NULL DEFAULT '';`,
+          `ALTER TABLE download_jobs ADD COLUMN started_at TEXT NOT NULL DEFAULT '';
+           ALTER TABLE download_jobs ADD COLUMN finished_at TEXT NOT NULL DEFAULT '';
+           UPDATE download_jobs SET finished_at=updated_at WHERE state IN ('complete','error','cancelled');`
     ];
 
     const backfillDlc = `INSERT OR IGNORE INTO product_relationships(parent_product_id,child_product_id,relationship_type,selected)
@@ -107,7 +121,6 @@ const migrations = [
          JOIN remote_files own ON own.game_id=child.id AND own.key=parent.key
          WHERE parent.category IN ('dlc','extras','patches','languagePacks') AND parent.game_id!=child.id
          GROUP BY parent.game_id,child.id;
-       UPDATE games SET product_type='dlc' WHERE id IN (SELECT child_product_id FROM product_relationships WHERE relationship_type='dlc');
        INSERT OR IGNORE INTO vault_child_file_locations(vault_id,child_product_id,file_key,storage_game_id,relative_path)
          SELECT state.vault_id,child.id,state.file_key,parent.game_id,state.name
          FROM vault_file_state state JOIN remote_files parent ON parent.game_id=state.game_id AND parent.key=state.file_key
@@ -138,7 +151,11 @@ const migrations = [
            WHERE job.game_id=remote_files.game_id AND snapshot.file_key=remote_files.key
              AND job.state IN ('queued','downloading','paused','verifying','error'));`;
 
-export function reconcileDlcRecords(db: Database) { db.exec(backfillDlc); }
+export function reconcileDlcRecords(db: Database) {
+  db.exec(backfillDlc);
+  const hasSourceType = (db.query('PRAGMA table_info(games)').all() as { name: string }[]).some(column => column.name === 'gog_game_type');
+  db.exec(`UPDATE games SET product_type='dlc' WHERE id IN (SELECT child_product_id FROM product_relationships WHERE relationship_type='dlc')${hasSourceType ? " AND gog_game_type=''" : ''}`);
+}
 
 export function migrate(db: Database, databasePath?: string, throughVersion = migrations.length) {
   db.exec('CREATE TABLE IF NOT EXISTS migrations (version INTEGER PRIMARY KEY)');

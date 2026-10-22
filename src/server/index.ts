@@ -6,9 +6,9 @@ import { withinRoot } from './paths';
 import { startupConfig, validSession } from './startup';
 import { accountInfo, connect, disconnect, loginUrl } from './gog/auth';
 import { product } from './gog/products';
-import { refreshLibrary, refreshOwnedProducts, refreshState, saveProductManifest } from './gog/library';
-import { activity, configDir, db, filesFor, gameById, games, jobsFor, linkDlcProducts, mediaFor, replaceFiles, replaceMedia, saveSettings, selectDlcProduct, setHiddenGames, settings, upsertGame } from './db';
-import { cancelScan, ignoreFolder, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
+import { cachedAccountShelf, refreshAccountShelf, refreshIncompletePacks, refreshLibrary, refreshOwnedProducts, refreshState, saveProductManifest } from './gog/library';
+import { activity, configDir, db, filesFor, gameById, games, jobsFor, linkDlcProducts, mediaFor, productGraph, replaceFiles, replaceMedia, saveSettings, selectDlcProduct, setHiddenGames, settings, upsertGame } from './db';
+import { cancelScan, ignoreFolder, importPreview, linkAndScan, loadScanFolders, matchingReview, organizeGame, organizePreview, reconcileOfflineArtwork, scanGame, scanVault, scanState, selectVault, storageInfo, vaultPath } from './storage';
 import { enqueueImports, importCommand, importJobs, shutdownImports, startImports, subscribeImports } from './imports';
 import { cancelVerification, enqueueVerification, hasActiveVerification, removeVerification, verificationJobs } from './verification';
 import { archiveMedia, selectMedia } from './media';
@@ -17,6 +17,7 @@ import { broadcast, command, enqueueWithChildren, missingFilesForParent, schedul
 const { token, host, port } = startupConfig();
 let playbackPort = port;
 const mediaTickets = new Map<string, { id: string; key: string; expires: number }>();
+const artworkReconciliations = new Map<string, Promise<void>>();
 const allowedOrigins = new Set(['http://tauri.localhost', 'tauri://localhost', ...(process.env.GOG_VAULT_DEV === '1' ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
 const app = new Elysia()
   .onRequest(({ request }) => {
@@ -77,13 +78,29 @@ const app = new Elysia()
   .delete('/api/gog/auth', async () => { await disconnect(); activity('GOG account disconnected'); return { ok: true }; })
   .get('/api/gog/library', () => refreshState)
   .post('/api/gog/library', () => { void refreshLibrary(); return { started: true }; })
-  .get('/api/games', () => games())
+  .get('/api/gog/shelf', () => cachedAccountShelf())
+  .post('/api/gog/shelf', () => refreshAccountShelf())
+  .get('/api/games', async () => {
+    void refreshIncompletePacks().catch(() => {});
+    const library = games();
+    await Promise.all(library.filter(game => game.folder && game.mediaStatus && game.mediaStatus.images.archived < game.mediaStatus.images.total).map(game => {
+      const key = JSON.stringify([settings().vaultPath, game.id, game.folder, game.refreshedAt]);
+      let pending = artworkReconciliations.get(key);
+      if (!pending) {
+        pending = reconcileOfflineArtwork(game.id).catch(() => { artworkReconciliations.delete(key); });
+        artworkReconciliations.set(key, pending);
+      }
+      return pending;
+    }));
+    return games();
+  })
   .patch('/api/games/visibility', ({ body }) => setHiddenGames(body.ids, body.hidden), { body: t.Object({ ids: t.Array(t.String()), hidden: t.Boolean() }) })
   .get('/api/library/download-preview', () => games().flatMap(game => {
-    const ids = [game.id, ...(game.dlcChildren || []).filter(child => child.selected).map(child => child.id)];
+    const ids = productGraph(game.id).ids;
     const missing = [...new Set(ids)].flatMap(id => jobsFor(id).some(job => ['queued', 'downloading', 'verifying', 'paused'].includes(job.state))
       ? [] : missingFilesForParent(game, id));
-    return missing.length ? [{ id: game.id, title: game.title, files: missing.length, bytes: missing.reduce((sum, file) => sum + file.size, 0) }] : [];
+    return missing.length ? [{ id: game.id, title: game.title, files: missing.length, bytes: missing.reduce((sum, file) => sum + file.size, 0),
+      targets: missing.map(file => ({ gameId: file.gameId, key: file.key, size: file.size })) }] : [];
   }))
   .post('/api/library/download-missing', ({ body }) => {
     const started: { id: string; job: number }[] = []; const skipped: { id: string; reason: string }[] = [];
@@ -93,7 +110,7 @@ const app = new Elysia()
     }
     return { started, skipped };
   }, { body: t.Object({ ids: t.Array(t.String()) }) })
-  .get('/api/games/:id', ({ params }) => { const game = gameById(params.id); if (!game) throw new Error('Game not found'); return { game, files: filesFor(params.id), media: mediaFor(params.id) }; })
+  .get('/api/games/:id', async ({ params }) => { await reconcileOfflineArtwork(params.id).catch(() => {}); const game = gameById(params.id); if (!game) throw new Error('Game not found'); return { game, files: filesFor(params.id), media: mediaFor(params.id) }; })
   .patch('/api/games/:id/dlc/:childId', ({ params, body }) => {
     const game = selectDlcProduct(params.id, params.childId, body.selected);
     return { game, files: filesFor(params.id), media: mediaFor(params.id) };
@@ -101,8 +118,8 @@ const app = new Elysia()
   .post('/api/games/:id/downloads', async ({ params }) => {
     if (!gameById(params.id)) throw new Error('Game not found');
     const ownedIds = await refreshOwnedProducts();
-    const { info, files, media, childIds } = await product(params.id, ownedIds);
-    upsertGame(info); saveProductManifest(params.id, files, childIds); replaceMedia(params.id, media);
+    const { info, files, media, childIds, inclusionIds, inclusionError } = await product(params.id, ownedIds);
+    upsertGame(info); saveProductManifest(params.id, files, childIds, inclusionIds, inclusionError); replaceMedia(params.id, media);
     return { game: gameById(params.id), files: filesFor(params.id), media: mediaFor(params.id) };
   })
   .patch('/api/games/:id/selections', ({ params, body }) => {

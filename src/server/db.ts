@@ -2,8 +2,9 @@ import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, normalize } from 'node:path';
 import { defaults, completion, contentAvailability, selectedChildCompletion, desiredFingerprint, manifestFingerprint, platformStates, previousInstallerSet, reconcileLocalGameState, statusFor, type Game, type Job, type RemoteFile, type MediaAsset, type Settings, type JobState } from '../shared/domain';
-import { resolveLibraryLandscapeArtwork } from '../shared/media';
+import { mediaArchiveStatus, resolveLibraryLandscapeArtwork } from '../shared/media';
 import { migrate, reconcileDlcRecords } from './migrations';
+import type { AccountShelf } from '../shared/domain';
 
 export const configDir = process.env.GOG_VAULT_DATA_DIR || './config';
 mkdirSync(configDir, { recursive: true });
@@ -103,6 +104,17 @@ function reconcileLinkedArchiveState() {
 export function activity(message: string) {
   db.query('INSERT INTO activity(at,message) VALUES (?,?)').run(now(), message);
 }
+export function accountShelf(accountId: string): AccountShelf {
+  const row = db.query('SELECT product_ids,refreshed_at FROM account_shelves WHERE account_id=?').get(accountId) as
+    { product_ids: string; refreshed_at: string } | null;
+  return row ? { ids: JSON.parse(row.product_ids), refreshedAt: row.refreshed_at } : { ids: [], refreshedAt: '' };
+}
+export function saveAccountShelf(accountId: string, ids: string[]): AccountShelf {
+  db.query(`INSERT INTO account_shelves(account_id,product_ids,refreshed_at) VALUES (?,?,?)
+    ON CONFLICT(account_id) DO UPDATE SET product_ids=excluded.product_ids,refreshed_at=excluded.refreshed_at`)
+    .run(accountId, JSON.stringify([...new Set(ids)]), now());
+  return accountShelf(accountId);
+}
 export function settings(): Settings {
   const rows = db.query('SELECT key,value FROM settings').all() as { key: string; value: string }[];
   const stored = Object.fromEntries(rows.map(row => [row.key, JSON.parse(row.value)]));
@@ -158,7 +170,89 @@ export function jobsFor(gameId?: string): Job[] {
   const rows = (gameId ? db.query('SELECT * FROM download_jobs WHERE game_id=? AND vault_id=? ORDER BY id DESC').all(gameId, vaultId) : db.query('SELECT * FROM download_jobs WHERE vault_id=? ORDER BY id DESC').all(vaultId)) as Row[];
   return rows.map(row => ({ id: row.id, gameId: row.game_id, state: row.state, createdAt: row.created_at,
     updatedAt: row.updated_at, error: row.error, currentFile: row.current_file, bytes: row.bytes, total: row.total, speed: row.speed,
+    startedAt: row.started_at, finishedAt: row.finished_at,
+    files: (db.query('SELECT file_key,snapshot,state,bytes FROM download_files WHERE job_id=? ORDER BY rowid').all(row.id) as Row[]).map(file => {
+      const snapshot = file.snapshot ? JSON.parse(file.snapshot) as Partial<RemoteFile> : {};
+      return { name: snapshot.name || file.file_key, size: snapshot.size || 0, bytes: file.bytes, state: file.state };
+    }),
     errorDetails: row.error_details ? JSON.parse(row.error_details) : null }));
+}
+export function saveProductInclusions(parentId: string, childIds: string[]) {
+  db.transaction(() => {
+    db.query('DELETE FROM product_inclusions WHERE parent_product_id=?').run(parentId);
+    const insert = db.query('INSERT INTO product_inclusions(parent_product_id,included_product_id) VALUES (?,?)');
+    for (const childId of new Set(childIds)) if (childId !== parentId) insert.run(parentId, childId);
+    db.query("UPDATE games SET inclusions_refreshed_at=?,inclusions_error='' WHERE id=?").run(now(), parentId);
+  })();
+}
+export function recordInclusionError(parentId: string, error: string) {
+  db.query('UPDATE games SET inclusions_error=? WHERE id=?').run(error, parentId);
+}
+export function productGraph(gameId: string) {
+  const ids = new Set<string>();
+  const unresolved = new Set<string>();
+  const bonusIds = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string, ancestors: Set<string>, inheritedExclusions: ReadonlySet<string>) => {
+    if (ancestors.has(id)) { unresolved.add(id); return; }
+    const context = JSON.stringify([id, [...inheritedExclusions].sort()]);
+    if (visited.has(context)) return;
+    visited.add(context);
+    const row = db.query('SELECT owned,product_type,gog_game_type,slug,manifest_hash,inclusions_refreshed_at,inclusions_error FROM games WHERE id=?').get(id) as Row | null;
+    if (!row?.owned) { unresolved.add(id); return; }
+    ids.add(id);
+    if (!row.manifest_hash || row.inclusions_error) unresolved.add(id);
+    const dlc = db.query('SELECT child_product_id AS id,selected FROM product_relationships WHERE parent_product_id=?').all(id) as { id: string; selected: number }[];
+    const excluded = new Set([...inheritedExclusions, ...dlc.filter(child => !child.selected).map(child => child.id)]);
+    const included = db.query('SELECT included_product_id AS id FROM product_inclusions WHERE parent_product_id=?').all(id) as { id: string }[];
+    const bundle = row.product_type === 'bundle' || !row.gog_game_type && /(?:^|[_-])bundle$/i.test(row.slug) && (dlc.length > 0 || included.length > 0);
+    if (bundle && !row.inclusions_refreshed_at) unresolved.add(id);
+    const children = new Set([...included.filter(child => !dlc.some(relation => relation.id === child.id && !relation.selected)).map(child => child.id),
+      ...dlc.filter(child => child.selected).map(child => child.id)]);
+    const path = new Set([...ancestors, id]);
+    for (const childId of children) {
+      if (excluded.has(childId)) continue;
+      const childFiles = filesFor(childId);
+      if (bundle && !filesFor(id).length && childFiles.length && childFiles.every(file => file.category === 'extras')) bonusIds.add(childId);
+      visit(childId, path, excluded);
+    }
+  };
+  visit(gameId, new Set(), new Set());
+  return { ids: [...ids], unresolvedIds: [...unresolved], bonusIds };
+}
+export function selectedProductFiles(gameId: string): RemoteFile[] {
+  const graph = productGraph(gameId);
+  return graph.ids.flatMap(id => filesFor(id).filter(file => !file.unavailable &&
+    (file.selected || graph.bonusIds.has(id) && file.category === 'extras')).map(file => ({ ...file, selected: true })));
+}
+function applyInclusionArchive(game: Game): Game {
+  const graph = productGraph(game.id);
+  const files = selectedProductFiles(game.id);
+  const states = graph.ids.map(id => gameById(id, false)!).filter(Boolean);
+  const verified = files.length > 0 && files.every(file => file.verified);
+  const identified = files.length > 0 && files.every(file => file.verified || file.matched);
+  const progress = files.some(file => file.verified || file.matched);
+  const active = states.find(state => ['Error', 'Downloading', 'Verifying', 'Queued', 'Paused'].includes(state.status));
+  const unresolved = graph.unresolvedIds.length > 0;
+  const archive = game.archive!;
+  archive.selectedCompletion = files.length ? Math.round(100 * files.reduce((sum, file) =>
+    sum + (file.verified || file.matched ? Math.max(1, file.size) : 0), 0) / files.reduce((sum, file) => sum + Math.max(1, file.size), 0)) : null;
+  if (unresolved && archive.selectedCompletion === 100) archive.selectedCompletion = 99;
+  archive.remoteSelectedBytes = files.reduce((sum, file) => sum + file.size, 0);
+  archive.overallStatus = active?.status || (verified && !unresolved ? 'Vaulted' : identified && !unresolved ? 'Needs Verification' : progress ? 'Incomplete' : 'Not Downloaded');
+  archive.verificationState = verified && !unresolved ? 'verified' : progress ? 'identified' : 'missing';
+  if (states.some(state => state.archive?.updateState === 'manifest_changed')) archive.updateState = 'manifest_changed';
+  const types = new Map(graph.ids.map(id => [id, (db.query('SELECT product_type FROM games WHERE id=?').get(id) as Row).product_type]));
+  const categorized = files.map(file => file.category === 'main' && types.get(file.gameId) === 'dlc' ? { ...file, category: 'dlc' as const } : file);
+  game.completion = { main: completion(categorized, 'main'), dlc: completion(categorized, 'dlc'), extras: completion(categorized, 'extras'),
+    patches: completion(categorized, 'patches'), languagePacks: completion(categorized, 'languagePacks'), other: completion(categorized, 'other') };
+  if (!categorized.some(file => file.category === 'main') && graph.bonusIds.size)
+    game.completion.dlc = completion(categorized.map(file => ({ ...file, category: 'dlc' as const })), 'dlc');
+  archive.main = game.completion.main; archive.dlc = game.completion.dlc; archive.extras = game.completion.extras;
+  game.remoteSize = archive.remoteSelectedBytes;
+  game.status = archive.overallStatus;
+  game.inclusionWarning = unresolved;
+  return game;
 }
 export function gameById(id: string, includeChildren = true): Game | null {
   const row = db.query('SELECT * FROM games WHERE id=?').get(id) as Row | null;
@@ -187,8 +281,11 @@ export function gameById(id: string, includeChildren = true): Game | null {
   const childRows = includeChildren ? db.query(`SELECT child.id,child.title,relation.selected FROM product_relationships relation
     JOIN games child ON child.id=relation.child_product_id WHERE relation.parent_product_id=? AND relation.relationship_type='dlc' ORDER BY child.title COLLATE NOCASE`)
     .all(id) as { id: string; title: string; selected: number }[] : [];
-  const autoHiddenFromLibrary = !!row.manifest_hash && !files.length && !childRows.length && !local?.folder && !local?.local_size && !borrowed.count;
-  const productType = row.product_type === 'game' && childRows.length && /(?:^|[_-])bundle$/i.test(row.slug) ? 'bundle' : row.product_type;
+  const includedRows = includeChildren ? db.query(`SELECT relation.included_product_id AS id,child.title FROM product_inclusions relation
+    LEFT JOIN games child ON child.id=relation.included_product_id WHERE relation.parent_product_id=? ORDER BY child.title COLLATE NOCASE`)
+    .all(id) as { id: string; title: string | null }[] : [];
+  const autoHiddenFromLibrary = !!row.manifest_hash && !files.length && !childRows.length && !includedRows.length && !local?.folder && !local?.local_size && !borrowed.count;
+  const productType = !row.gog_game_type && row.product_type === 'game' && childRows.length && /(?:^|[_-])bundle$/i.test(row.slug) ? 'bundle' : row.product_type;
   const bonusOnly = files.length > 0 && files.every(file => file.category === 'extras');
   if (bonusOnly) archive.overallStatus = statusFor(files.map(file => ({ ...file, selected: true })), jobsFor(id), changed,
     !!local?.folder || borrowed.count > 0, prior);
@@ -233,7 +330,10 @@ export function gameById(id: string, includeChildren = true): Game | null {
     ? selectedChildren.length || legacyDlc.some(file => file.selected) ? 'selected' as const : 'off' as const
     : contentAvailability(files, 'dlc'), extras: contentAvailability(files, 'extras') };
   const logo = (db.query("SELECT url FROM media_assets WHERE game_id=? AND role='logo' LIMIT 1").get(id) as { url: string } | null)?.url || '';
-  return { id, title: row.title, slug: row.slug, productType, bonusOnly, bonusCoverage, parentProduct: parent || undefined,
+  const game: Game = { id, title: row.title, slug: row.slug, productType, gogGameType: row.gog_game_type || undefined, bonusOnly, bonusCoverage, parentProduct: parent || undefined,
+    mediaStatus: mediaArchiveStatus(mediaFor(id)),
+    inclusionsRefreshedAt: row.inclusions_refreshed_at,
+    inclusionError: row.inclusions_error || undefined,
     dlcChildren: childStates.map(child => ({ id: child.id, title: child.title, selected: !!child.selected,
       files: child.files.length, bytes: child.files.reduce((sum, file) => sum + file.size, 0),
       completion: child.game.completion.main, status: child.game.status, cover: child.game.cover, platform: child.game.platforms,
@@ -252,6 +352,22 @@ export function gameById(id: string, includeChildren = true): Game | null {
     completion: { main: changed && archive.overallStatus === 'Vaulted' && row.product_type === 'dlc' ? 100 : completion(files, 'main'),
       dlc: dlcCompletion, extras: completion(files, 'extras'), patches: completion(files, 'patches'), languagePacks: completion(files, 'languagePacks'), other: completion(files, 'other') }
   };
+  if (includeChildren) {
+    game.includedIn = db.query(`SELECT parent.id,parent.title FROM product_inclusions relation JOIN games parent ON parent.id=relation.parent_product_id
+      WHERE relation.included_product_id=? AND parent.owned=1 ORDER BY parent.title COLLATE NOCASE`).all(id) as { id: string; title: string }[];
+    const selectedIds = new Set(productGraph(id).ids);
+    game.includedProducts = includedRows.map(child => {
+      let childGame = gameById(child.id, false);
+      if (childGame?.productType === 'bundle') childGame = applyInclusionArchive(childGame);
+      const childFiles = selectedProductFiles(child.id);
+      const selected = selectedIds.has(child.id) || !childGame;
+      return { id: child.id, title: child.title || `Product ${child.id}`, owned: !!childGame, selected, status: childGame?.status,
+        completion: childGame?.archive?.selectedCompletion ?? null,
+        pending: selected && (productGraph(child.id).unresolvedIds.length > 0 || childFiles.some(file => !file.verified && !file.matched)) };
+    });
+    if (productType === 'bundle' || includedRows.length) applyInclusionArchive(game);
+  }
+  return game;
 }
 export function games(): Game[] {
   return (db.query('SELECT id FROM games WHERE owned=1 ORDER BY title COLLATE NOCASE').all() as { id: string }[]).map(row => gameById(row.id)!);
@@ -268,15 +384,17 @@ export function setHiddenGames(ids: string[], hidden: boolean) {
   return unique.map(id => gameById(id)!);
 }
 export function upsertGame(input: Partial<Game> & { id: string; title: string }) {
-  db.query(`INSERT INTO games(id,title,slug,cover,background,release_date,platforms,languages,first_seen,refreshed_at,product_type)
-    VALUES ($id,$title,$slug,$cover,$background,$release,$platforms,$languages,$now,$now,$type)
+  db.query(`INSERT INTO games(id,title,slug,cover,background,release_date,platforms,languages,first_seen,refreshed_at,product_type,gog_game_type)
+    VALUES ($id,$title,$slug,$cover,$background,$release,$platforms,$languages,$now,$now,$type,$gogType)
     ON CONFLICT(id) DO UPDATE SET title=$title,slug=$slug,
       cover=CASE WHEN $cover='' OR ($cover=$background AND games.cover!='' AND games.cover!=games.background) THEN games.cover ELSE $cover END,
       background=CASE WHEN $background='' THEN games.background ELSE $background END,
       release_date=$release,platforms=$platforms,languages=$languages,refreshed_at=$now,
-      product_type=CASE WHEN $type='game' AND games.product_type='dlc' THEN games.product_type ELSE $type END`)
+      product_type=CASE WHEN $gogType!='' THEN $type WHEN games.gog_game_type!='' THEN games.product_type
+        WHEN $type='game' AND games.product_type='dlc' THEN games.product_type ELSE $type END,
+      gog_game_type=CASE WHEN $gogType!='' THEN $gogType ELSE games.gog_game_type END`)
     .run({ $id: input.id, $title: input.title, $slug: input.slug || '', $cover: input.cover || '', $background: input.background || '',
-      $release: input.releaseDate || '', $platforms: JSON.stringify(input.platforms || []), $languages: JSON.stringify(input.languages || []), $now: now(), $type: input.productType || 'game' });
+      $release: input.releaseDate || '', $platforms: JSON.stringify(input.platforms || []), $languages: JSON.stringify(input.languages || []), $now: now(), $type: input.productType || 'game', $gogType: input.gogGameType || '' });
 }
 export function unownedDlcProductIds(ownedIds: ReadonlySet<string>): string[] {
   const candidates = db.query(`SELECT id FROM games WHERE product_type='dlc' UNION SELECT child_product_id AS id FROM product_relationships`)
@@ -352,13 +470,19 @@ export function replaceFiles(gameId: string, files: RemoteFile[]) {
   })();
 }
 export function changeJob(id: number, state: JobState, error = '') {
-  db.query('UPDATE download_jobs SET state=?,error=?,updated_at=? WHERE id=?').run(state, error, now(), id);
+  const at = now();
+  db.query(`UPDATE download_jobs SET state=?,error=?,updated_at=?,
+    started_at=CASE WHEN started_at='' AND ? IN ('downloading','verifying') THEN ? ELSE started_at END,
+    finished_at=CASE WHEN ? IN ('complete','error','cancelled') THEN ? ELSE '' END WHERE id=?`)
+    .run(state, error, at, state, at, state, at, id);
 }
 export function mediaFor(gameId: string): MediaAsset[] {
   const vaultId = activeVault()?.id || -1;
-  return (db.query('SELECT * FROM media_assets WHERE game_id=? ORDER BY role,key').all(gameId) as Row[]).map(row => ({
+  return (db.query(`SELECT asset.*,local.local_path AS vault_local_path FROM media_assets asset
+    LEFT JOIN vault_media local ON local.vault_id=? AND local.game_id=asset.game_id AND local.media_key=asset.key
+    WHERE asset.game_id=? ORDER BY asset.role,asset.key`).all(vaultId, gameId) as Row[]).map(row => ({
     key: row.key, gameId: row.game_id, role: row.role, url: row.url, sourceUrl: row.url, poster: row.poster,
-    localPath: (db.query('SELECT local_path FROM vault_media WHERE vault_id=? AND game_id=? AND media_key=?').get(vaultId, gameId, row.key) as { local_path: string } | null)?.local_path || '',
+    localPath: row.vault_local_path || '',
     size: row.size, width: row.width, height: row.height, mimeType: row.mime_type, sha256: row.sha256,
     provider: row.provider, videoId: row.video_id, embedUrl: row.embed_url, title: row.title, selected: !!row.selected, external: !!row.external
   }));
@@ -378,7 +502,7 @@ export function replaceMedia(gameId: string, media: MediaAsset[]) {
     for (const asset of media) {
       const old = previous.get(asset.key);
       insert.run(gameId, asset.key, asset.role, asset.url, asset.poster, '', asset.size,
-        Number(old?.selected ?? (asset.role === 'screenshot' || asset.role === 'additionalArtwork' ? config.storeImages : asset.role === 'video' && !asset.external ? config.storeVideos : false)), Number(asset.external), old?.width || 0, old?.height || 0, old?.mimeType || '', old?.sha256 || '', asset.provider || '', asset.videoId || '', asset.embedUrl || '', asset.title || '');
+        Number(old?.selected ?? (asset.role === 'video' ? config.storeVideos : config.storeImages)), Number(asset.external), old?.width || 0, old?.height || 0, old?.mimeType || '', old?.sha256 || '', asset.provider || '', asset.videoId || '', asset.embedUrl || '', asset.title || '');
     }
   })();
 }

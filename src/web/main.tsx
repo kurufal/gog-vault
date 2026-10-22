@@ -13,10 +13,13 @@ import {
   CircleAlert,
   Database,
   Download,
+  Eye,
   FolderInput,
   HardDrive,
+  Image as ImageIcon,
   LayoutGrid,
   List,
+  ListPlus,
   LoaderCircle,
   Menu,
   MoreHorizontal,
@@ -29,6 +32,7 @@ import {
   SlidersHorizontal,
   Square,
   Trash2,
+  Video,
   X,
 } from "lucide-react";
 import "@fontsource/audiowide/400.css";
@@ -36,7 +40,10 @@ import "@fontsource/inter/400.css";
 import "@fontsource/inter/500.css";
 import "@fontsource/inter/600.css";
 import "@fontsource/inter/700.css";
-import { bulkDownloadWarningBytes, committedNumber, defaults, isNeutralLanguage, matchesManifestFilters, removeUnresolvedFolder, scopedDownloadPreview, showLibraryCard, usedCapacity, visibilityMatches, type
+import { activityElapsed, bulkDownloadWarningBytes, committedNumber, defaults, isNeutralLanguage, libraryShelfGames, libraryStatusFilters, libraryStatusMatches, toggleLibraryStatus, matchesManifestFilters, removeUnresolvedFolder, scopedDownloadPreview, usedCapacity, visibilityMatches, type LibraryStatusFilter, type
+  AccountShelf,
+  ActivityFile,
+  LibraryShelf,
   Game,
   Job,
   MediaAsset,
@@ -45,7 +52,7 @@ import { bulkDownloadWarningBytes, committedNumber, defaults, isNeutralLanguage,
   Platform,
   Category,
 } from "../shared/domain";
-import { isLibraryLandscape, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from '../shared/media';
+import { isLibraryLandscape, mediaArchiveStatus, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from '../shared/media';
 import { api, cancelGogLogin, diskCapacity, localArtwork, localMedia, streamedMedia, onGogAuthStatus, openUrl, pickVault, queueSocket, startGogLogin } from "./desktop";
 import "./style.css";
 import "./polish.css";
@@ -54,13 +61,15 @@ type Page = "dashboard" | "library" | "settings";
 type Detail = { game: Game; files: RemoteFile[]; media: MediaAsset[] };
 type OrganizeProposal = { id: string; title: string; current: string; proposed: string; conflict: boolean; conflictWith: string[]; confidence: 'high' | 'review' };
 type MatchFolder = { folder: string; localPath: string; candidates: { id: string; title: string; confidence: number; reasons: string[] }[] };
-type DownloadProposal = { id: string; title: string; files: number; bytes: number };
+type DownloadProposal = { id: string; title: string; files: number; bytes: number; targets?: { gameId: string; key: string; size: number }[] };
 type ImportPlan = { source: string; files: number; bytes: number; signature: string; metadataId: string;
   candidates: { id: string; title: string; confidence: number; reasons: string[]; existingFolder: boolean }[]; error: string };
 type ImportJob = { id: string; batchId: string; gameId: string; source: string; mode: 'copy' | 'move'; destination: string;
   state: string; createdAt: string; bytes: number; total: number; speed: number; currentFile: string;
+  startedAt?: string; completedAt?: string; files?: ActivityFile[];
   filesDone: number; filesTotal: number; errorDetails: { stage: string; filename: string; safeMessage: string; code: string; retryable: boolean } | null };
 type VerificationJob = { id: string; gameId: string; state: 'queued' | 'verifying' | 'reconciling' | 'complete' | 'failed' | 'cancelled';
+  createdAt?: string; startedAt?: string; finishedAt?: string; files?: ActivityFile[];
   done: number; total: number; bytes: number; totalBytes: number; currentFile: string; error: string };
 type Account = { connected: boolean; username: string; loginUrl: string; credentialError?: string };
 type Storage = {
@@ -96,6 +105,7 @@ function contentLabel(game: Game, category: Category): string {
   return game.completion[category] === null ? 'N/A' : `${game.completion[category]}%`;
 }
 function statusHint(game: Game): string {
+  if (game.inclusionWarning) return 'Included product metadata is unresolved. This edition cannot yet be confirmed complete.';
   if (game.autoHiddenFromLibrary) return 'GOG lists no downloadable files or linked products for this owned record.';
   if (game.previousInstallerParts) return `${game.previousInstallerParts} installer parts have stored SHA-256 verification. The current GOG build has not been confirmed.`;
   if (game.dlcChildren?.some(child => child.selected && child.updateAvailable)) return 'A selected DLC has a newer GOG manifest. The archived version remains available.';
@@ -109,8 +119,26 @@ function gogStoreUrl(game: Game): string {
   return /^[a-z0-9_-]+$/i.test(game.slug) ? `https://www.gog.com/game/${game.slug}` : '';
 }
 function bundleHint(game: Game): string {
+  const label = game.gogGameType === 'pack' ? 'GOG pack' : 'Bundle (inferred)';
+  if (game.includedProducts?.length) return `${label}; includes ${game.includedProducts.length} products`;
   const count = game.dlcChildren?.length || 0;
-  return count ? `Bundle containing ${count} DLC ${count === 1 ? 'product' : 'products'}` : 'GOG bundle';
+  return count ? `${label} with ${count} DLC ${count === 1 ? 'product' : 'products'}` : label;
+}
+
+function mediaStatusText(status: { archived: number; total: number } | undefined, external = 0): string {
+  if (!status) return 'Not indexed';
+  if (!status.total) return 'None listed';
+  if (external === status.total) return `${external} external ${external === 1 ? 'link' : 'links'}`;
+  return `${status.archived} / ${status.total} archived${external ? `; ${external} external` : ''}`;
+}
+
+function CardDetails({ game }: { game: Game }) {
+  return <dl className="card-extra-details" aria-label={`Additional details for ${game.title}`}>
+    <div><dt><HardDrive size={14} aria-hidden="true" />Size on disk</dt><dd>{fmt(game.localSize)}</dd></div>
+    <div><dt><Download size={14} aria-hidden="true" />Remote size</dt><dd>{fmt(game.remoteSize)}</dd></div>
+    <div><dt><ImageIcon size={14} aria-hidden="true" />Images</dt><dd>{mediaStatusText(game.mediaStatus?.images)}</dd></div>
+    <div><dt><Video size={14} aria-hidden="true" />Videos</dt><dd>{mediaStatusText(game.mediaStatus?.videos, game.mediaStatus?.videos.external)}</dd></div>
+  </dl>;
 }
 function dlcHint(game: Game): string {
   return `${game.bonusOnly ? 'DLC product with GOG bonus content downloads' : 'Downloadable content'}${game.parentProduct ? ` for ${game.parentProduct.title}` : ''}`;
@@ -208,6 +236,43 @@ function Artwork({
     </div>
   );
 }
+function ActivityDetails({ createdAt, startedAt, finishedAt, active, state, files, source, destination }: {
+  createdAt?: string; startedAt?: string; finishedAt?: string; active: boolean; state: string; files?: ActivityFile[]; source?: string; destination?: string;
+}) {
+  const [currentTime, setCurrentTime] = useState(Date.now);
+  useEffect(() => {
+    if (!active || !startedAt) return;
+    setCurrentTime(Date.now());
+    const timer = window.setInterval(() => setCurrentTime(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active, startedAt]);
+  const timestamp = (value: string | undefined, fallback: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : fallback;
+  const elapsed = activityElapsed(startedAt, finishedAt, currentTime);
+  const seconds = elapsed === null ? 0 : Math.floor(elapsed / 1000);
+  const waiting = state === 'queued' && !startedAt;
+  const duration = elapsed === null ? (waiting ? 'Waiting in queue' : 'Unavailable') : [
+    seconds >= 3600 ? `${Math.floor(seconds / 3600)}h` : '',
+    seconds >= 60 ? `${Math.floor(seconds / 60) % 60}m` : '', `${seconds % 60}s`
+  ].filter(Boolean).join(' ');
+  const fileStates: Record<string, string> = { queued: 'Queued', downloading: 'Downloading', verifying: 'Verifying', complete: 'Verified', verified: 'Verified', identified: 'Identified', missing: 'Missing' };
+  return <div className="activity-expanded">
+    <dl className="activity-facts">
+      <div><dt>Queued</dt><dd>{timestamp(createdAt, 'Not recorded')}</dd></div>
+      <div><dt>Started</dt><dd>{timestamp(startedAt, waiting ? 'Waiting in queue' : state === 'cancelled' && !startedAt ? 'Cancelled before starting' : 'Start time unavailable')}</dd></div>
+      <div><dt>Finished</dt><dd>{timestamp(finishedAt, active ? (waiting ? 'Pending' : 'In progress') : 'Finish time unavailable')}</dd></div>
+      <div><dt>Elapsed</dt><dd>{duration}</dd></div>
+      {source && <div className="activity-path"><dt>Source</dt><dd>{source}</dd></div>}
+      {destination && <div className="activity-path"><dt>Destination</dt><dd>{destination}</dd></div>}
+    </dl>
+    <h4>Files <span>{files?.length || 0}</span></h4>
+    {files?.length ? <ul className="activity-files">{files.map((file, index) => <li key={`${index}:${file.name}`}>
+      <strong>{file.name}</strong><span>{fileStates[file.state] || file.state.replaceAll('_', ' ')}</span>
+      <small>{fmt(file.bytes)} / {fmt(file.size)}</small>
+      <progress aria-label={`${file.name}: ${fileStates[file.state] || file.state}`} max={file.size > 0 ? file.size : 1} value={['complete', 'verified'].includes(file.state) ? (file.size || 1) : Math.min(Math.max(0, file.bytes), file.size || 1)} />
+    </li>)}</ul> : <p className="activity-no-files">{files ? 'No files queued for this activity.' : 'This older activity has no saved file history.'}</p>}
+  </div>;
+}
+
 function ActivityHoverPreview({ game, vaultIdentity, active }: { game: Game; vaultIdentity: string; active: boolean }) {
   const [source, setSource] = useState('');
   const sourceRef = useRef('');
@@ -232,7 +297,7 @@ function ActivityHoverPreview({ game, vaultIdentity, active }: { game: Game; vau
   useEffect(() => () => { urls.current.forEach(url => URL.revokeObjectURL(url)); }, [game.id, vaultIdentity]);
   return <div className={`activity-hover-preview ${active && source ? 'visible' : ''}`} aria-hidden="true">{source && <img src={source} alt="" />}</div>;
 }
-function trackActivityPointer(event: React.PointerEvent<HTMLDivElement>) {
+function trackActivityPointer(event: React.PointerEvent<HTMLElement>) {
   const row = event.currentTarget;
   if (row.dataset.previewFrame) return;
   row.dataset.previewFrame = '1';
@@ -294,6 +359,7 @@ function App() {
     done: 0,
     total: 0,
     error: "",
+    shelfError: "",
   });
   const [scan, setScan] = useState({
     running: false,
@@ -324,19 +390,38 @@ function App() {
   const [selectionEnabled, setSelectionEnabled] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("All");
+  const [shelf, setShelf] = useState<LibraryShelf>(() => localStorage.getItem('gog-vault-library-shelf') === 'collection' ? 'collection' : 'products');
+  const [accountShelf, setAccountShelf] = useState<AccountShelf>({ ids: [], refreshedAt: '' });
+  useEffect(() => { localStorage.setItem('gog-vault-library-shelf', shelf); }, [shelf]);
+  const [statusFilters, setStatusFilters] = useState<LibraryStatusFilter[]>(() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem('gog-vault-status-filters') || '[]');
+      return Array.isArray(saved) ? libraryStatusFilters.filter(value => saved.includes(value)) : [];
+    } catch { return []; }
+  });
+  useEffect(() => { localStorage.setItem('gog-vault-status-filters', JSON.stringify(statusFilters)); }, [statusFilters]);
   const [visibility, setVisibility] = useState<'Visible' | 'Hidden' | 'All'>(() => localStorage.getItem('gog-vault-show-hidden') === '1' ? 'All' : 'Visible');
   useEffect(() => { localStorage.setItem('gog-vault-show-hidden', visibility === 'Visible' ? '0' : '1'); }, [visibility]);
+  const [additionalDetails, setAdditionalDetails] = useState(() => localStorage.getItem('gog-vault-additional-details') === '1');
+  useEffect(() => { localStorage.setItem('gog-vault-additional-details', additionalDetails ? '1' : '0'); }, [additionalDetails]);
   const [os, setOs] = useState("All systems");
   const [sort, setSort] = useState("Title A-Z");
   const [columnSort, setColumnSort] = useState<{ label: string; descending: boolean } | null>(null);
   const [storage, setStorage] = useState<Storage | null>(null);
-  const [code, setCode] = useState("");
   const [loginPending, setLoginPending] = useState(false);
-  const [browserLogin, setBrowserLogin] = useState(false);
+
+  const openLibraryStatus = (filter: LibraryStatusFilter | 'All') => {
+    setStatusFilters(filter === 'All' ? [] : [filter]);
+    setShelf('products');
+    setSearch('');
+    setOs('All systems');
+    setSelectedIds(new Set());
+    setDownloadPreview(null);
+    nav('library');
+  };
 
   const reload = async () => {
-    const [library, queue, importQueue, verifyQueue, stats, progress, scanProgress] = await Promise.all([
+    const [library, queue, importQueue, verifyQueue, stats, progress, scanProgress, shelfSnapshot] = await Promise.all([
       api<Game[]>("/games"),
       api<Job[]>("/queue"),
       api<ImportJob[]>("/imports"),
@@ -345,8 +430,10 @@ function App() {
       api<Dashboard>("/dashboard"),
       api<typeof refresh>("/gog/library"),
       api<typeof scan>("/storage/scan"),
+      api<AccountShelf>("/gog/shelf"),
     ]);
     setGames(library);
+    setAccountShelf(shelfSnapshot);
     setJobs(queue);
     setImportJobs(importQueue);
     setVerifications(verifyQueue);
@@ -436,7 +523,8 @@ function App() {
   };
   const previewDownloads = async (mode: 'download' | 'update', selected: Game[]) => {
     try {
-      const preview = scopedDownloadPreview(await api<DownloadProposal[]>('/library/download-preview'), new Set(selected.map(game => game.id)), new Set<string>(), true);
+      const selectedIds = new Set(selected.map(game => game.id));
+      const preview = (await api<DownloadProposal[]>('/library/download-preview')).filter(item => selectedIds.has(item.id));
       setDownloadMode(mode);
       setIncludeUpdates(mode === 'update' ? true : selected.some(game => game.status === 'Update Available' && preview.some(item => item.id === game.id)) ? null : false);
       setLargeDownloadConfirmed(false);
@@ -479,10 +567,11 @@ function App() {
       if (pendingQueue) { setJobs(pendingQueue); pendingQueue = null; }
     };
     const scheduleProgress = () => { progressTimer ??= setTimeout(flushProgress, 140); };
-    function refreshGame(id: string) {
+    function refreshGames() {
       void api<Game[]>('/games').then(setGames).catch(() => {});
-      if (detailId.current === id) void api<Detail>(`/games/${id}`).then(updated => {
-        setDetail(current => current?.game.id === id ? updated : current);
+      const openId = detailId.current;
+      if (openId) void api<Detail>(`/games/${openId}`).then(updated => {
+        setDetail(current => current?.game.id === openId ? updated : current);
       }).catch(() => {});
     }
     function connect() {
@@ -497,7 +586,7 @@ function App() {
             if ((message.jobs as Job[]).some(job => ['complete', 'error', 'cancelled'].includes(job.state) && queueStates.get(job.id) !== job.state)) flushProgress();
             else scheduleProgress();
             for (const job of message.jobs as Job[]) {
-              if (queueStates.get(job.id) !== job.state) { queueStates.set(job.id, job.state); refreshGame(job.gameId); }
+              if (queueStates.get(job.id) !== job.state) { queueStates.set(job.id, job.state); refreshGames(); }
             }
           }
           if (message.type === 'imports') {
@@ -507,7 +596,7 @@ function App() {
             for (const job of message.jobs as ImportJob[]) {
               importStates.set(job.id, job.state);
               if (job.state === 'completed' && !completedImports.has(job.id)) {
-                completedImports.add(job.id); refreshGame(job.gameId);
+                completedImports.add(job.id); refreshGames();
               }
             }
           }
@@ -551,11 +640,11 @@ function App() {
       if (status === "connected") {
         void api<Account>("/gog/auth").then(setAccount).then(reload).catch((e) => setError((e as Error).message));
       } else if (status === "expired") {
-        setError("GOG sign-in timed out. Try again or use browser login.");
+        setError("GOG sign-in timed out. Please try again.");
       } else if (status === "error") {
         void api<Account>("/gog/auth").then(user => {
           setAccount(user);
-          setError(user.credentialError || "GOG sign-in could not be completed. Try browser login if GOG blocked the desktop window.");
+          setError(user.credentialError || "GOG sign-in could not be completed. Check your connection and try again.");
         }).catch(() => setError("GOG sign-in could not be completed. Check your connection and try again."));
       }
     }).then(stop => { if (active) unlisten = stop; else stop(); }).catch((e) => setError((e as Error).message));
@@ -590,24 +679,24 @@ function App() {
     notify(async () => {
       setSettings(await api<Settings>("/settings", "PATCH", input));
     }, "Saving settings");
-  const libraryGames = games.filter(showLibraryCard);
+  const syncAccountShelf = () => notify(async () => {
+    setAccountShelf(await api<AccountShelf>('/gog/shelf', 'POST'));
+  }, 'Refreshing account shelf');
+  const changeShelf = (next: LibraryShelf) => {
+    setShelf(next);
+    setSelectedIds(new Set());
+    setDownloadPreview(null);
+    if (next === 'collection' && !accountShelf.refreshedAt && account?.connected && !busy && !refresh.running) void syncAccountShelf();
+  };
+  const libraryGames = libraryShelfGames(games, shelf, accountShelf.ids);
+  const libraryTotal = shelf === 'collection' ? accountShelf.ids.length : games.length;
+  const unresolvedShelfEntries = shelf === 'collection' ? libraryTotal - libraryGames.length : 0;
   const visible = libraryGames
     .filter(
       (g) =>
-        visibilityMatches(g, visibility, search) &&
+        visibilityMatches(shelf === 'collection' ? { ...g, autoHiddenFromLibrary: false } : g, visibility, search) &&
         (os === "All systems" || g.platforms.includes(os as Platform)) &&
-        (filter === "All" ||
-          (filter === "Vaulted"
-            ? g.status === "Vaulted"
-            : filter === "Missing"
-              ? g.status === "Not Downloaded"
-              : filter === "Updates"
-                ? g.status === "Update Available" || g.archive?.updateState === 'manifest_changed'
-                : filter === "Downloading"
-                  ? ["Queued", "Downloading", "Paused", "Verifying"].includes(
-                      g.status,
-                    )
-                  : g.status === filter)),
+        libraryStatusMatches(g, statusFilters),
     )
     .sort((a, b) => {
       if (columnSort) {
@@ -632,8 +721,7 @@ function App() {
   const previewHasUpdates = downloadMode === 'download' && !!downloadPreview?.some(item => games.find(game => game.id === item.id)?.status === 'Update Available');
   const selectedVisibleIds = new Set(selectedVisible.map(game => game.id));
   const downloadablePreview = scopedDownloadPreview(downloadPreview || [], selectedVisibleIds,
-    new Set(games.filter(game => game.status === 'Update Available' || game.archive?.updateState === 'manifest_changed').map(game => game.id)), includeUpdates === true)
-    .filter(item => !games.find(game => game.id === item.id)?.parentProduct || !selectedVisibleIds.has(games.find(game => game.id === item.id)!.parentProduct!.id));
+    new Set(games.filter(game => game.status === 'Update Available' || game.archive?.updateState === 'manifest_changed').map(game => game.id)), includeUpdates === true);
   const downloadBytes = downloadablePreview.reduce((sum, item) => sum + item.bytes, 0);
   const toggleSelection = (id: string) => setSelectedIds(current => {
     const next = new Set(current);
@@ -682,7 +770,7 @@ function App() {
               <Icon size={18} />
               {label}
               {id === "library" && (
-                <span className="nav-count">{libraryGames.length}</span>
+                <span className="nav-count">{libraryTotal}</span>
               )}
             </button>
           ))}
@@ -748,47 +836,47 @@ function App() {
               <div className="stats-grid dashboard-stats">
                 {(
                   [
-                    ["Owned Games", "owned", Database],
-                    ["Vaulted", "vaulted", ShieldCheck],
-                    ["Missing", "missing", ArrowDownToLine],
-                    ["Incomplete", "incomplete", CircleAlert],
-                    ["Updates Available", "updates", RefreshCw],
-                    ["Downloading", "downloading", Download],
-                    ["Errors", "errors", Activity],
+                    ["Owned Products", "owned", Database, 'All'],
+                    ["Vaulted", "vaulted", ShieldCheck, 'Vaulted'],
+                    ["Missing", "missing", ArrowDownToLine, 'Missing'],
+                    ["Incomplete", "incomplete", CircleAlert, 'Incomplete'],
+                    ["Updates Available", "updates", RefreshCw, 'Updates'],
+                    ["Downloading", "downloading", Download, 'Downloading'],
+                    ["Errors", "errors", Activity, 'Errors'],
                   ] as const
-                ).map(([label, key, Icon]) => (
-                  <div className="stat" key={key}>
+                ).map(([label, key, Icon, filter]) => (
+                  <button className="stat stat-link" key={key} onClick={() => openLibraryStatus(filter)} aria-label={`View ${label.toLowerCase()} in Library`}>
                     <div className="stat-top">
                       <span>{label}</span>
                       <Icon size={19} />
                     </div>
                     <strong>{dashboard?.counts[key] || 0}</strong>
-                  </div>
+                  </button>
                 ))}
-                <div className="stat storage-stat">
+                <button className="stat storage-stat stat-link" onClick={() => openLibraryStatus('All')} aria-label="View archive products in Library">
                   <div className="stat-top">
                     <span>Archive required</span>
                     <Database size={19} />
                   </div>
                   <strong>{fmt(games.reduce((sum, game) => sum + game.remoteSize, 0))}</strong>
                   <small>SELECTED FILES · ALL GAMES</small>
-                </div>
-                <div className="stat storage-stat">
+                </button>
+                <button className="stat storage-stat stat-link" onClick={() => { openLibraryStatus('All'); setSort('Local Size'); setColumnSort(null); }} aria-label="View Library by size on disk">
                   <div className="stat-top">
                     <span>Vault used</span>
                     <HardDrive size={19} />
                   </div>
                   <strong>{fmt(storage?.indexedBytes ?? dashboard?.counts.size ?? 0)}</strong>
                   <small>INDEXED LOCAL FILES</small>
-                </div>
-                <div className="stat storage-stat">
+                </button>
+                <button className="stat storage-stat stat-link" onClick={() => openLibraryStatus('All')} aria-label="View Library for this drive">
                   <div className="stat-top">
                     <span>Drive capacity</span>
                     <HardDrive size={19} />
                   </div>
                   <strong>{storage?.available == null ? 'N/A' : fmt(storage.available)}</strong>
                   <small>{storage?.total == null ? 'CAPACITY UNAVAILABLE' : `FREE OF ${fmt(storage.total)} TOTAL`}</small>
-                </div>
+                </button>
               </div>
               <div className="section-header">
                 <h2>Recent activity</h2>
@@ -815,6 +903,10 @@ function App() {
           {page === "library" && (
             <>
               <div className="page-heading inline-heading library-actions">
+                <div className="shelf-switch" role="group" aria-label="Library shelf">
+                  <button aria-pressed={shelf === 'collection'} onClick={() => changeShelf('collection')}>Collection{accountShelf.refreshedAt && <span>{accountShelf.ids.length}</span>}</button>
+                  <button aria-pressed={shelf === 'products'} onClick={() => changeShelf('products')}>Products<span>{games.length}</span></button>
+                </div>
                 <button
                   className="secondary-button"
                   disabled={!account?.connected || !!busy || refresh.running}
@@ -847,6 +939,12 @@ function App() {
                   Refreshing metadata {refresh.done} / {refresh.total}
                 </div>
               )}
+              {shelf === 'collection' && (unresolvedShelfEntries > 0 || refresh.shelfError) && <div className="shelf-status">
+                <span role="status">{[
+                  unresolvedShelfEntries > 0 ? `${unresolvedShelfEntries} entries awaiting product metadata` : '',
+                  refresh.shelfError ? `Shelf refresh failed: ${refresh.shelfError}` : ''
+                ].filter(Boolean).join(' · ')}</span>
+              </div>}
               <div className="library-tools">
                 <div className="search-wrap">
                   <Search size={18} />
@@ -903,27 +1001,25 @@ function App() {
                 </div>
               </div>
               <div className="filter-row">
-                {[
-                  "All",
-                  "Vaulted",
-                  "Missing",
-                  "Incomplete",
-                  "Downloading",
-                  "Updates",
-                  "Errors",
-                ].map((label) => (
+                <div className="filter-statuses" role="group" aria-label="Library status filters">
+                {(['All', ...libraryStatusFilters] as const).map((label) => (
                   <button
                     key={label}
-                    className={filter === label ? "selected" : ""}
-                    onClick={() => setFilter(label)}
+                    className="library-toggle"
+                    aria-pressed={label === 'All' ? !statusFilters.length : statusFilters.includes(label)}
+                    onClick={() => setStatusFilters(current => toggleLibraryStatus(current, label))}
                   >
                     {label}
                   </button>
                 ))}
-                <label className="checkbox-line"><input type="checkbox" checked={visibility !== 'Visible'} onChange={event => setVisibility(event.target.checked ? 'All' : 'Visible')} />Show hidden</label>
+                </div>
+                <div className="filter-options" role="group" aria-label="Library display options">
+                  <button className="library-toggle" aria-pressed={visibility !== 'Visible'} onClick={() => setVisibility(current => current === 'Visible' ? 'All' : 'Visible')}><Eye size={15} aria-hidden="true" />Show Hidden</button>
+                  <button className="library-toggle" aria-pressed={additionalDetails} onClick={() => setAdditionalDetails(current => !current)}><ListPlus size={15} aria-hidden="true" />Additional Details</button>
+                </div>
               </div>
               <div className="results-line">
-                SHOWING {visible.length} OF {libraryGames.length} GAMES
+                SHOWING {visible.length} OF {libraryTotal} {shelf === 'collection' ? 'COLLECTION ENTRIES' : 'PRODUCTS'}
               </div>
               {visible.length ? (
                 settings?.view === "list" ? (
@@ -936,12 +1032,13 @@ function App() {
                     {visible.map(game => <div className={`list-row list-game ${selectionEnabled && selectedIds.has(game.id) ? 'is-selected' : ''}`} key={game.id} role={selectionEnabled ? undefined : 'button'} tabIndex={selectionEnabled ? -1 : 0}
                       onClick={() => selectionEnabled ? toggleSelection(game.id) : void openGame(game.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectionEnabled ? toggleSelection(game.id) : void openGame(game.id); } }}>
                       {selectionEnabled && <input className="list-select" type="checkbox" aria-label={`Select ${game.title}`} checked={selectedIds.has(game.id)} onChange={() => toggleSelection(game.id)} onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()} />}
-                      <div className="list-title"><div className="list-art"><Artwork game={game} vaultIdentity={settings?.vaultPath} /></div><div className="list-name">{game.title}{game.productType === 'dlc' && <small className="dlc-badge" title={dlcHint(game)}>DLC</small>}{game.bonusOnly && <small className="dlc-badge bonus-download-badge" title="GOG Goodies: bonus downloads">BONUS</small>}{game.productType === 'bundle' && <small className="dlc-badge bundle-badge" title={bundleHint(game)}>BUNDLE</small>}{game.autoHiddenFromLibrary && <small className="hidden-badge">NO DOWNLOADS</small>}{game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}{game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}</div></div>
+                      <div className="list-title"><div className="list-art"><Artwork game={game} vaultIdentity={settings?.vaultPath} /></div><div className="list-name">{game.title}{game.productType === 'dlc' && <small className="dlc-badge" title={dlcHint(game)}>DLC</small>}{game.bonusOnly && <small className="dlc-badge bonus-download-badge" title="GOG Goodies: bonus downloads">BONUS</small>}{game.productType === 'bundle' && <small className="dlc-badge bundle-badge" title={bundleHint(game)}>{game.gogGameType === 'pack' ? 'PACK' : 'BUNDLE'}</small>}{game.autoHiddenFromLibrary && <small className="hidden-badge">NO DOWNLOADS</small>}{game.hiddenFromLibrary && <small className="hidden-badge">HIDDEN</small>}{game.parentProduct && <button className="dlc-parent-link" onKeyDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openGame(game.parentProduct!.id); }}>DLC FOR {game.parentProduct.title}</button>}</div></div>
                       <div className="list-cell-1"><Platforms platforms={game.platforms} /></div>
                       {(['main', 'dlc', 'extras'] as const).map((key, index) => <div className={`list-cell-${index + 2}`} key={key} title={game.productType === 'dlc' && key === 'main' ? 'Content' : key}>{contentLabel(game, key)}</div>)}
                       <div className="list-cell-5"><span className={`status ${game.status.toLowerCase().replaceAll(' ', '-')}`} title={statusHint(game)} aria-label={`${game.status}. ${statusHint(game)}`}>{game.status}{(game.previousInstallerParts || game.archive?.updateState === 'manifest_changed' || ['Needs Verification', 'Update Available', 'Incomplete'].includes(game.status)) && <CircleAlert size={12} aria-hidden="true" />}</span></div>
                       <div className="list-cell-6">{fmt(game.localSize)}</div><div className="list-cell-7">{fmt(game.remoteSize)}</div>
                       <div className="list-cell-8">{game.refreshedAt ? new Date(game.refreshedAt).toLocaleDateString() : '-'}</div>
+                      {additionalDetails && <div className="list-extra-details"><CardDetails game={game} /></div>}
                     </div>)}
                   </div>
                 ) : (
@@ -960,7 +1057,7 @@ function App() {
                           {selectionEnabled && <input className="card-select" type="checkbox" aria-label={`Select ${game.title}`} checked={selectedIds.has(game.id)} onChange={() => toggleSelection(game.id)} onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()} />}
                           {game.productType === 'dlc' && <small className="dlc-badge dlc-card-badge" title={dlcHint(game)}>DLC</small>}
                           {game.bonusOnly && <small className="dlc-badge bonus-download-badge bonus-card-badge" title="GOG Goodies: bonus downloads">BONUS</small>}
-                          {game.productType === 'bundle' && <small className="dlc-badge dlc-card-badge bundle-badge" title={bundleHint(game)}>BUNDLE</small>}
+                          {game.productType === 'bundle' && <small className="dlc-badge dlc-card-badge bundle-badge" title={bundleHint(game)}>{game.gogGameType === 'pack' ? 'PACK' : 'BUNDLE'}</small>}
                           {(game.status === "Update Available" || game.archive?.updateState === 'manifest_changed' && game.status === 'Vaulted') && (
                             <span className="update-tag">UPDATE</span>
                           )}
@@ -984,6 +1081,7 @@ function App() {
                             <Platforms platforms={game.platforms} states={game.platformState} />
                             <span className={`status ${game.status.toLowerCase().replaceAll(" ", "-")}`} title={statusHint(game)} aria-label={`${game.status}. ${statusHint(game)}`} tabIndex={0}>{game.status}{(game.previousInstallerParts || game.archive?.updateState === 'manifest_changed' || ['Needs Verification', 'Update Available', 'Incomplete'].includes(game.status)) && <CircleAlert size={12} aria-hidden="true" />}</span>
                           </div>
+                          {additionalDetails && <CardDetails game={game} />}
                         </div>
                       </div>
                     ))}
@@ -993,12 +1091,12 @@ function App() {
                 <div className="empty-state">
                   <Database size={35} />
                   <h3>
-                    {games.length
-                      ? "No matching games"
+                    {shelf === 'collection' && !accountShelf.refreshedAt ? 'Collection awaiting sync' : libraryTotal
+                      ? "No matching entries"
                       : "Library awaiting sync"}
                   </h3>
                   <p>
-                    {games.length
+                    {shelf === 'collection' && !accountShelf.refreshedAt ? (account?.connected ? 'Refresh the account shelf to load your collection.' : 'Connect your GOG account in Settings.') : libraryTotal
                       ? "Try another filter or search term."
                       : account?.connected
                         ? "Refresh your library to index owned games."
@@ -1024,7 +1122,7 @@ function App() {
                     <div className="account-connected">
                       <span className="online-dot" />
                       Connected as <strong>{account.username}</strong>
-                      <p className="field-help">{games.length} games · Last refresh {games.some(game => game.refreshedAt) ? new Date(Math.max(...games.map(game => Date.parse(game.refreshedAt) || 0))).toLocaleDateString() : "not yet"}</p>
+                      <p className="field-help">{games.length} products · Last refresh {games.some(game => game.refreshedAt) ? new Date(Math.max(...games.map(game => Date.parse(game.refreshedAt) || 0))).toLocaleDateString() : "not yet"}</p>
                       <button className="secondary-button" disabled={refresh.running || !!busy} onClick={() => void notify(() => api('/gog/library', 'POST'), 'Starting refresh')}><RefreshCw size={16} />Refresh library</button>
                       <button
                         className="text-danger"
@@ -1050,7 +1148,7 @@ function App() {
                           setLoginPending(true);
                           void startGogLogin(account.loginUrl).catch((e) => {
                             setLoginPending(false);
-                            setError(`Could not open GOG sign-in: ${String(e)}. Use browser login instead.`);
+                            setError(`Could not open GOG sign-in: ${String(e)}. Please try again.`);
                           });
                         }}
                       >
@@ -1058,36 +1156,6 @@ function App() {
                       </button>
                       {loginPending && <button className="secondary-button" onClick={() => void cancelGogLogin().catch((e) => setError(String(e)))}>Cancel sign-in</button>}
                       <p className="field-help">Sign in on GOG's page. Your password never enters GOG Vault.</p>
-                      <button className="secondary-button" onClick={() => setBrowserLogin(!browserLogin)} aria-expanded={browserLogin}>Use browser instead</button>
-                      {browserLogin && (
-                        <div>
-                          <p className="field-help">For sign-in pages that do not work in the desktop window, open GOG in your browser and paste the redirect URL or code here.</p>
-                          <button className="secondary-button" disabled={loginPending || !account?.loginUrl} onClick={() => { if (account?.loginUrl) void openUrl(account.loginUrl).catch((e) => setError(String(e))); }}>Open GOG in browser <ArrowRight size={16} /></button>
-                          <div className="field-row">
-                            <input
-                              aria-label="GOG authorization URL or code"
-                              type="text"
-                              autoComplete="off"
-                              placeholder="Paste the GOG redirect URL or code"
-                              value={code}
-                              onChange={(event) => setCode(event.target.value)}
-                            />
-                            <button
-                              className="secondary-button"
-                              disabled={!code || !!busy || loginPending}
-                              onClick={() =>
-                                void notify(async () => {
-                                  await api("/gog/auth", "POST", { code });
-                                  setCode("");
-                                  setAccount(await api("/gog/auth"));
-                                }, "Connecting account")
-                              }
-                            >
-                              Finish
-                            </button>
-                          </div>
-                        </div>
-                      )}
                     </>
                   )}
                   {refresh.running && (
@@ -1200,7 +1268,7 @@ function App() {
                       <div className="defaults-choices"><strong>Platforms</strong>{(['windows', 'linux', 'mac'] as Platform[]).map(value => <label className="checkbox-line" key={value}><input type="checkbox" checked={settings.platforms.includes(value)} onChange={event => void changeSettings({ platforms: event.target.checked ? [...settings.platforms, value] : settings.platforms.filter(item => item !== value) })} />{value === 'mac' ? 'macOS' : value}</label>)}</div>
                       <div className="defaults-choices language-choices"><strong>Languages</strong><div>{[...new Set(['English', ...games.flatMap(game => game.languages), ...settings.languages])].map(value => <label className="checkbox-line" key={value}><input type="checkbox" checked={settings.languages.includes(value)} onChange={event => void changeSettings({ languages: event.target.checked ? [...settings.languages, value] : settings.languages.filter(item => item !== value) })} />{value}</label>)}</div></div>
                       <div className="download-group"><strong>Transfer</strong>
-                        <NumericSetting label="Concurrent games" value={settings.concurrency} min={1} max={8} fallback={defaults.concurrency} onCommit={value => void changeSettings({ concurrency: value })} />
+                        <NumericSetting label="Simultaneous downloads" value={settings.concurrency} min={1} max={8} fallback={defaults.concurrency} onCommit={value => void changeSettings({ concurrency: value })} />
                         <NumericSetting label="Retry count" value={settings.retries} min={0} max={10} fallback={defaults.retries} onCommit={value => void changeSettings({ retries: value })} />
                         <NumericSetting label="Timeout (seconds)" value={settings.timeout} min={10} max={3600} fallback={defaults.timeout} onCommit={value => void changeSettings({ timeout: value })} />
                       </div>
@@ -1299,10 +1367,11 @@ function App() {
         </div>
         <div className="queue-items">
           {verifications.map(job => { const game = games.find(item => item.id === job.gameId);
-            return <div className={`queue-item activity-row ${['complete', 'failed', 'cancelled'].includes(job.state) ? 'activity-row-done' : 'activity-row-active'}`} key={job.id}
+            return <details className={`queue-item activity-row ${['complete', 'failed', 'cancelled'].includes(job.state) ? 'activity-row-done' : 'activity-row-active'}`} key={job.id}
               onPointerEnter={() => setActivityHover(`verify-${job.id}`)} onPointerLeave={() => setActivityHover(null)} onPointerMove={trackActivityPointer}>
+              <summary className="activity-summary" aria-label={`Verification ${game?.title || job.gameId} details`}>
               {game?.folder && <ActivityHoverPreview game={game} vaultIdentity={settings?.vaultPath || ''} active={activityHover === `verify-${job.id}`} />}
-              <div className="activity-heading"><strong>{game?.title || job.gameId}</strong><div className="activity-actions">
+              <div className="activity-heading"><ChevronDown size={16} className="activity-chevron" aria-hidden="true" /><strong>{game?.title || job.gameId}</strong><div className="activity-actions" onClick={event => event.stopPropagation()}>
                 {['queued', 'verifying'].includes(job.state) && <button title="Cancel verification" onClick={() => void notify(() => api(`/verifications/${job.id}/cancel`, 'POST'), 'Cancelling verification')}><Square size={16} /></button>}
                 {['complete', 'failed', 'cancelled'].includes(job.state) && <button title="Remove from activity history" onClick={() => void notify(() => api(`/verifications/${job.id}/remove`, 'POST'), 'Removing history')}><X size={16} /></button>}
               </div></div>
@@ -1312,14 +1381,17 @@ function App() {
               {job.error && <div className="queue-failure" role="alert">{job.error}</div>}
               {['complete', 'failed', 'cancelled'].includes(job.state) && <div className="queue-data"><span>{archiveResult(game)}</span><span>{game?.status}</span></div>}
               <div className="queue-progress"><span style={{ width: `${job.total ? job.done / job.total * 100 : 0}%` }} /></div>
-            </div>; })}
+              </summary>
+              <ActivityDetails createdAt={job.createdAt} startedAt={job.startedAt} finishedAt={job.finishedAt} active={!['complete', 'failed', 'cancelled'].includes(job.state)} state={job.state} files={job.files} />
+            </details>; })}
           {importJobs.map(job => { const game = games.find(item => item.id === job.gameId);
             const remaining = job.speed > 0 && job.total > job.bytes ? Math.ceil((job.total - job.bytes) / job.speed) : 0;
-            return <div className={`queue-item activity-row ${['completed', 'cancelled', 'failed'].includes(job.state) ? 'activity-row-done' : 'activity-row-active'}`} key={`import-${job.id}`}
+            return <details className={`queue-item activity-row ${['completed', 'cancelled', 'failed'].includes(job.state) ? 'activity-row-done' : 'activity-row-active'}`} key={`import-${job.id}`}
               onPointerEnter={() => setActivityHover(`import-${job.id}`)} onPointerLeave={() => setActivityHover(null)} onPointerMove={trackActivityPointer}>
+              <summary className="activity-summary" aria-label={`Import ${game?.title || job.gameId} details`}>
               {game?.folder && <ActivityHoverPreview game={game} vaultIdentity={settings?.vaultPath || ''} active={activityHover === `import-${job.id}`} />}
-              <div className="activity-heading"><strong>{game?.title || `GOG ${job.gameId}`}</strong>
-                <div className="activity-actions">{!['completed', 'failed', 'cancelled', 'finalizing', 'deleting_source'].includes(job.state) && <button title="Cancel import" onClick={() => void notify(() => api(`/imports/${job.id}/cancel`, 'POST'), 'Cancelling import')}><Square size={16} /></button>}
+              <div className="activity-heading"><ChevronDown size={16} className="activity-chevron" aria-hidden="true" /><strong>{game?.title || `GOG ${job.gameId}`}</strong>
+                <div className="activity-actions" onClick={event => event.stopPropagation()}>{!['completed', 'failed', 'cancelled', 'finalizing', 'deleting_source'].includes(job.state) && <button title="Cancel import" onClick={() => void notify(() => api(`/imports/${job.id}/cancel`, 'POST'), 'Cancelling import')}><Square size={16} /></button>}
                   {['failed', 'cancelled'].includes(job.state) && job.errorDetails?.retryable !== false && <button title="Retry import" onClick={() => void notify(() => api(`/imports/${job.id}/retry`, 'POST'), 'Retrying import')}><Play size={16} /></button>}
                     {['completed', 'failed', 'cancelled'].includes(job.state) && <button title="Remove from activity history" onClick={() => void notify(() => api(`/imports/${job.id}/remove`, 'POST'), 'Removing history')}><X size={16} /></button>}</div></div>
               <span className="activity-stage">{job.mode.toUpperCase()} · {job.state.replaceAll('_', ' ').toUpperCase()}</span>
@@ -1328,17 +1400,21 @@ function App() {
               <div className="queue-data"><span>{archiveResult(game)}</span><span>{job.speed ? `${fmt(job.speed)}/s` : game?.status || job.state.replaceAll('_', ' ')}{remaining ? ` · ${Math.ceil(remaining / 60)} min left` : ''}</span></div>
               {job.state === 'failed' && job.errorDetails && <div className="queue-failure" role="alert"><strong>{job.errorDetails.safeMessage}</strong><small>{job.errorDetails.stage} · {job.errorDetails.filename}{job.errorDetails.code ? ` · ${job.errorDetails.code}` : ''}</small></div>}
                 {job.state !== 'completed' && <div className="queue-progress"><span style={{ width: `${job.total ? Math.min(100, job.bytes / job.total * 100) : 0}%` }} /></div>}
-            </div>; })}
+              </summary>
+              <ActivityDetails createdAt={job.createdAt} startedAt={job.startedAt} finishedAt={job.completedAt} active={!['completed', 'failed', 'cancelled'].includes(job.state)} state={job.state} files={job.files} source={job.source} destination={job.destination} />
+            </details>; })}
           {jobs.length ? (
             jobs.map((job) => {
               const game = games.find((item) => item.id === job.gameId);
               return (
-                <div className={`queue-item activity-row ${['complete', 'cancelled', 'error'].includes(job.state) ? 'activity-row-done' : 'activity-row-active'}`} key={job.id}
+                <details className={`queue-item activity-row ${['complete', 'cancelled', 'error'].includes(job.state) ? 'activity-row-done' : 'activity-row-active'}`} key={job.id}
                   onPointerEnter={() => setActivityHover(`download-${job.id}`)} onPointerLeave={() => setActivityHover(null)} onPointerMove={trackActivityPointer}>
+                  <summary className="activity-summary" aria-label={`Download ${game?.title || job.gameId} details`}>
                   {game?.folder && <ActivityHoverPreview game={game} vaultIdentity={settings?.vaultPath || ''} active={activityHover === `download-${job.id}`} />}
                   <div className="activity-heading">
+                    <ChevronDown size={16} className="activity-chevron" aria-hidden="true" />
                     <strong>{game?.title || job.gameId}</strong>
-                    <div className="activity-actions">
+                    <div className="activity-actions" onClick={event => event.stopPropagation()}>
                       {['downloading', 'queued', 'verifying'].includes(job.state) && <button title="Pause download" onClick={() => void notify(() => api(`/queue/${job.id}/pause`, 'POST'))}><Pause size={16} /></button>}
                       {['paused', 'error'].includes(job.state) && <button title="Resume download" onClick={() => void notify(() => api(`/queue/${job.id}/resume`, 'POST'))}><Play size={16} /></button>}
                       {!['complete', 'cancelled', 'error'].includes(job.state) && <button title="Cancel download" onClick={() => void notify(() => api(`/queue/${job.id}/cancel`, 'POST'))}><Square size={16} /></button>}
@@ -1381,7 +1457,9 @@ function App() {
                       }}
                     />
                   </div>
-                </div>
+                  </summary>
+                  <ActivityDetails createdAt={job.createdAt} startedAt={job.startedAt} finishedAt={job.finishedAt || (['complete', 'cancelled', 'error'].includes(job.state) ? job.updatedAt : undefined)} active={!['complete', 'cancelled', 'error'].includes(job.state)} state={job.state} files={job.files} />
+                </details>
               );
             })
           ) : !importJobs.length && !verifications.length ? (
@@ -1486,7 +1564,7 @@ function GameModal({
   useEffect(() => { setFilterPlatforms([]); setFilterLanguages([]); }, [game.id]);
   const [chosenPlatforms, setChosenPlatforms] = useState<Platform[]>(defaultSettings?.platforms || ['windows']);
   const [chosenLanguages, setChosenLanguages] = useState<string[]>(defaultSettings?.languages || ['English']);
-  const [chosenMisc, setChosenMisc] = useState({ dlc: defaultSettings?.dlc ?? true, extras: defaultSettings?.extras ?? false, images: defaultSettings?.storeImages ?? false });
+  const [chosenMisc, setChosenMisc] = useState({ dlc: defaultSettings?.dlc ?? true, extras: defaultSettings?.extras ?? false, images: defaultSettings?.storeImages ?? false, videos: defaultSettings?.storeVideos ?? false });
   const [mediaOpen, setMediaOpen] = useState(false);
   const [activeMedia, setActiveMedia] = useState(0);
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -1495,6 +1573,7 @@ function GameModal({
   const gallery = uniqueMedia(media);
   const imageCount = gallery.filter(asset => asset.role !== 'video').length;
   const videoCount = gallery.filter(asset => asset.role === 'video').length;
+  const mediaStatus = mediaArchiveStatus(media);
   useEffect(() => {
     let active = true;
     const objectUrls: string[] = [];
@@ -1528,10 +1607,11 @@ function GameModal({
   const matchesSelection = (file: RemoteFile, platforms: Platform[], languages: string[], misc: typeof chosenMisc) =>
     platforms.includes(file.platform) && (isNeutralLanguage(file.language) || languages.some(value => value.toLowerCase() === file.language.toLowerCase())) &&
       (file.category === 'main' || file.category === 'dlc' && misc.dlc || file.category === 'extras' && misc.extras || file.category === 'patches' && !!defaultSettings?.patches || file.category === 'languagePacks' && !!defaultSettings?.languagePacks);
-  const selectableImages = media.filter(asset => asset.role === 'screenshot' || asset.role === 'additionalArtwork');
+  const imageAssets = media.filter(asset => asset.role !== 'video');
+  const videoAssets = media.filter(asset => asset.role === 'video');
   const selectMatching = (platforms: Platform[], languages: string[], misc: typeof chosenMisc) =>
     applySelection(files.map(file => ({ key: file.key, selected: matchesSelection(file, platforms, languages, misc) })),
-      selectableImages.map(asset => ({ key: asset.key, selected: misc.images })),
+      media.map(asset => ({ key: asset.key, selected: asset.role === 'video' ? misc.videos : misc.images })),
       (game.dlcChildren || []).map(child => ({ id: child.id, selected: misc.dlc })));
   const languageOptions = [...new Set(files.map(file => file.language).filter(value => !isNeutralLanguage(value)))];
   const shown = files.filter(file => matchesManifestFilters(file, filterPlatforms, filterLanguages));
@@ -1575,7 +1655,7 @@ function GameModal({
               <h2>{game.title}</h2>
               {game.productType === 'dlc' && <small className="dlc-badge" title={dlcHint(game)}>DLC</small>}
               {game.bonusOnly && <small className="dlc-badge bonus-download-badge" title="GOG Goodies: bonus downloads">BONUS</small>}
-              {game.productType === 'bundle' && <small className="dlc-badge bundle-badge" title={bundleHint(game)}>BUNDLE</small>}
+              {game.productType === 'bundle' && <small className="dlc-badge bundle-badge" title={bundleHint(game)}>{game.gogGameType === 'pack' ? 'PACK' : 'BUNDLE'}</small>}
               {game.parentProduct && <button className="dlc-parent-link" onClick={() => onOpenGame(game.parentProduct!.id)}>DLC FOR {game.parentProduct.title} <ArrowRight size={13} /></button>}
               <div className="identity-meta">
                 {game.autoHiddenFromLibrary && <span className="hidden-badge">NO DOWNLOADS</span>}
@@ -1683,7 +1763,7 @@ function GameModal({
               <button
                 className="primary-button"
                 disabled={
-                  !files.some((file) => file.selected && !file.verified && !file.matched) && !game.dlcChildren?.some(child => child.selected && child.pending) || busy
+                  !files.some((file) => file.selected && !file.verified && !file.matched) && !game.dlcChildren?.some(child => child.selected && child.pending) && !game.includedProducts?.some(child => child.pending && child.owned) || busy
                 }
                 onClick={() => update(`/games/${game.id}/queue`)}
               >
@@ -1714,6 +1794,10 @@ function GameModal({
             )}
             <div className="detail-facts">
               <div>
+                <span>GOG TYPE</span>
+                <strong className="gog-source-type">{game.gogGameType || 'Not retrieved'}</strong>
+              </div>
+              <div>
                 <span>LOCAL FOLDER</span>
                 <strong>
                   {game.folderPath || "Not linked"}
@@ -1743,7 +1827,21 @@ function GameModal({
               </div>
             </div>
           </div>
-          {!game.folder && (
+          {(!!game.includedProducts?.length || !!game.includedIn?.length || game.inclusionWarning || !!game.inclusionError) && <section className="product-inclusions" aria-label="Product relationships">
+            {(game.inclusionWarning || game.inclusionError) && <p className="inclusion-warning" role="status"><CircleAlert size={16} />{game.inclusionError || 'Included product metadata is incomplete. Refresh metadata to resolve this edition.'}</p>}
+            {!!game.includedProducts?.length && <div className="inclusion-group">
+              <h4>Includes <span>{game.includedProducts.length}</span></h4>
+              {game.includedProducts.map(child => <div className="inclusion-row" key={child.id}>
+                <span><strong>{child.title}</strong><small>{!child.owned ? 'Not owned or not indexed' : !child.selected ? 'Off for this edition' : child.status}{child.owned && child.selected && child.completion !== null ? ` · ${child.completion}% selected` : ''}</small></span>
+                <button className="text-button" disabled={!child.owned} onClick={() => onOpenGame(child.id)} aria-label={`View included product ${child.title}`}>View <ArrowRight size={14} /></button>
+              </div>)}
+            </div>}
+            {!!game.includedIn?.length && <div className="inclusion-group">
+              <h4>Included In <span>{game.includedIn.length}</span></h4>
+              {game.includedIn.map(parent => <div className="inclusion-row" key={parent.id}><strong>{parent.title}</strong><button className="text-button" onClick={() => onOpenGame(parent.id)} aria-label={`View containing product ${parent.title}`}>View <ArrowRight size={14} /></button></div>)}
+            </div>}
+          </section>}
+          {!game.folder && (files.length > 0 || !game.includedProducts?.length) && (
             <div className="link-folder">
               <span>Have an existing archive? Link its folder:</span>
               <button
@@ -1791,8 +1889,8 @@ function GameModal({
           <div className="selection-quick">
             <div><strong>PLATFORMS</strong>{(['windows', 'linux', 'mac'] as Platform[]).map(value => <label key={value}><input type="checkbox" checked={chosenPlatforms.includes(value)} onChange={() => setChosenPlatforms(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value === 'mac' ? 'macOS' : value}</label>)}</div>
             <div><strong>LANGUAGES</strong>{[...new Set(files.map(file => file.language).filter(value => !isNeutralLanguage(value)))].map(value => <label key={value}><input type="checkbox" checked={chosenLanguages.some(item => item.toLowerCase() === value.toLowerCase())} onChange={() => setChosenLanguages(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])} />{value}</label>)}</div>
-            <div><strong>MISC</strong>{(['dlc', 'extras', 'images'] as const).map(value => <label key={value}><input type="checkbox" checked={chosenMisc[value]} onChange={() => setChosenMisc(old => ({ ...old, [value]: !old[value] }))} />{value.toUpperCase()}</label>)}</div>
-            <div className="selection-actions"><small>{files.filter(file => matchesSelection(file, chosenPlatforms, chosenLanguages, chosenMisc)).length + (chosenMisc.images ? selectableImages.length : 0) + (chosenMisc.dlc ? game.dlcChildren?.length || 0 : 0)} matching items</small><button className="secondary-button" disabled={busy} onClick={() => selectMatching(chosenPlatforms, chosenLanguages, chosenMisc)}>Select matching</button><button className="secondary-button" disabled={busy} onClick={() => applySelection(files.map(file => ({ key: file.key, selected: false })), selectableImages.map(asset => ({ key: asset.key, selected: false })), (game.dlcChildren || []).map(child => ({ id: child.id, selected: false })))}>Clear selection</button><button className="secondary-button" disabled={busy} onClick={() => { const platforms = defaultSettings?.platforms || ['windows']; const languages = defaultSettings?.languages || ['English']; const misc = { dlc: defaultSettings?.dlc ?? true, extras: defaultSettings?.extras ?? false, images: defaultSettings?.storeImages ?? false }; setChosenPlatforms(platforms); setChosenLanguages(languages); setChosenMisc(misc); selectMatching(platforms, languages, misc); }}>Reset to defaults</button></div>
+            <div><strong>MISC</strong>{(['dlc', 'extras', 'images', 'videos'] as const).map(value => <label key={value}><input type="checkbox" checked={chosenMisc[value]} onChange={() => setChosenMisc(old => ({ ...old, [value]: !old[value] }))} />{value.toUpperCase()}</label>)}</div>
+            <div className="selection-actions"><small>{files.filter(file => matchesSelection(file, chosenPlatforms, chosenLanguages, chosenMisc)).length + (chosenMisc.images ? imageCount : 0) + (chosenMisc.videos ? videoCount : 0) + (chosenMisc.dlc ? game.dlcChildren?.length || 0 : 0)} matching items</small><button className="secondary-button" disabled={busy} onClick={() => selectMatching(chosenPlatforms, chosenLanguages, chosenMisc)}>Select matching</button><button className="secondary-button" disabled={busy} onClick={() => applySelection(files.map(file => ({ key: file.key, selected: false })), media.map(asset => ({ key: asset.key, selected: false })), (game.dlcChildren || []).map(child => ({ id: child.id, selected: false })))}>Clear selection</button><button className="secondary-button" disabled={busy} onClick={() => { const platforms = defaultSettings?.platforms || ['windows']; const languages = defaultSettings?.languages || ['English']; const misc = { dlc: defaultSettings?.dlc ?? true, extras: defaultSettings?.extras ?? false, images: defaultSettings?.storeImages ?? false, videos: defaultSettings?.storeVideos ?? false }; setChosenPlatforms(platforms); setChosenLanguages(languages); setChosenMisc(misc); selectMatching(platforms, languages, misc); }}>Reset to defaults</button></div>
           </div>
           {groups.map(([category, label]) => (
             <details className="file-group" key={`${game.id}:${category}`} open={files.some(file => file.category === category) || category === 'dlc' && !!game.dlcChildren?.length}>
@@ -1842,11 +1940,14 @@ function GameModal({
           {(imageCount > 0 || videoCount > 0) && (
             <details className="file-group" key={`${game.id}:media`} open>
               <summary><h4>STORE MEDIA <span>{imageCount} images · {videoCount} videos</span></h4><ChevronDown size={16} /></summary>
-              {media.filter(asset => asset.role === 'screenshot' || asset.role === 'additionalArtwork' || asset.role === 'video').map(asset => (
-                <label className="file-row" key={asset.key}>
-                  <input type="checkbox" disabled={asset.external || busy} checked={asset.selected} onChange={event => update(`/games/${game.id}/media`, 'PATCH', { files: [{ key: asset.key, selected: event.target.checked }] })} />
-                  <span className="file-description"><strong>{asset.role === 'video' ? 'Store video' : 'Store image'}</strong><small>{asset.external ? 'External video · open only' : asset.localPath ? 'Archived offline' : 'Viewable online · not archived'}</small></span>
-                  <span className="file-size">{asset.size ? fmt(asset.size) : 'Size unknown'}</span>
+              {[{ label: 'Images', assets: imageAssets, status: mediaStatus.images, external: 0 }, { label: 'Videos', assets: videoAssets, status: mediaStatus.videos, external: mediaStatus.videos.external }].map(group => (
+                <label className="file-row media-category" key={group.label}>
+                  <input type="checkbox" aria-label={`Archive all ${group.label.toLowerCase()}`} disabled={!group.assets.length || busy}
+                    checked={group.assets.length > 0 && group.assets.every(asset => asset.selected)}
+                    ref={input => { if (input) input.indeterminate = group.assets.some(asset => asset.selected) && !group.assets.every(asset => asset.selected); }}
+                    onChange={event => update(`/games/${game.id}/media`, 'PATCH', { files: group.assets.map(asset => ({ key: asset.key, selected: event.target.checked })) })} />
+                  {group.label === 'Images' ? <ImageIcon size={18} aria-hidden="true" /> : <Video size={18} aria-hidden="true" />}
+                  <span className="file-description"><strong>{group.label}</strong><small>{mediaStatusText(group.status, group.external)}</small></span>
                 </label>
               ))}
               {media.some(asset => asset.selected && !asset.localPath && !asset.external) && <button className="secondary-button" disabled={busy || !game.folder} onClick={onArchiveMedia}><Download size={15} /> Archive selected media</button>}

@@ -4,6 +4,55 @@ import { bulkDownloadWarningBytes, committedNumber, completion, contentAvailabil
 import { withinRoot } from '../server/paths';
 import { scoreFolder } from '../server/matching';
 import { isLibraryLandscape, playableVideoSource, progressColor, resolveLibraryLandscapeArtwork, uniqueMedia } from './media';
+import { activityElapsed, libraryShelfGames, libraryStatusMatches, toggleLibraryStatus, type Game } from './domain';
+
+test('activity elapsed time uses actual start/finish times and never invents missing history', () => {
+  expect(activityElapsed('2026-10-21T10:00:00Z', '2026-10-21T10:01:30Z')).toBe(90_000);
+  expect(activityElapsed('2026-10-21T10:00:00Z', undefined, Date.parse('2026-10-21T10:02:00Z'))).toBe(120_000);
+  expect(activityElapsed('', '2026-10-21T10:01:30Z')).toBeNull();
+  expect(activityElapsed('invalid', undefined)).toBeNull();
+  expect(activityElapsed('2026-10-21T10:02:00Z', '2026-10-21T10:01:30Z')).toBeNull();
+});
+
+test('library status toggles combine as a union and All resets the selection', () => {
+  const selected = toggleLibraryStatus(toggleLibraryStatus([], 'Missing'), 'Vaulted');
+  expect(selected).toEqual(['Missing', 'Vaulted']);
+  expect(libraryStatusMatches({ status: 'Vaulted' }, selected)).toBe(true);
+  expect(libraryStatusMatches({ status: 'Not Downloaded' }, selected)).toBe(true);
+  expect(libraryStatusMatches({ status: 'Incomplete' }, selected)).toBe(false);
+  expect(toggleLibraryStatus(selected, 'Missing')).toEqual(['Vaulted']);
+  expect(toggleLibraryStatus(selected, 'All')).toEqual([]);
+  expect(toggleLibraryStatus(['Missing'], 'Missing')).toEqual([]);
+  expect(libraryStatusMatches({ status: 'Needs Verification' }, [])).toBe(true);
+});
+
+test('library status filters include errors, active transfer states, and manifest updates', () => {
+  expect(libraryStatusMatches({ status: 'Error' }, ['Errors'])).toBe(true);
+  expect(libraryStatusMatches({ status: 'Vaulted' }, ['Errors'])).toBe(false);
+  for (const status of ['Queued', 'Downloading', 'Paused', 'Verifying'] as const)
+    expect(libraryStatusMatches({ status }, ['Downloading'])).toBe(true);
+  expect(libraryStatusMatches({ status: 'Vaulted', archive: { updateState: 'manifest_changed' } as Game['archive'] }, ['Updates'])).toBe(true);
+  expect(libraryStatusMatches({ status: 'Update Available' }, ['Updates'])).toBe(true);
+  expect(libraryStatusMatches({ status: 'Incomplete' }, ['Incomplete'])).toBe(true);
+});
+
+test('bulk previews count shared included product files only once', () => {
+  const base = { gameId: 'base', key: 'installer', size: 10 };
+  const dlc = { gameId: 'dlc', key: 'installer', size: 5 };
+  const items = [{ id: 'base', bytes: 10, targets: [base] }, { id: 'premium', bytes: 15, targets: [base, dlc] }];
+  expect(scopedDownloadPreview(items, new Set(['base', 'premium']), new Set(), true).map(item => ({ id: item.id, bytes: item.bytes })))
+    .toEqual([{ id: 'base', bytes: 10 }, { id: 'premium', bytes: 5 }]);
+  expect(scopedDownloadPreview(items, new Set(['premium']), new Set(), true)[0]?.bytes).toBe(15);
+  expect(scopedDownloadPreview(items, new Set(['base', 'premium']), new Set(['base']), false)[0]?.bytes).toBe(15);
+});
+
+test('collection membership uses shelf IDs while Products retains every owned product unchanged', () => {
+  const products = [{ id: 'base' }, { id: 'dlc' }, { id: 'bonus', bonusOnly: true }, { id: 'pack', autoHiddenFromLibrary: true }];
+  expect(libraryShelfGames(products, 'collection', ['base', 'bonus', 'pack', 'missing'])).toEqual([products[0]!, products[2]!, products[3]!]);
+  expect(libraryShelfGames(products, 'collection', [])).toEqual([]);
+  expect(libraryShelfGames(products, 'products', ['base'])).toBe(products);
+  expect(products).toHaveLength(4);
+});
 
 test('numeric settings commit only valid values after allowing an empty draft', () => {
   expect(committedNumber('', 1, 8, 2)).toBe(2);

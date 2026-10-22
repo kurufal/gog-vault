@@ -88,7 +88,7 @@ async function preservePrevious(folder: string, filename: string, final: string,
   catch (error) { await rename(backup, final); throw error; }
 }
 export async function downloadFile(file: RemoteFile, folder: string, signal: AbortSignal, progress: (bytes: number, total: number) => void,
-  onVerifying: (expectedSize?: number) => void = () => {}, onDownloading: () => void = () => {}, onVerified: (result: DownloadVerification) => void = () => {},
+  onVerifying: (expectedSize?: number) => void | Promise<void> = () => {}, onDownloading: () => void | Promise<void> = () => {}, onVerified: (result: DownloadVerification) => void = () => {},
   onStage: (stage: string, httpStatus?: number) => void = () => {}) {
   const config = settings();
   for (let attempt = 0; attempt <= config.retries; attempt++) {
@@ -119,6 +119,7 @@ export async function downloadFile(file: RemoteFile, folder: string, signal: Abo
         throw error;
       });
       if (oldExists && checksumUrl) {
+        await onVerifying(expectedSize);
         for (let verification = 0; verification <= config.retries; verification++) {
           if (signal.aborted) throw new Error('Download interrupted');
           try {
@@ -142,7 +143,7 @@ export async function downloadFile(file: RemoteFile, folder: string, signal: Abo
         else throw new Error('Partial file exceeds expected size');
       }
       if (!expectedSize || offset !== expectedSize) {
-      onDownloading();
+      await onDownloading();
       try {
       const inactivity = new AbortController();
       let timer = setTimeout(() => inactivity.abort(), config.timeout * 1000);
@@ -204,7 +205,7 @@ export async function downloadFile(file: RemoteFile, folder: string, signal: Abo
       }
       if (file.category === 'extras' && !checksumUrl && !expectedSize) throw new Error('Extra expected size unavailable');
       progress(offset, expectedSize);
-      onVerifying(expectedSize);
+      await onVerifying(expectedSize);
       let verified = false;
       for (let verification = 0; verification <= config.retries; verification++) {
         if (signal.aborted) throw new Error('Download interrupted');
@@ -223,9 +224,9 @@ export async function downloadFile(file: RemoteFile, folder: string, signal: Abo
         onVerified({ filename, size: (await stat(final)).size, sha256: await hashFile(final, 0, undefined, signal, 'sha256'), source: checksumUrl ? 'gog-checksum' : 'local-sha256', checksumUrl });
         return filename;
       }
-      if (attempt === config.retries) throw new Error(checksumUrl ? 'Installer checksum mismatch' : 'Extra size mismatch');
       await unlink(partial);
-      onDownloading();
+      if (attempt === config.retries) throw new Error(checksumUrl ? 'Installer checksum mismatch' : 'Extra size mismatch');
+      await onDownloading();
     } catch (error) {
       if (error instanceof Error && /Checksum metadata unavailable|Installer checksum mismatch|Extra size mismatch|Extra expected size unavailable/.test(error.message)) throw error;
       if (signal.aborted || attempt === config.retries) throw error;
